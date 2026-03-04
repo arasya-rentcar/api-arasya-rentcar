@@ -27,6 +27,7 @@ jobs:
       run: |
         tar -czf backend.tar.gz \
         dist \
+        prisma \
         package.json \
         package-lock.json \
         .env
@@ -71,6 +72,8 @@ jobs:
           cd current
 
           npm ci --omit=dev
+
+          npx prisma generate
 
           pm2 reload api
 
