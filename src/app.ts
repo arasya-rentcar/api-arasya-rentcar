@@ -12,17 +12,36 @@ import { errorMiddleware } from './middleware/error.middleware';
 
 const app = express();
 
-// app.use(cors());
-app.use(cors({
-  origin: [
-    "https://management.arasyarentcar.com"
-  ],
-  credentials: true
-}))
+const allowedOrigins = [
+  "https://management.arasyarentcar.com",
+  "http://localhost:3000"
+];
 
-app.options('*', cors());
+app.use(cors({
+  origin: function (origin, callback) {
+
+    // allow requests with no origin (mobile apps, curl)
+    if (!origin) return callback(null, true);
+
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+
+    return callback(new Error("Not allowed by CORS"));
+  },
+  credentials: true,
+  methods: ["GET","POST","PUT","PATCH","DELETE","OPTIONS"],
+  allowedHeaders: ["Content-Type","Authorization"]
+}));
+
+app.options("/*", cors());
 
 app.use(express.json());
+
+app.use((req, res, next) => {
+  console.log("Origin:", req.headers.origin);
+  next();
+});
 
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', service: 'arasya-rentcar-api' });
