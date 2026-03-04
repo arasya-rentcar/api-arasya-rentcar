@@ -1,0 +1,93 @@
+name: Deploy Backend
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Create env file
+      run: |
+        echo "${{ secrets.BACKEND_ENV }}" > .env
+
+    - name: Install deps
+      run: npm ci
+
+    - name: Build
+      run: npm run build
+
+    - name: Archive
+      run: |
+        tar -czf backend.tar.gz \
+        dist \
+        package.json \
+        package-lock.json \
+        .env
+
+    - name: Upload to VPS
+      uses: appleboy/scp-action@v0.1.7
+      with:
+        host: ${{ secrets.HOST }}
+        username: ${{ secrets.USERNAME }}
+        key: ${{ secrets.SSH_KEY }}
+        source: backend.tar.gz
+        target: /var/www/api-arasya-rentcar/
+
+    - name: Deploy on VPS
+      uses: appleboy/ssh-action@v1
+      with:
+        host: ${{ secrets.HOST }}
+        username: ${{ secrets.USERNAME }}
+        key: ${{ secrets.SSH_KEY }}
+
+        script: |
+
+          set -e
+
+          export NVM_DIR="$HOME/.nvm"
+          source $NVM_DIR/nvm.sh
+
+          cd /var/www/api-arasya-rentcar
+
+          PREVIOUS=$(readlink current || echo "")
+
+          RELEASE=$(date +%Y%m%d%H%M%S)
+
+          mkdir -p releases/$RELEASE
+
+          tar -xzf backend.tar.gz -C releases/$RELEASE
+
+          cp releases/$RELEASE/.env shared/.env
+
+          cd releases/$RELEASE
+
+          npm ci --omit=dev
+
+          cd /var/www/api-arasya-rentcar
+
+          ln -sfn releases/$RELEASE current
+
+          pm2 reload api
+
+          sleep 5
+
+          if ! curl -f http://localhost:3001/health > /dev/null; then
+            echo "Deploy failed. Rolling back..."
+
+            ln -sfn $PREVIOUS current
+
+            pm2 reload api
+
+            exit 1
+          fi
+
+          echo "Deploy success"
+
+          ls -dt releases/* | tail -n +6 | xargs rm -rf
