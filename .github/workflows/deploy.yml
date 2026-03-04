@@ -15,7 +15,7 @@ jobs:
 
     - name: Create env file
       run: |
-        echo "${{ secrets.BACKEND_ENV }}" > .env
+        echo "${{ secrets.BACKEND_ENV }}" > .env.production
 
     - name: Install deps
       run: npm ci
@@ -29,7 +29,7 @@ jobs:
         dist \
         package.json \
         package-lock.json \
-        .env
+        .env.production
 
     - name: Upload to VPS
       uses: appleboy/scp-action@v0.1.7
@@ -64,15 +64,13 @@ jobs:
 
           tar -xzf backend.tar.gz -C releases/$RELEASE
 
-          cp releases/$RELEASE/.env shared/.env
-
-          cd releases/$RELEASE
-
-          npm ci --omit=dev
-
-          cd /var/www/api-arasya-rentcar
+          cp releases/$RELEASE/.env.production shared/.env
 
           ln -sfn releases/$RELEASE current
+
+          cd current
+
+          npm ci --omit=dev
 
           pm2 reload api
 
