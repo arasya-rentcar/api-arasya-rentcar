@@ -12,7 +12,14 @@ import { errorMiddleware } from './middleware/error.middleware';
 
 const app = express();
 
-app.use(cors());
+// app.use(cors());
+app.use(cors({
+  origin: [
+    "https://management.arasyarentcar.com"
+  ],
+  credentials: true
+}))
+
 app.use(express.json());
 
 app.get('/health', (_req, res) => {
