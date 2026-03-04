@@ -15,7 +15,7 @@ jobs:
 
     - name: Create env file
       run: |
-        echo "${{ secrets.BACKEND_ENV }}" > .env.production
+        echo "${{ secrets.BACKEND_ENV }}" > .env
 
     - name: Install deps
       run: npm ci
@@ -29,7 +29,7 @@ jobs:
         dist \
         package.json \
         package-lock.json \
-        .env.production
+        .env
 
     - name: Upload to VPS
       uses: appleboy/scp-action@v0.1.7
@@ -64,7 +64,7 @@ jobs:
 
           tar -xzf backend.tar.gz -C releases/$RELEASE
 
-          cp releases/$RELEASE/.env.production shared/.env
+          cp releases/$RELEASE/.env shared/.env
 
           ln -sfn releases/$RELEASE current
 
