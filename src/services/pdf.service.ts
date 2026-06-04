@@ -1,4 +1,15 @@
-import { PDFDocument, rgb, StandardFonts, PDFFont, PDFPage } from 'pdf-lib';
+import { PDFDocument, rgb, StandardFonts, PDFFont, PDFPage } from "pdf-lib";
+
+export interface InvoiceLineItem {
+  serviceDate?: Date | string | null;
+  description?: string | null;
+  serviceKind?: string | null;
+  pickupLocation?: string | null;
+  dropoffLocation?: string | null;
+  quantity?: number | null;
+  unitPrice?: number | string | null;
+  totalPrice?: number | string | null;
+}
 
 export interface InvoiceData {
   invoiceNumber: string;
@@ -7,15 +18,16 @@ export interface InvoiceData {
   pickupLocation: string;
   dropoffLocation: string;
   finalPrice: number;
+  items?: InvoiceLineItem[];
   // New fields for payment-type invoices
-  invoiceType: string;     // e.g. "Down Payment", "Settlement Payment", "Full Payment"
-  paymentMethod: string;   // e.g. "Cash", "Bank Transfer", "QRIS"
-  amountPaid: number;      // Amount for this specific invoice
-  previouslyPaid: number;  // Sum of all prior invoices
+  invoiceType: string; // e.g. "Down Payment", "Settlement Payment", "Full Payment"
+  paymentMethod: string; // e.g. "Cash", "Bank Transfer", "QRIS"
+  amountPaid: number; // Amount for this specific invoice
+  previouslyPaid: number; // Sum of all prior invoices
 }
 
 function formatRp(value: number): string {
-  return `Rp ${new Intl.NumberFormat('id-ID').format(value)}`;
+  return `Rp ${new Intl.NumberFormat("id-ID").format(value)}`;
 }
 
 function drawLabelValue(
@@ -63,7 +75,7 @@ export async function generateInvoicePDF(data: InvoiceData): Promise<Buffer> {
     color: rgb(0.07, 0.07, 0.07),
   });
 
-  page.drawText('ARASYA RENTCAR', {
+  page.drawText("ARASYA RENTCAR", {
     x: margin,
     y: height - 52,
     size: 22,
@@ -71,7 +83,7 @@ export async function generateInvoicePDF(data: InvoiceData): Promise<Buffer> {
     color: rgb(1, 1, 1),
   });
 
-  page.drawText('Car Rental Services', {
+  page.drawText("Car Rental Services", {
     x: margin,
     y: height - 72,
     size: 9,
@@ -80,7 +92,7 @@ export async function generateInvoicePDF(data: InvoiceData): Promise<Buffer> {
   });
 
   // Invoice type label + number on the right
-  page.drawText('INVOICE', {
+  page.drawText("INVOICE", {
     x: width - margin - 70,
     y: height - 45,
     size: 18,
@@ -107,23 +119,55 @@ export async function generateInvoicePDF(data: InvoiceData): Promise<Buffer> {
   // ── Info Section ──────────────────────────────────────────────────
   let y = height - 160;
 
-  const issueDateStr = data.issueDate.toLocaleDateString('id-ID', {
-    year: 'numeric',
-    month: 'long',
-    day: 'numeric',
+  const issueDateStr = data.issueDate.toLocaleDateString("id-ID", {
+    year: "numeric",
+    month: "long",
+    day: "numeric",
   });
 
-  drawLabelValue(page, 'ISSUE DATE', issueDateStr, margin, y, regular, bold);
-  drawLabelValue(page, 'CUSTOMER NAME', data.customerName, width / 2, y, regular, bold);
+  drawLabelValue(page, "ISSUE DATE", issueDateStr, margin, y, regular, bold);
+  drawLabelValue(
+    page,
+    "CUSTOMER NAME",
+    data.customerName,
+    width / 2,
+    y,
+    regular,
+    bold,
+  );
 
   y -= 50;
 
-  drawLabelValue(page, 'PICKUP LOCATION', data.pickupLocation, margin, y, regular, regular);
-  drawLabelValue(page, 'DROPOFF LOCATION', data.dropoffLocation, width / 2, y, regular, regular);
+  drawLabelValue(
+    page,
+    "PICKUP LOCATION",
+    data.pickupLocation,
+    margin,
+    y,
+    regular,
+    regular,
+  );
+  drawLabelValue(
+    page,
+    "DROPOFF LOCATION",
+    data.dropoffLocation,
+    width / 2,
+    y,
+    regular,
+    regular,
+  );
 
   y -= 50;
 
-  drawLabelValue(page, 'PAYMENT METHOD', data.paymentMethod, margin, y, regular, bold);
+  drawLabelValue(
+    page,
+    "PAYMENT METHOD",
+    data.paymentMethod,
+    margin,
+    y,
+    regular,
+    bold,
+  );
 
   y -= 30;
 
@@ -146,15 +190,28 @@ export async function generateInvoicePDF(data: InvoiceData): Promise<Buffer> {
     color: rgb(0.95, 0.95, 0.95),
   });
 
-  page.drawText('DESCRIPTION', {
-    x: margin + 10,
+  page.drawText("DATE", {
+    x: margin + 8,
     y: y + 3,
     size: 8,
     font: bold,
     color: rgb(0.35, 0.35, 0.35),
   });
-
-  page.drawText('AMOUNT', {
+  page.drawText("SERVICE DETAIL", {
+    x: margin + 78,
+    y: y + 3,
+    size: 8,
+    font: bold,
+    color: rgb(0.35, 0.35, 0.35),
+  });
+  page.drawText("QTY", {
+    x: width - margin - 150,
+    y: y + 3,
+    size: 8,
+    font: bold,
+    color: rgb(0.35, 0.35, 0.35),
+  });
+  page.drawText("AMOUNT", {
     x: width - margin - 90,
     y: y + 3,
     size: 8,
@@ -164,26 +221,73 @@ export async function generateInvoicePDF(data: InvoiceData): Promise<Buffer> {
 
   y -= 28;
 
-  // Service row — shows the type-specific description and amount paid
-  const serviceDescription = `${data.invoiceType} — Car Rental Service`;
+  const lineItems = data.items?.length
+    ? data.items
+    : [
+        {
+          description: `${data.invoiceType} — Car Rental Service`,
+          pickupLocation: data.pickupLocation,
+          dropoffLocation: data.dropoffLocation,
+          quantity: 1,
+          totalPrice: data.amountPaid,
+        },
+      ];
 
-  page.drawText(serviceDescription, {
-    x: margin + 10,
-    y,
-    size: 10,
-    font: regular,
-    color: rgb(0.1, 0.1, 0.1),
-  });
+  for (const [index, item] of lineItems.entries()) {
+    if (y < 250) break;
+    const rawDate = item.serviceDate ? new Date(item.serviceDate) : null;
+    const dateStr =
+      rawDate && !Number.isNaN(rawDate.getTime())
+        ? rawDate.toLocaleDateString("id-ID", {
+            day: "2-digit",
+            month: "short",
+            year: "numeric",
+          })
+        : "-";
+    const route = [item.pickupLocation, item.dropoffLocation]
+      .filter(Boolean)
+      .join(" → ");
+    const description =
+      item.description || route || `Service Item ${index + 1}`;
+    const kind = item.serviceKind ? `${item.serviceKind} — ` : "";
+    const detail =
+      kind +
+      (route && item.description ? `${description} (${route})` : description);
+    const qty = item.quantity ?? 1;
+    const amount = Number(item.totalPrice ?? 0);
 
-  page.drawText(formatRp(data.amountPaid), {
-    x: width - margin - 90,
-    y,
-    size: 10,
-    font: regular,
-    color: rgb(0.1, 0.1, 0.1),
-  });
+    page.drawText(dateStr.slice(0, 14), {
+      x: margin + 8,
+      y,
+      size: 8,
+      font: regular,
+      color: rgb(0.25, 0.25, 0.25),
+    });
+    page.drawText(detail.slice(0, 58), {
+      x: margin + 78,
+      y,
+      size: 8,
+      font: regular,
+      color: rgb(0.1, 0.1, 0.1),
+    });
+    page.drawText(String(qty), {
+      x: width - margin - 150,
+      y,
+      size: 8,
+      font: regular,
+      color: rgb(0.1, 0.1, 0.1),
+    });
+    page.drawText(formatRp(amount), {
+      x: width - margin - 90,
+      y,
+      size: 8,
+      font: regular,
+      color: rgb(0.1, 0.1, 0.1),
+    });
+    y -= 18;
+  }
 
-  y -= 20;
+  y -= 2;
 
   page.drawLine({
     start: { x: margin, y },
@@ -196,17 +300,17 @@ export async function generateInvoicePDF(data: InvoiceData): Promise<Buffer> {
 
   // ── Summary section ─────────────────────────────────────────────
   const summaryRows: [string, string][] = [
-    ['Order Total', formatRp(data.finalPrice)],
+    ["Order Total", formatRp(data.finalPrice)],
   ];
 
   if (data.previouslyPaid > 0) {
-    summaryRows.push(['Previously Paid', formatRp(data.previouslyPaid)]);
+    summaryRows.push(["Previously Paid", formatRp(data.previouslyPaid)]);
   }
 
-  summaryRows.push(['Amount This Invoice', formatRp(data.amountPaid)]);
+  summaryRows.push(["Amount This Invoice", formatRp(data.amountPaid)]);
 
   const balance = data.finalPrice - data.previouslyPaid - data.amountPaid;
-  summaryRows.push(['Balance Remaining', formatRp(balance)]);
+  summaryRows.push(["Balance Remaining", formatRp(balance)]);
 
   for (const [label, value] of summaryRows) {
     page.drawText(label, {
@@ -238,7 +342,7 @@ export async function generateInvoicePDF(data: InvoiceData): Promise<Buffer> {
 
   y -= 22;
 
-  page.drawText('AMOUNT PAID', {
+  page.drawText("AMOUNT PAID", {
     x: margin + 10,
     y,
     size: 12,
@@ -257,7 +361,7 @@ export async function generateInvoicePDF(data: InvoiceData): Promise<Buffer> {
   y -= 55;
 
   // ── Payment information ───────────────────────────────────────────
-  page.drawText('PAYMENT INFORMATION', {
+  page.drawText("PAYMENT INFORMATION", {
     x: margin,
     y,
     size: 9,
@@ -275,10 +379,10 @@ export async function generateInvoicePDF(data: InvoiceData): Promise<Buffer> {
   });
 
   const paymentRows: [string, string][] = [
-    ['Payment Method', data.paymentMethod],
-    ['Bank', 'BCA'],
-    ['Account Number', '1234567890'],
-    ['Account Name', 'ARASYA RENTCAR'],
+    ["Payment Method", data.paymentMethod],
+    ["Bank", "BCA"],
+    ["Account Number", "1234567890"],
+    ["Account Name", "ARASYA RENTCAR"],
   ];
 
   for (const [label, value] of paymentRows) {
@@ -307,7 +411,7 @@ export async function generateInvoicePDF(data: InvoiceData): Promise<Buffer> {
     color: rgb(0.82, 0.82, 0.82),
   });
 
-  page.drawText('Thank you for choosing ARASYA RENTCAR.', {
+  page.drawText("Thank you for choosing ARASYA RENTCAR.", {
     x: margin,
     y: 62,
     size: 9,
@@ -315,7 +419,7 @@ export async function generateInvoicePDF(data: InvoiceData): Promise<Buffer> {
     color: rgb(0.5, 0.5, 0.5),
   });
 
-  page.drawText('This document was generated automatically.', {
+  page.drawText("This document was generated automatically.", {
     x: margin,
     y: 46,
     size: 8,

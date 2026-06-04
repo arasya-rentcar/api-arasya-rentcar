@@ -7,15 +7,24 @@ import driversRoutes from './modules/drivers/drivers.route';
 import carsRoutes from './modules/cars/cars.route';
 import ordersRoutes from './modules/orders/orders.route';
 import tripsRoutes from './modules/trips/trips.route';
+import botRoutes from './modules/bot/bot.route';
 
 import { errorMiddleware } from './middleware/error.middleware';
 
 const app = express();
 
-const allowedOrigins = [
-  "https://management.arasyarentcar.com",
-  "http://localhost:3000"
-];
+const allowedOrigins = (process.env.CORS_ORIGINS || '')
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
+if (allowedOrigins.length === 0) {
+  allowedOrigins.push(
+    'https://dashboard.haikuy.com',
+    'https://management.arasyarentcar.com',
+    'http://localhost:3000'
+  );
+}
 
 app.use(cors({
   origin: function (origin, callback) {
@@ -53,6 +62,7 @@ app.use('/api/v1/drivers', driversRoutes);
 app.use('/api/v1/cars', carsRoutes);
 app.use('/api/v1/orders', ordersRoutes);
 app.use('/api/v1/trips', tripsRoutes);
+app.use('/api/v1/bot', botRoutes);
 
 app.use(errorMiddleware);
 

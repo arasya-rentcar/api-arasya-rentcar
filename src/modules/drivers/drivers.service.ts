@@ -16,6 +16,8 @@ export async function createDriver(input: CreateDriverInput) {
       user_id: input.user_id,
       name: input.name,
       phone: input.phone,
+      type: input.type,
+      location: input.location || null,
     },
     include: { user: { select: { email: true, role: true } } },
   });

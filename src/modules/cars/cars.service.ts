@@ -3,11 +3,16 @@ import { AppError } from '../../utils/AppError';
 import { CreateCarInput, UpdateCarInput } from './cars.validation';
 
 export async function createCar(input: CreateCarInput) {
-  const existing = await prisma.car.findUnique({
+  const existingPlate = await prisma.car.findUnique({
     where: { plate_number: input.plate_number },
   });
 
-  if (existing) throw new AppError('Plate number already registered', 409);
+  if (existingPlate) throw new AppError('Plate number already registered', 409);
+
+  if (input.unit_code) {
+    const existingCode = await prisma.car.findUnique({ where: { unit_code: input.unit_code } });
+    if (existingCode) throw new AppError('Unit code already registered', 409);
+  }
 
   return prisma.car.create({ data: input });
 }
@@ -31,6 +36,11 @@ export async function updateCar(id: string, input: UpdateCarInput) {
       where: { plate_number: input.plate_number },
     });
     if (duplicate) throw new AppError('Plate number already registered', 409);
+  }
+
+  if (input.unit_code && input.unit_code !== car.unit_code) {
+    const duplicateCode = await prisma.car.findUnique({ where: { unit_code: input.unit_code } });
+    if (duplicateCode) throw new AppError('Unit code already registered', 409);
   }
 
   return prisma.car.update({ where: { id }, data: input });

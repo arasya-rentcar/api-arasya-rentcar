@@ -3,8 +3,8 @@ generator client {
 }
 
 datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
   directUrl = env("DIRECT_URL")
 }
 
@@ -17,6 +17,11 @@ enum DriverStatus {
   AVAILABLE
   ON_DUTY
   OFF
+}
+
+enum DriverType {
+  INTERNAL
+  EXTERNAL
 }
 
 enum CarStatus {
@@ -63,20 +68,72 @@ enum ExpenseType {
 }
 
 enum InvoiceStatus {
+  DRAFT
   ISSUED
+  REVISED
   PAID
+  CANCELLED
 }
 
 enum InvoiceType {
   DP
   SETTLEMENT
   FULL
+  ADDITIONAL
 }
 
 enum PaymentMethod {
   CASH
   BANK_TRANSFER
   QRIS
+  OTHER
+}
+
+enum OrderSource {
+  WEB
+  WHATSAPP
+  IMPORT
+}
+
+enum ReportInputType {
+  TEXT
+  IMAGE
+  PDF
+  DOCUMENT
+  MIXED
+}
+
+enum ReportSource {
+  WHATSAPP
+  WEB
+  API
+}
+
+enum ReportStatus {
+  MATCHED
+  UNMATCHED
+  NEEDS_REVIEW
+}
+
+enum InvoiceDeliveryChannel {
+  WHATSAPP
+}
+
+enum InvoiceDeliveryStatus {
+  PENDING
+  SENT
+  FAILED
+}
+
+enum OrderAdjustmentType {
+  ROUTE_CHANGE
+  TIME_CHANGE
+  EXTRA_DESTINATION
+  OVERTIME
+  PARKING
+  TOLL
+  FUEL
+  DISCOUNT
   OTHER
 }
 
@@ -92,59 +149,133 @@ model User {
 }
 
 model Driver {
-  id      String       @id @default(uuid())
-  user_id String       @unique
-  user    User         @relation(fields: [user_id], references: [id])
-  name    String
-  phone   String
-  status  DriverStatus @default(AVAILABLE)
-  trips   Trip[]
+  id       String       @id @default(uuid())
+  user_id  String       @unique
+  user     User         @relation(fields: [user_id], references: [id])
+  name     String
+  phone    String
+  email    String?
+  location String?
+  type     DriverType   @default(INTERNAL)
+  status   DriverStatus @default(AVAILABLE)
+  trips    Trip[]
+  reports  TripReport[]
 
+  @@index([phone])
+  @@index([type])
   @@map("drivers")
 }
 
 model Car {
-  id           String    @id @default(uuid())
-  plate_number String    @unique
-  model        String
-  status       CarStatus @default(AVAILABLE)
-  trips        Trip[]
+  id              String     @id @default(uuid())
+  plate_number    String     @unique
+  unit_code       String?    @unique
+  model           String
+  status          CarStatus  @default(AVAILABLE)
+  type            DriverType @default(INTERNAL)
+  origin_location String?
+  trips           Trip[]
 
   @@map("cars")
 }
 
 model Order {
-  id               String        @id @default(uuid())
-  customer_name    String
-  customer_phone   String
-  pickup_location  String
-  dropoff_location String
-  order_date       DateTime
-  final_price      Decimal       @db.Decimal(12, 2)
-  order_status     OrderStatus   @default(CREATED)
-  payment_status   PaymentStatus @default(UNPAID)
-  created_at       DateTime      @default(now())
-  updated_at       DateTime      @updatedAt
-  trip             Trip?
-  invoices         Invoice[]
+  id                     String               @id @default(uuid())
+  order_code             String?              @unique
+  source                 OrderSource          @default(WEB)
+  customer_name          String
+  customer_phone         String
+  pickup_location        String
+  dropoff_location       String
+  order_date             DateTime
+  service_start_at       DateTime?
+  service_end_at         DateTime?
+  final_price            Decimal              @db.Decimal(12, 2)
+  service_type           String?
+  passenger_count        Int?
+  notes                  String?
+  area                   String?
+  driver_origin          String?
+  raw_order_text         String?
+  whatsapp_message_id    String?
+  driver_message_sent_at DateTime?
+  needs_review           Boolean              @default(false)
+  review_reason          String?
+  order_status           OrderStatus          @default(CREATED)
+  payment_status         PaymentStatus        @default(UNPAID)
+  created_at             DateTime             @default(now())
+  updated_at             DateTime             @updatedAt
+  customers              OrderCustomer[]
+  service_items          OrderServiceItem[]
+  trip                   Trip?
+  reports                TripReport[]
+  summary                OrderSummary?
+  invoices               Invoice[]
+  invoice_delivery_logs  InvoiceDeliveryLog[]
+  adjustments            OrderAdjustment[]
+  change_logs            OrderChangeLog[]
 
+  @@index([order_code])
+  @@index([source])
+  @@index([order_status])
+  @@index([needs_review])
+  @@index([service_start_at])
+  @@index([service_end_at])
   @@map("orders")
 }
 
+model OrderCustomer {
+  id         String   @id @default(uuid())
+  order_id   String
+  order      Order    @relation(fields: [order_id], references: [id], onDelete: Cascade)
+  name       String
+  phone      String?
+  is_primary Boolean  @default(false)
+  created_at DateTime @default(now())
+
+  @@index([order_id])
+  @@map("order_customers")
+}
+
+model OrderServiceItem {
+  id                     String    @id @default(uuid())
+  order_id               String
+  order                  Order     @relation(fields: [order_id], references: [id], onDelete: Cascade)
+  service_date           DateTime?
+  start_at               DateTime?
+  end_at                 DateTime?
+  description            String?
+  service_kind           String?
+  pickup_location        String
+  dropoff_location       String
+  driver_origin_location String?
+  quantity               Int       @default(1)
+  unit_price             Decimal   @default(0) @db.Decimal(12, 2)
+  total_price            Decimal   @default(0) @db.Decimal(12, 2)
+  notes                  String?
+  sort_order             Int       @default(0)
+  created_at             DateTime  @default(now())
+
+  @@index([order_id])
+  @@index([service_date])
+  @@map("order_service_items")
+}
+
 model Trip {
-  id             String     @id @default(uuid())
-  order_id       String     @unique
-  order          Order      @relation(fields: [order_id], references: [id])
+  id             String       @id @default(uuid())
+  order_id       String       @unique
+  order          Order        @relation(fields: [order_id], references: [id])
   driver_id      String
-  driver         Driver     @relation(fields: [driver_id], references: [id])
+  driver         Driver       @relation(fields: [driver_id], references: [id])
   car_id         String
-  car            Car        @relation(fields: [car_id], references: [id])
-  current_status TripStatus @default(DRIVER_ASSIGNED)
+  car            Car          @relation(fields: [car_id], references: [id])
+  current_status TripStatus   @default(DRIVER_ASSIGNED)
   started_at     DateTime?
   finished_at    DateTime?
-  created_at     DateTime   @default(now())
+  created_at     DateTime     @default(now())
   logs           TripLog[]
   expenses       Expense[]
+  reports        TripReport[]
 
   @@map("trips")
 }
@@ -161,20 +292,89 @@ model TripLog {
 }
 
 model Invoice {
-  id             String        @id @default(uuid())
+  id             String               @id @default(uuid())
   order_id       String
-  order          Order         @relation(fields: [order_id], references: [id])
-  invoice_number String        @unique
-  invoice_type   InvoiceType   @default(FULL)
-  payment_method PaymentMethod @default(CASH)
-  issue_date     DateTime      @default(now())
-  amount         Decimal       @db.Decimal(12, 2)
+  order          Order                @relation(fields: [order_id], references: [id])
+  invoice_number String               @unique
+  invoice_type   InvoiceType          @default(FULL)
+  payment_method PaymentMethod        @default(CASH)
+  issue_date     DateTime             @default(now())
+  amount         Decimal              @db.Decimal(12, 2)
   note           String?
   file_url       String?
-  status         InvoiceStatus @default(ISSUED)
-  created_at     DateTime      @default(now())
+  status         InvoiceStatus        @default(ISSUED)
+  revision       Int                  @default(0)
+  parent_id      String?
+  parent         Invoice?             @relation("InvoiceRevisions", fields: [parent_id], references: [id])
+  revisions      Invoice[]            @relation("InvoiceRevisions")
+  delivery_logs  InvoiceDeliveryLog[]
+  created_at     DateTime             @default(now())
+  updated_at     DateTime             @updatedAt
 
+  @@index([order_id])
+  @@index([parent_id])
+  @@index([status])
   @@map("invoices")
+}
+
+model InvoiceDeliveryLog {
+  id                      String                 @id @default(uuid())
+  invoice_id              String
+  invoice                 Invoice                @relation(fields: [invoice_id], references: [id], onDelete: Cascade)
+  order_id                String
+  order                   Order                  @relation(fields: [order_id], references: [id], onDelete: Cascade)
+  channel                 InvoiceDeliveryChannel @default(WHATSAPP)
+  target_name             String?
+  target_phone            String
+  message_text            String?
+  file_url                String
+  invoice_number_snapshot String
+  amount_snapshot         Decimal                @db.Decimal(12, 2)
+  status_snapshot         InvoiceStatus
+  status                  InvoiceDeliveryStatus  @default(PENDING)
+  provider_message_id     String?
+  error_message           String?
+  sent_by_user_id         String?
+  sent_at                 DateTime?
+  created_at              DateTime               @default(now())
+  updated_at              DateTime               @updatedAt
+
+  @@index([invoice_id])
+  @@index([order_id])
+  @@index([status])
+  @@map("invoice_delivery_logs")
+}
+
+model OrderAdjustment {
+  id          String              @id @default(uuid())
+  order_id    String
+  order       Order               @relation(fields: [order_id], references: [id], onDelete: Cascade)
+  type        OrderAdjustmentType @default(OTHER)
+  description String
+  amount      Decimal             @default(0) @db.Decimal(12, 2)
+  quantity    Int                 @default(1)
+  is_billable Boolean             @default(true)
+  created_by  String?
+  created_at  DateTime            @default(now())
+
+  @@index([order_id])
+  @@index([type])
+  @@map("order_adjustments")
+}
+
+model OrderChangeLog {
+  id         String   @id @default(uuid())
+  order_id   String
+  order      Order    @relation(fields: [order_id], references: [id], onDelete: Cascade)
+  field      String?
+  old_value  String?
+  new_value  String?
+  note       String?
+  actor      String?
+  created_at DateTime @default(now())
+
+  @@index([order_id])
+  @@map("order_change_logs")
 }
 
 model Expense {
@@ -187,4 +387,60 @@ model Expense {
   created_at DateTime    @default(now())
 
   @@map("expenses")
+}
+
+model TripReport {
+  id             String          @id @default(uuid())
+  order_id       String?
+  order          Order?          @relation(fields: [order_id], references: [id], onDelete: SetNull)
+  trip_id        String?
+  trip           Trip?           @relation(fields: [trip_id], references: [id], onDelete: SetNull)
+  order_code     String?
+  driver_id      String?
+  driver         Driver?         @relation(fields: [driver_id], references: [id], onDelete: SetNull)
+  driver_phone   String?
+  report_type    String
+  input_type     ReportInputType @default(TEXT)
+  notes          String?
+  extracted_text String?
+  file_url       String?
+  file_mime      String?
+  match_method   String?
+  source         ReportSource    @default(WHATSAPP)
+  status         ReportStatus    @default(MATCHED)
+  created_at     DateTime        @default(now())
+
+  @@index([order_id])
+  @@index([trip_id])
+  @@index([order_code])
+  @@index([driver_phone])
+  @@index([report_type])
+  @@index([status])
+  @@map("trip_reports")
+}
+
+model OrderSummary {
+  id                String   @id @default(uuid())
+  order_id          String   @unique
+  order             Order    @relation(fields: [order_id], references: [id], onDelete: Cascade)
+  start_received    Boolean  @default(false)
+  finish_received   Boolean  @default(false)
+  docs_received     Int      @default(0)
+  photos_count      Int      @default(0)
+  missing_items     String[] @default([])
+  e_toll_start      Decimal? @db.Decimal(12, 2)
+  e_toll_used       Decimal? @db.Decimal(12, 2)
+  e_toll_end        Decimal? @db.Decimal(12, 2)
+  bbm_total         Decimal? @db.Decimal(12, 2)
+  parking_total     Decimal? @db.Decimal(12, 2)
+  odometer_start    Decimal? @db.Decimal(12, 2)
+  odometer_finish   Decimal? @db.Decimal(12, 2)
+  distance_km       Decimal? @db.Decimal(12, 2)
+  fuel_liters       Decimal? @db.Decimal(12, 2)
+  km_per_liter      Decimal? @db.Decimal(12, 2)
+  generated_summary String?
+  generated_at      DateTime @default(now())
+  updated_at        DateTime @updatedAt
+
+  @@map("order_summaries")
 }

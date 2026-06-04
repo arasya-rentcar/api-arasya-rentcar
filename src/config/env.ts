@@ -17,4 +17,5 @@ export const env = {
   SUPABASE_URL: required('SUPABASE_URL'),
   SUPABASE_SERVICE_KEY: required('SUPABASE_SERVICE_KEY'),
   SUPABASE_STORAGE_BUCKET: process.env.SUPABASE_STORAGE_BUCKET || 'invoices',
+  BOT_INTERNAL_TOKEN: process.env.BOT_INTERNAL_TOKEN || '',
 };
