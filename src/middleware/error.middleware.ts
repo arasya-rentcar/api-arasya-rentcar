@@ -1,6 +1,7 @@
 import { Request, Response, NextFunction } from 'express';
 import { ZodError } from 'zod';
 import { AppError } from '../utils/AppError';
+import { logger } from '../config/logger';
 
 export function errorMiddleware(
   err: Error,
@@ -28,7 +29,7 @@ export function errorMiddleware(
     return;
   }
 
-  console.error('[error]', err);
+  logger.error({ err }, 'Unhandled error');
 
   res.status(500).json({
     status: 'error',

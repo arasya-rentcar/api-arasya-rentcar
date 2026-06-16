@@ -1,5 +1,11 @@
 import express from 'express';
 import cors from 'cors';
+import helmet from 'helmet';
+import pinoHttp from 'pino-http';
+
+import { env } from './config/env';
+import { logger } from './config/logger';
+import { globalLimiter, authLimiter, botLimiter } from './middleware/rateLimit.middleware';
 
 import authRoutes from './modules/auth/auth.route';
 import usersRoutes from './modules/users/users.route';
@@ -14,6 +20,12 @@ import sheetImportsRoutes from './modules/sheet-imports/sheet-imports.route';
 import { errorMiddleware } from './middleware/error.middleware';
 
 const app = express();
+
+// Behind nginx: trust the proxy so req.ip and rate limiting use the real client IP.
+app.set('trust proxy', env.TRUST_PROXY);
+
+// Security headers.
+app.use(helmet());
 
 const allowedOrigins = (process.env.CORS_ORIGINS || '')
   .split(',')
@@ -47,18 +59,26 @@ app.use(cors({
 
 app.options("/*", cors());
 
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 
-app.use((req, res, next) => {
-  console.log("Origin:", req.headers.origin);
-  next();
-});
+// Structured request logging (replaces ad-hoc console.log).
+app.use(
+  pinoHttp({
+    logger,
+    autoLogging: {
+      ignore: (req) => req.url === '/health',
+    },
+  }),
+);
 
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', service: 'arasya-rentcar-api' });
 });
 
-app.use('/api/v1/auth', authRoutes);
+// Global rate limit on the API surface (/health is registered above and excluded).
+app.use('/api/', globalLimiter);
+
+app.use('/api/v1/auth', authLimiter, authRoutes);
 app.use('/api/v1/users', usersRoutes);
 app.use('/api/v1/drivers', driversRoutes);
 app.use('/api/v1/cars', carsRoutes);
@@ -66,7 +86,7 @@ app.use('/api/v1/orders', ordersRoutes);
 app.use('/api/v1/final-orders', finalOrdersRoutes);
 app.use('/api/v1/sheet-imports', sheetImportsRoutes);
 app.use('/api/v1/trips', tripsRoutes);
-app.use('/api/v1/bot', botRoutes);
+app.use('/api/v1/bot', botLimiter, botRoutes);
 
 app.use(errorMiddleware);
 

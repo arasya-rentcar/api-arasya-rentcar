@@ -1,18 +1,18 @@
-import './config/env'; // load env first
+import './config/env'; // load + validate env first
 import app from './app';
 import { env } from './config/env';
+import { logger } from './config/logger';
 
 const server = app.listen(env.PORT, () => {
-  console.log(`[server] ARASYA RENTCAR API running on port ${env.PORT}`);
-  console.log(`[server] Environment: ${env.NODE_ENV}`);
+  logger.info(`ARASYA RENTCAR API running on port ${env.PORT} (${env.NODE_ENV})`);
 });
 
 process.on('SIGTERM', () => {
-  console.log('[server] SIGTERM received. Shutting down gracefully.');
+  logger.info('SIGTERM received. Shutting down gracefully.');
   server.close(() => process.exit(0));
 });
 
 process.on('unhandledRejection', (reason) => {
-  console.error('[server] Unhandled Rejection:', reason);
+  logger.error({ reason }, 'Unhandled Rejection');
   server.close(() => process.exit(1));
 });
