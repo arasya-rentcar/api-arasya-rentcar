@@ -8,6 +8,8 @@ import carsRoutes from './modules/cars/cars.route';
 import ordersRoutes from './modules/orders/orders.route';
 import tripsRoutes from './modules/trips/trips.route';
 import botRoutes from './modules/bot/bot.route';
+import finalOrdersRoutes from './modules/final-orders/final-orders.route';
+import sheetImportsRoutes from './modules/sheet-imports/sheet-imports.route';
 
 import { errorMiddleware } from './middleware/error.middleware';
 
@@ -61,6 +63,8 @@ app.use('/api/v1/users', usersRoutes);
 app.use('/api/v1/drivers', driversRoutes);
 app.use('/api/v1/cars', carsRoutes);
 app.use('/api/v1/orders', ordersRoutes);
+app.use('/api/v1/final-orders', finalOrdersRoutes);
+app.use('/api/v1/sheet-imports', sheetImportsRoutes);
 app.use('/api/v1/trips', tripsRoutes);
 app.use('/api/v1/bot', botRoutes);
 

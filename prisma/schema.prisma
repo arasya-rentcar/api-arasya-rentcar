@@ -210,6 +210,8 @@ model Order {
   trip                   Trip?
   reports                TripReport[]
   summary                OrderSummary?
+  final_finance          OrderFinalFinance?
+  sheet_import_rows      SheetImportRow[]
   invoices               Invoice[]
   invoice_delivery_logs  InvoiceDeliveryLog[]
   adjustments            OrderAdjustment[]
@@ -443,4 +445,72 @@ model OrderSummary {
   updated_at        DateTime @updatedAt
 
   @@map("order_summaries")
+}
+
+
+model OrderFinalFinance {
+  id                    String   @id @default(uuid())
+  order_id              String   @unique
+  order                 Order    @relation(fields: [order_id], references: [id], onDelete: Cascade)
+  sheet_checked_raw     String?
+  refund_cashback_raw   String?
+  refund_cashback_amount Decimal? @db.Decimal(12, 2)
+  invoice_no_raw        String?
+  service_date_raw      String?
+  service_date          DateTime?
+  vehicle_raw           String?
+  route_raw             String?
+  duration_raw          String?
+  package_raw           String?
+  driver_vendor_raw     String?
+  plate_no_raw          String?
+  sell_price            Decimal? @db.Decimal(12, 2)
+  rtr_amount            Decimal? @db.Decimal(12, 2)
+  dp_amount             Decimal? @db.Decimal(12, 2)
+  additional_amount     Decimal? @db.Decimal(12, 2)
+  user_overtime_amount  Decimal? @db.Decimal(12, 2)
+  user_overtime_hours_raw String?
+  parking_user_amount   Decimal? @db.Decimal(12, 2)
+  total_user_amount     Decimal? @db.Decimal(12, 2)
+  paid_off_date_raw     String?
+  paid_off_date         DateTime?
+  fuel_amount           Decimal? @db.Decimal(12, 2)
+  toll_amount           Decimal? @db.Decimal(12, 2)
+  driver_fee_amount     Decimal? @db.Decimal(12, 2)
+  driver_overtime_amount Decimal? @db.Decimal(12, 2)
+  parking_cash_amount   Decimal? @db.Decimal(12, 2)
+  other_amount          Decimal? @db.Decimal(12, 2)
+  finance_note          String?
+  total_driver_amount   Decimal? @db.Decimal(12, 2)
+  driver_paid_date_raw  String?
+  driver_paid_date      DateTime?
+  total_ops_cost        Decimal? @db.Decimal(12, 2)
+  unit_rental_price     Decimal? @db.Decimal(12, 2)
+  margin_amount         Decimal? @db.Decimal(12, 2)
+  margin_formula_version String?
+  raw_row_json          Json?
+  created_at            DateTime @default(now())
+  updated_at            DateTime @updatedAt
+
+  @@map("order_final_finances")
+}
+
+model SheetImportRow {
+  id         String   @id @default(uuid())
+  sheet_id   String
+  gid        String
+  row_number Int
+  row_hash   String
+  raw_json   Json
+  order_id   String?
+  order      Order?   @relation(fields: [order_id], references: [id], onDelete: SetNull)
+  status     String
+  warnings   String[] @default([])
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  @@unique([sheet_id, gid, row_number])
+  @@index([status])
+  @@index([order_id])
+  @@map("sheet_import_rows")
 }
