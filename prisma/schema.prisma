@@ -240,7 +240,7 @@ model Order {
 model Customer {
   id            String   @id @default(uuid())
   name          String
-  phone         String   @unique
+  phone         String?  @unique
   email         String?
   tags          String[] @default([])
   total_orders  Int      @default(0)

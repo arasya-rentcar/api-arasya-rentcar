@@ -8,6 +8,11 @@ import {
   rowHash,
   rowsFromCsv,
 } from "../../utils/sheetFinalOrderParser";
+import { findOrCreateCustomer } from "../customers/customers.service";
+import {
+  findOrCreateVendor,
+  findOrCreateVendorCar,
+} from "../external-vendors/external-vendors.service";
 
 type ImportOptions = {
   sheetId?: string;
@@ -104,12 +109,42 @@ export async function importSheetRows(options: ImportOptions = {}) {
 
     const result = await prisma.$transaction(async (tx) => {
       let orderId = existingImport?.order_id || null;
+
+      // Find-or-create the customer (sheet rows have a name, no phone).
+      const { customer } = await findOrCreateCustomer(tx, {
+        name: orderData.customer_name,
+        phone: null,
+      });
+
+      // For external rows, find-or-create the vendor (and its car) from the
+      // sheet's DRIVER/VENDOR + vehicle columns.
+      let externalVendorId: string | null = null;
+      let externalCarId: string | null = null;
+      if (orderData.is_external && financeData.driver_vendor_raw) {
+        // Strip a trailing "(actual driver)" so the vendor name stays clean.
+        const vendorName = financeData.driver_vendor_raw
+          .replace(/\s*\([^)]*\)\s*$/, "")
+          .trim();
+        const vendor = await findOrCreateVendor(tx, { name: vendorName });
+        if (vendor) {
+          externalVendorId = vendor.id;
+          const car = await findOrCreateVendorCar(tx, vendor.id, {
+            model: financeData.vehicle_raw,
+            plate_number: financeData.plate_no_raw,
+          });
+          externalCarId = car?.id ?? null;
+        }
+      }
       if (orderId) {
         await tx.order.update({
           where: { id: orderId },
           data: {
             customer_name: orderData.customer_name,
             customer_phone: orderData.customer_phone,
+            customer_id: customer.id,
+            is_external: orderData.is_external,
+            external_vendor_id: externalVendorId,
+            external_car_id: externalCarId,
             pickup_location: orderData.pickup_location,
             dropoff_location: orderData.dropoff_location,
             order_date: orderData.order_date,
@@ -129,6 +164,9 @@ export async function importSheetRows(options: ImportOptions = {}) {
           data: {
             ...orderData,
             order_code: orderData.order_code ? `${orderData.order_code}#sheet-${rowNumber}` : `sheet-${sheetId}-${gid}-${rowNumber}`,
+            customer_id: customer.id,
+            external_vendor_id: externalVendorId,
+            external_car_id: externalCarId,
             customers: { create: [{ name: orderData.customer_name, phone: null, is_primary: true }] },
             service_items: {
               create: [{
@@ -177,7 +215,7 @@ export async function importSheetRows(options: ImportOptions = {}) {
       });
 
       return { row_number: rowNumber, order_id: orderId, status: "IMPORTED", warnings: built.warnings };
-    });
+    }, { timeout: 15000 });
 
     results.push(result);
   }

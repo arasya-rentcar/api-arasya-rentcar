@@ -11,6 +11,62 @@ import type { Prisma } from '@prisma/client';
 
 const TAB_PAGE_SIZE = 10;
 
+type Db = Prisma.TransactionClient | typeof prisma;
+
+/** Find a vendor by case-insensitive name or create it. */
+export async function findOrCreateVendor(
+  client: Db,
+  params: { name: string; phone?: string | null },
+) {
+  const name = (params.name || '').trim();
+  if (!name) return null;
+  const existing = await client.externalVendor.findFirst({
+    where: { name: { equals: name, mode: 'insensitive' } },
+  });
+  if (existing) {
+    // backfill phone if we now have one and it was missing
+    if (params.phone && !existing.phone) {
+      return client.externalVendor.update({
+        where: { id: existing.id },
+        data: { phone: params.phone },
+      });
+    }
+    return existing;
+  }
+  return client.externalVendor.create({
+    data: { name, phone: params.phone || null },
+  });
+}
+
+/** Find a vendor car by model (+plate when given) or create it. */
+export async function findOrCreateVendorCar(
+  client: Db,
+  vendorId: string,
+  params: { model?: string | null; plate_number?: string | null },
+) {
+  const model = (params.model || '').trim();
+  const plate = (params.plate_number || '').trim();
+  if (!model && !plate) return null;
+
+  const existing = await client.externalCar.findFirst({
+    where: {
+      vendor_id: vendorId,
+      ...(plate
+        ? { plate_number: { equals: plate, mode: 'insensitive' } }
+        : { model: { equals: model || '-', mode: 'insensitive' } }),
+    },
+  });
+  if (existing) return existing;
+
+  return client.externalCar.create({
+    data: {
+      vendor_id: vendorId,
+      model: model || 'Unknown',
+      plate_number: plate || null,
+    },
+  });
+}
+
 export async function createVendor(input: CreateVendorInput) {
   return prisma.externalVendor.create({
     data: {

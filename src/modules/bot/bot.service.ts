@@ -8,6 +8,10 @@ import {
   BotReportInput,
 } from "./bot.validation";
 import { upsertCustomerForOrder } from "../customers/customers.service";
+import {
+  findOrCreateVendor,
+  findOrCreateVendorCar,
+} from "../external-vendors/external-vendors.service";
 
 function normalizePhone(phone = ""): string {
   let digits = phone.replace(/[^0-9]/g, "");
@@ -230,6 +234,16 @@ export async function createBotOrder(input: BotCreateOrderInput) {
     : Number(input.final_price || 0);
   const orderDate = new Date(input.order_date);
 
+  // Infer external: explicit type, OR a driver phone is present (the agreed
+  // WhatsApp signal that an outside driver was supplied), OR the car/driver
+  // name is prefixed "External".
+  const carText = `${input.car_model || ""} ${input.car_query || ""}`.toLowerCase();
+  const isExternal =
+    input.driver_type === "EXTERNAL" ||
+    !!(input.driver_phone && input.driver_phone.trim()) ||
+    /\bexternal\b/.test(carText) ||
+    /\bexternal\b/.test((input.driver_name || "").toLowerCase());
+
   return prisma.$transaction(async (tx) => {
     // Link / upsert the customer by phone so WhatsApp orders count toward
     // repeat-order stats just like web orders.
@@ -240,6 +254,37 @@ export async function createBotOrder(input: BotCreateOrderInput) {
       orderDate,
     });
 
+    // For external WhatsApp orders, find-or-create the vendor (from the driver
+    // name/phone) and the car they brought.
+    let externalVendorId: string | null = null;
+    let externalCarId: string | null = null;
+    if (isExternal) {
+      const vendorName = (input.driver_name || input.driver_origin || "")
+        .replace(/\s*\([^)]*\)\s*$/, "")
+        .trim();
+      if (vendorName) {
+        const vendor = await findOrCreateVendor(tx, {
+          name: vendorName,
+          phone: input.driver_phone || null,
+        });
+        if (vendor) {
+          externalVendorId = vendor.id;
+          const carModel = (input.car_model || input.car_query || "")
+            .replace(/external/gi, "")
+            .trim();
+          const car = await findOrCreateVendorCar(tx, vendor.id, {
+            model: carModel || null,
+            plate_number: input.car_plate || null,
+          });
+          externalCarId = car?.id ?? null;
+          await tx.externalVendor.update({
+            where: { id: vendor.id },
+            data: { order_count: { increment: 1 } },
+          });
+        }
+      }
+    }
+
     return tx.order.create({
       data: {
         order_code: input.order_code,
@@ -247,6 +292,9 @@ export async function createBotOrder(input: BotCreateOrderInput) {
         customer_name: input.customer_name,
         customer_phone: normalizePhone(input.customer_phone),
         customer_id: customer?.id ?? null,
+        is_external: isExternal,
+        external_vendor_id: externalVendorId,
+        external_car_id: externalCarId,
         pickup_location: input.pickup_location,
         dropoff_location: input.dropoff_location,
         order_date: orderDate,
@@ -274,7 +322,7 @@ export async function createBotOrder(input: BotCreateOrderInput) {
       },
       include: orderInclude(),
     });
-  });
+  }, { timeout: 15000 });
 }
 
 async function resolveOrder(orderIdOrCode: string) {

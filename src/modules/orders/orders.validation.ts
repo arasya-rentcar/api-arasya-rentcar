@@ -99,6 +99,20 @@ export const updateOrderSchema = z
     },
   );
 
+const money = z.number().nonnegative().nullable().optional();
+export const upsertOrderFinanceSchema = z.object({
+  total_user_amount: money,
+  sell_price: money,
+  rtr_amount: money,
+  total_ops_cost: money,
+  fuel_amount: money,
+  toll_amount: money,
+  parking_cash_amount: money,
+  driver_fee_amount: money,
+  total_driver_amount: money,
+  finance_note: z.string().nullable().optional(),
+});
+
 export const assignOrderSchema = z.object({
   driver_id: z.string().uuid("Invalid driver_id format"),
   car_id: z.string().uuid("Invalid car_id format"),
@@ -133,6 +147,7 @@ export const createChangeLogSchema = z.object({
   actor: z.string().optional(),
 });
 
+export type UpsertOrderFinanceInput = z.infer<typeof upsertOrderFinanceSchema>;
 export type CreateOrderInput = z.infer<typeof createOrderSchema>;
 export type UpdateOrderInput = z.infer<typeof updateOrderSchema>;
 export type AssignOrderInput = z.infer<typeof assignOrderSchema>;

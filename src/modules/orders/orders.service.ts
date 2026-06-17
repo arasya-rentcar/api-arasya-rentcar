@@ -8,6 +8,7 @@ import {
   CreateChangeLogInput,
 } from "./orders.validation";
 import { upsertCustomerForOrder } from "../customers/customers.service";
+import { computeMargin, MARGIN_FORMULA_VERSION } from "../../utils/margin";
 
 function normalizeOrderCustomers(input: {
   customer_name: string;
@@ -142,7 +143,7 @@ export async function createOrder(input: CreateOrderInput) {
     }
 
     return order;
-  });
+  }, { timeout: 15000 });
 }
 
 export async function listOrders() {
@@ -338,6 +339,122 @@ export async function searchOrders(params: SearchOrdersParams) {
   };
 }
 
+export interface UpsertOrderFinanceInput {
+  total_user_amount?: number | null;
+  sell_price?: number | null;
+  rtr_amount?: number | null;
+  total_ops_cost?: number | null;
+  fuel_amount?: number | null;
+  toll_amount?: number | null;
+  parking_cash_amount?: number | null;
+  driver_fee_amount?: number | null;
+  total_driver_amount?: number | null;
+  finance_note?: string | null;
+}
+
+const nn = (v?: number | null) => (v == null ? null : Number(v));
+
+/**
+ * Create or update the finance record for an app order and (re)compute margin
+ * using the confirmed rules. External flag comes from the order itself.
+ */
+export async function upsertOrderFinance(
+  id: string,
+  input: UpsertOrderFinanceInput,
+) {
+  const order = await prisma.order.findUnique({
+    where: { id },
+    include: { final_finance: true },
+  });
+  if (!order) throw new AppError("Order not found", 404);
+
+  const existing = order.final_finance;
+  const num = (v: unknown) => (v == null ? null : Number(v));
+
+  // Merge incoming values over existing finance.
+  const totalUser =
+    input.total_user_amount !== undefined
+      ? nn(input.total_user_amount)
+      : (num(existing?.total_user_amount) ?? Number(order.final_price));
+  const sellPrice =
+    input.sell_price !== undefined
+      ? nn(input.sell_price)
+      : num(existing?.sell_price);
+  const rtr =
+    input.rtr_amount !== undefined
+      ? nn(input.rtr_amount)
+      : num(existing?.rtr_amount);
+
+  // Ops cost: explicit value wins; otherwise sum the cost components when given;
+  // otherwise keep existing.
+  let opsCost: number | null;
+  if (input.total_ops_cost !== undefined) {
+    opsCost = nn(input.total_ops_cost);
+  } else if (
+    input.fuel_amount !== undefined ||
+    input.toll_amount !== undefined ||
+    input.parking_cash_amount !== undefined
+  ) {
+    opsCost =
+      (nn(input.fuel_amount) ?? 0) +
+      (nn(input.toll_amount) ?? 0) +
+      (nn(input.parking_cash_amount) ?? 0);
+  } else {
+    opsCost = num(existing?.total_ops_cost);
+  }
+
+  const driverTotal =
+    input.total_driver_amount !== undefined
+      ? nn(input.total_driver_amount)
+      : num(existing?.total_driver_amount);
+
+  const margin = computeMargin({
+    isExternal: order.is_external,
+    total_user_amount: totalUser,
+    total_ops_cost: opsCost,
+    sell_price: sellPrice,
+    rtr_amount: rtr,
+  });
+
+  const data = {
+    total_user_amount: totalUser,
+    sell_price: sellPrice,
+    rtr_amount: rtr,
+    total_ops_cost: opsCost,
+    fuel_amount:
+      input.fuel_amount !== undefined
+        ? nn(input.fuel_amount)
+        : num(existing?.fuel_amount),
+    toll_amount:
+      input.toll_amount !== undefined
+        ? nn(input.toll_amount)
+        : num(existing?.toll_amount),
+    parking_cash_amount:
+      input.parking_cash_amount !== undefined
+        ? nn(input.parking_cash_amount)
+        : num(existing?.parking_cash_amount),
+    driver_fee_amount:
+      input.driver_fee_amount !== undefined
+        ? nn(input.driver_fee_amount)
+        : num(existing?.driver_fee_amount),
+    total_driver_amount: driverTotal,
+    finance_note:
+      input.finance_note !== undefined
+        ? input.finance_note
+        : (existing?.finance_note ?? null),
+    margin_amount: margin,
+    margin_formula_version: MARGIN_FORMULA_VERSION,
+  };
+
+  await prisma.orderFinalFinance.upsert({
+    where: { order_id: id },
+    update: data,
+    create: { ...data, order_id: id },
+  });
+
+  return getOrderById(id);
+}
+
 export async function getOrderById(id: string) {
   const order = await prisma.order.findUnique({
     where: { id },
@@ -355,6 +472,14 @@ export async function getOrderById(id: string) {
         include: {
           delivery_logs: { orderBy: { created_at: "desc" as const } },
         },
+      },
+      final_finance: true,
+      external_vendor: { select: { id: true, name: true, phone: true } },
+      external_car: {
+        select: { id: true, model: true, plate_number: true },
+      },
+      customer: {
+        select: { id: true, name: true, phone: true, total_orders: true },
       },
       customers: { orderBy: { created_at: "asc" as const } },
       service_items: { orderBy: { sort_order: "asc" as const } },

@@ -8,6 +8,7 @@ import {
   listOrdersController,
   searchOrdersController,
   getOrderByIdController,
+  upsertOrderFinanceController,
   updateOrderController,
   assignOrderController,
   createOrderAdjustmentController,
@@ -27,6 +28,7 @@ router.get("/", listOrdersController);
 router.get("/search", searchOrdersController);
 router.get("/:id", getOrderByIdController);
 router.put("/:id", updateOrderController);
+router.put("/:id/finance", upsertOrderFinanceController);
 router.post("/:id/assign", assignOrderController);
 router.post("/:id/adjustments", createOrderAdjustmentController);
 router.post("/:id/change-logs", createOrderChangeLogController);

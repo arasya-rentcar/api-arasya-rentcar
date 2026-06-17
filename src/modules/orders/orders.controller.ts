@@ -5,6 +5,7 @@ import {
   assignOrderSchema,
   createAdjustmentSchema,
   createChangeLogSchema,
+  upsertOrderFinanceSchema,
 } from "./orders.validation";
 import {
   createOrder,
@@ -15,6 +16,7 @@ import {
   assignOrder,
   createOrderAdjustment,
   createOrderChangeLog,
+  upsertOrderFinance,
 } from "./orders.service";
 import {
   generateInvoiceController,
@@ -73,6 +75,20 @@ export async function searchOrdersController(
       page_size: q.page_size ? Number(q.page_size) : undefined,
     });
     res.json({ status: "success", ...result });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function upsertOrderFinanceController(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const input = upsertOrderFinanceSchema.parse(req.body);
+    const order = await upsertOrderFinance(req.params.id, input);
+    res.json({ status: "success", data: order });
   } catch (err) {
     next(err);
   }

@@ -126,41 +126,58 @@ export async function updateCustomer(id: string, input: UpdateCustomerInput) {
   return prisma.customer.update({ where: { id }, data });
 }
 
-/**
- * Upsert a customer by phone and roll up order stats. Call this whenever an
- * order is created so repeat-order counts stay accurate. Safe to run inside a
- * transaction (pass tx); otherwise uses the default client.
- */
-export async function upsertCustomerForOrder(
-  client: Prisma.TransactionClient | typeof prisma,
-  params: { name: string; phone: string; amount: number; orderDate: Date },
-) {
-  const phone = normalizePhone(params.phone);
-  if (!phone) return null;
+type Db = Prisma.TransactionClient | typeof prisma;
 
-  const existing = await client.customer.findUnique({ where: { phone } });
-  if (existing) {
-    const updated = await client.customer.update({
-      where: { id: existing.id },
-      data: {
-        name: existing.name || params.name,
-        total_orders: { increment: 1 },
-        total_spent: { increment: params.amount },
-        last_order_at: params.orderDate,
-        first_order_at: existing.first_order_at ?? params.orderDate,
-      },
+/**
+ * Find an existing customer (by normalized phone if available, otherwise by
+ * case-insensitive name) or create one. Does NOT touch order rollups.
+ */
+export async function findOrCreateCustomer(
+  client: Db,
+  params: { name: string; phone?: string | null },
+) {
+  const phone = params.phone ? normalizePhone(params.phone) : '';
+  const name = (params.name || '').trim() || 'Unknown customer';
+
+  if (phone) {
+    const byPhone = await client.customer.findUnique({ where: { phone } });
+    if (byPhone) return { customer: byPhone, created: false };
+  } else {
+    // No phone: match by exact (case-insensitive) name to avoid duplicates.
+    const byName = await client.customer.findFirst({
+      where: { phone: null, name: { equals: name, mode: 'insensitive' } },
     });
-    return updated;
+    if (byName) return { customer: byName, created: false };
   }
 
-  return client.customer.create({
+  const customer = await client.customer.create({
+    data: { name, phone: phone || null },
+  });
+  return { customer, created: true };
+}
+
+/**
+ * Find-or-create the customer for an order AND roll up order stats. Call this
+ * whenever an order is created so repeat-order counts stay accurate. Safe to
+ * run inside a transaction (pass tx); otherwise uses the default client.
+ */
+export async function upsertCustomerForOrder(
+  client: Db,
+  params: { name: string; phone?: string | null; amount: number; orderDate: Date },
+) {
+  const { customer } = await findOrCreateCustomer(client, {
+    name: params.name,
+    phone: params.phone,
+  });
+
+  return client.customer.update({
+    where: { id: customer.id },
     data: {
-      name: params.name,
-      phone,
-      total_orders: 1,
-      total_spent: params.amount,
-      first_order_at: params.orderDate,
+      name: customer.name || params.name,
+      total_orders: { increment: 1 },
+      total_spent: { increment: params.amount },
       last_order_at: params.orderDate,
+      first_order_at: customer.first_order_at ?? params.orderDate,
     },
   });
 }
