@@ -45,6 +45,11 @@ export const createOrderSchema = z
     service_start_at: z.string().datetime().optional(),
     service_end_at: z.string().datetime().optional(),
     final_price: z.number().positive("final_price must be a positive number"),
+    service_type: z.string().optional(),
+    passenger_count: z.number().int().positive().optional(),
+    area: z.string().optional(),
+    notes: z.string().optional(),
+    driver_origin: z.string().optional(),
   })
   .refine(
     (v) =>
@@ -69,6 +74,11 @@ export const updateOrderSchema = z
     service_start_at: z.string().datetime().optional(),
     service_end_at: z.string().datetime().optional(),
     final_price: z.number().positive().optional(),
+    service_type: z.string().optional(),
+    passenger_count: z.number().int().positive().optional(),
+    area: z.string().optional(),
+    notes: z.string().optional(),
+    driver_origin: z.string().optional(),
     payment_status: z.enum(["UNPAID", "DP_PAID", "PAID"]).optional(),
     change_reason: z.string().optional(),
   })

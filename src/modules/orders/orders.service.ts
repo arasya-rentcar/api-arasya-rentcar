@@ -83,6 +83,11 @@ export async function createOrder(input: CreateOrderInput) {
         ? new Date(input.service_end_at)
         : null,
       final_price: calculatedFinalPrice,
+      service_type: input.service_type ?? null,
+      passenger_count: input.passenger_count ?? null,
+      area: input.area ?? null,
+      notes: input.notes ?? null,
+      driver_origin: input.driver_origin ?? null,
       service_items: serviceItems?.length
         ? { create: serviceItems }
         : undefined,
