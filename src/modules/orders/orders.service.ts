@@ -142,6 +142,152 @@ export async function listOrders() {
   });
 }
 
+export interface SearchOrdersParams {
+  search?: string;
+  order_status?: string;
+  payment_status?: string;
+  source?: string;
+  has_finance?: string; // "true" | "false"
+  date_field?: "order_date" | "service_start_at";
+  date_from?: string;
+  date_to?: string;
+  page?: number;
+  page_size?: number;
+}
+
+export async function searchOrders(params: SearchOrdersParams) {
+  const page = Math.max(1, Number(params.page) || 1);
+  const pageSize = Math.min(200, Math.max(1, Number(params.page_size) || 20));
+  const dateField =
+    params.date_field === "service_start_at"
+      ? "service_start_at"
+      : "order_date";
+
+  const where: Record<string, unknown> = {};
+  const and: unknown[] = [];
+
+  if (params.search?.trim()) {
+    const q = params.search.trim();
+    and.push({
+      OR: [
+        { customer_name: { contains: q, mode: "insensitive" } },
+        { customer_phone: { contains: q, mode: "insensitive" } },
+        { order_code: { contains: q, mode: "insensitive" } },
+        { pickup_location: { contains: q, mode: "insensitive" } },
+        { dropoff_location: { contains: q, mode: "insensitive" } },
+        { customers: { some: { name: { contains: q, mode: "insensitive" } } } },
+        { customers: { some: { phone: { contains: q, mode: "insensitive" } } } },
+        { trip: { driver: { name: { contains: q, mode: "insensitive" } } } },
+        { trip: { car: { plate_number: { contains: q, mode: "insensitive" } } } },
+        { trip: { car: { model: { contains: q, mode: "insensitive" } } } },
+        {
+          final_finance: {
+            invoice_no_raw: { contains: q, mode: "insensitive" },
+          },
+        },
+      ],
+    });
+  }
+  if (params.order_status && params.order_status !== "ALL")
+    and.push({ order_status: params.order_status });
+  if (params.payment_status && params.payment_status !== "ALL")
+    and.push({ payment_status: params.payment_status });
+  if (params.source && params.source !== "ALL")
+    and.push({ source: params.source });
+  if (params.has_finance === "true") and.push({ final_finance: { isNot: null } });
+  if (params.has_finance === "false") and.push({ final_finance: { is: null } });
+  if (params.date_from)
+    and.push({ [dateField]: { gte: new Date(`${params.date_from}T00:00:00`) } });
+  if (params.date_to)
+    and.push({ [dateField]: { lte: new Date(`${params.date_to}T23:59:59`) } });
+  if (and.length) where.AND = and;
+
+  const [total, rows, financeAgg] = await Promise.all([
+    prisma.order.count({ where }),
+    prisma.order.findMany({
+      where,
+      orderBy: { created_at: "desc" },
+      skip: (page - 1) * pageSize,
+      take: pageSize,
+      include: {
+        final_finance: {
+          select: {
+            id: true,
+            total_user_amount: true,
+            total_ops_cost: true,
+            total_driver_amount: true,
+            margin_amount: true,
+            invoice_no_raw: true,
+            driver_vendor_raw: true,
+            vehicle_raw: true,
+            route_raw: true,
+            plate_no_raw: true,
+            sheet_checked_raw: true,
+            service_date: true,
+          },
+        },
+        sheet_import_rows: {
+          select: { id: true, sheet_id: true, gid: true, row_number: true },
+        },
+        trip: {
+          select: {
+            id: true,
+            current_status: true,
+            driver: { select: { name: true } },
+            car: { select: { plate_number: true, model: true } },
+          },
+        },
+        invoices: {
+          select: {
+            id: true,
+            invoice_number: true,
+            invoice_type: true,
+            status: true,
+            amount: true,
+            file_url: true,
+          },
+          orderBy: { created_at: "desc" as const },
+        },
+        customers: { orderBy: { created_at: "asc" as const } },
+      },
+    }),
+    // Summary totals across the WHOLE filtered set (not just current page)
+    prisma.orderFinalFinance.aggregate({
+      where: { order: where },
+      _sum: {
+        total_user_amount: true,
+        total_ops_cost: true,
+        total_driver_amount: true,
+        margin_amount: true,
+      },
+    }),
+  ]);
+
+  // final_price sum (fallback turnover) across filtered set
+  const priceAgg = await prisma.order.aggregate({
+    where,
+    _sum: { final_price: true },
+  });
+
+  return {
+    data: rows,
+    pagination: {
+      page,
+      page_size: pageSize,
+      total,
+      page_count: Math.max(1, Math.ceil(total / pageSize)),
+    },
+    summary: {
+      count: total,
+      final_price_total: priceAgg._sum.final_price ?? 0,
+      total_user_amount: financeAgg._sum.total_user_amount ?? 0,
+      total_ops_cost: financeAgg._sum.total_ops_cost ?? 0,
+      total_driver_amount: financeAgg._sum.total_driver_amount ?? 0,
+      margin_amount: financeAgg._sum.margin_amount ?? 0,
+    },
+  };
+}
+
 export async function getOrderById(id: string) {
   const order = await prisma.order.findUnique({
     where: { id },

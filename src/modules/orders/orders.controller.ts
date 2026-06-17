@@ -9,6 +9,7 @@ import {
 import {
   createOrder,
   listOrders,
+  searchOrders,
   getOrderById,
   updateOrder,
   assignOrder,
@@ -44,6 +45,34 @@ export async function listOrdersController(
   try {
     const orders = await listOrders();
     res.json({ status: "success", data: orders });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function searchOrdersController(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const q = req.query;
+    const str = (v: unknown) =>
+      typeof v === "string" && v.length ? v : undefined;
+    const result = await searchOrders({
+      search: str(q.search),
+      order_status: str(q.order_status),
+      payment_status: str(q.payment_status),
+      source: str(q.source),
+      has_finance: str(q.has_finance),
+      date_field:
+        q.date_field === "service_start_at" ? "service_start_at" : "order_date",
+      date_from: str(q.date_from),
+      date_to: str(q.date_to),
+      page: q.page ? Number(q.page) : undefined,
+      page_size: q.page_size ? Number(q.page_size) : undefined,
+    });
+    res.json({ status: "success", ...result });
   } catch (err) {
     next(err);
   }

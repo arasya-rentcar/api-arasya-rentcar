@@ -6,6 +6,7 @@ import {
 import {
   createOrderController,
   listOrdersController,
+  searchOrdersController,
   getOrderByIdController,
   updateOrderController,
   assignOrderController,
@@ -23,6 +24,7 @@ router.use(verifyTokenMiddleware, requireRole("ADMIN"));
 
 router.post("/", createOrderController);
 router.get("/", listOrdersController);
+router.get("/search", searchOrdersController);
 router.get("/:id", getOrderByIdController);
 router.put("/:id", updateOrderController);
 router.post("/:id/assign", assignOrderController);
