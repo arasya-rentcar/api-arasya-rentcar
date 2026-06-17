@@ -95,6 +95,13 @@ enum OrderSource {
   IMPORT
 }
 
+enum ScheduleStatus {
+  SCHEDULED
+  IN_PROGRESS
+  DONE
+  CANCELLED
+}
+
 enum ReportInputType {
   TEXT
   IMAGE
@@ -160,6 +167,7 @@ model Driver {
   status   DriverStatus @default(AVAILABLE)
   trips    Trip[]
   reports  TripReport[]
+  schedule_lines OrderServiceItem[]
 
   @@index([phone])
   @@index([type])
@@ -175,6 +183,7 @@ model Car {
   type            DriverType @default(INTERNAL)
   origin_location String?
   trips           Trip[]
+  schedule_lines  OrderServiceItem[]
 
   @@map("cars")
 }
@@ -265,6 +274,7 @@ model ExternalVendor {
   order_count Int           @default(0)
   cars        ExternalCar[]
   orders      Order[]
+  schedule_lines OrderServiceItem[]
   created_at  DateTime      @default(now())
   updated_at  DateTime      @updatedAt
 
@@ -280,6 +290,7 @@ model ExternalCar {
   plate_number String?
   notes        String?
   orders       Order[]
+  schedule_lines OrderServiceItem[]
   created_at   DateTime       @default(now())
   updated_at   DateTime       @updatedAt
 
@@ -317,10 +328,35 @@ model OrderServiceItem {
   total_price            Decimal   @default(0) @db.Decimal(12, 2)
   notes                  String?
   sort_order             Int       @default(0)
+
+  // --- Schedule / per-day assignment ---
+  is_external            Boolean        @default(false)
+  line_status            ScheduleStatus @default(SCHEDULED)
+  driver_id              String?
+  driver                 Driver?        @relation(fields: [driver_id], references: [id], onDelete: SetNull)
+  car_id                 String?
+  car                    Car?           @relation(fields: [car_id], references: [id], onDelete: SetNull)
+  external_vendor_id     String?
+  external_vendor        ExternalVendor? @relation(fields: [external_vendor_id], references: [id], onDelete: SetNull)
+  external_car_id        String?
+  external_car           ExternalCar?    @relation(fields: [external_car_id], references: [id], onDelete: SetNull)
+  driver_name_raw        String?
+  plate_raw              String?
+
+  // --- Per-day finance (daily margin = roll-up source) ---
+  rtr_amount             Decimal?  @db.Decimal(12, 2)
+  ops_cost               Decimal   @default(0) @db.Decimal(12, 2)
+  margin_amount          Decimal?  @db.Decimal(12, 2)
+  margin_formula_version String?
+
   created_at             DateTime  @default(now())
 
   @@index([order_id])
   @@index([service_date])
+  @@index([driver_id])
+  @@index([car_id])
+  @@index([external_vendor_id])
+  @@index([line_status])
   @@map("order_service_items")
 }
 

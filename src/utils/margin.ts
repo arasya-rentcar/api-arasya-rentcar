@@ -32,3 +32,22 @@ export function computeMargin(input: MarginInputs): number {
   // Internal: total user minus total operational cost.
   return n(input.total_user_amount) - n(input.total_ops_cost);
 }
+
+/**
+ * Per-day (schedule line) margin. Same rule as the order-level formula, just
+ * applied to one day's revenue + cost so multi-day orders with mixed
+ * internal/external days roll up correctly (order margin = sum of line margins).
+ */
+export interface LineMarginInputs {
+  isExternal: boolean;
+  revenue?: number | null; // that day's user/sell price (total_price)
+  ops_cost?: number | null; // that day's ops (bensin/tol/fee/parkir/etc.)
+  rtr_amount?: number | null; // vendor RTR for external days
+}
+
+export function computeLineMargin(input: LineMarginInputs): number {
+  if (input.isExternal) {
+    return n(input.revenue) - n(input.rtr_amount);
+  }
+  return n(input.revenue) - n(input.ops_cost);
+}

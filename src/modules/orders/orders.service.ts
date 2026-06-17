@@ -128,9 +128,42 @@ export async function createOrder(input: CreateOrderInput) {
         is_external: isExternal,
         external_vendor_id: input.external_vendor_id ?? null,
         external_car_id: input.external_car_id ?? null,
-        service_items: serviceItems?.length
-          ? { create: serviceItems }
-          : undefined,
+        service_items: {
+          create: (serviceItems?.length
+            ? serviceItems
+            : [
+                {
+                  // Default single day-line so every app order shows on the
+                  // schedule even before explicit service items are added.
+                  service_date: input.service_start_at
+                    ? new Date(input.service_start_at)
+                    : orderDate,
+                  start_at: input.service_start_at
+                    ? new Date(input.service_start_at)
+                    : null,
+                  end_at: input.service_end_at
+                    ? new Date(input.service_end_at)
+                    : null,
+                  description: null,
+                  service_kind: input.service_type ?? null,
+                  pickup_location: input.pickup_location,
+                  dropoff_location: input.dropoff_location,
+                  quantity: 1,
+                  unit_price: Number(calculatedFinalPrice),
+                  total_price: Number(calculatedFinalPrice),
+                  notes: input.notes ?? null,
+                  sort_order: 0,
+                },
+              ]
+          ).map((item) => ({
+            ...item,
+            is_external: isExternal,
+            line_status: "SCHEDULED" as const,
+            external_vendor_id: input.external_vendor_id ?? null,
+            external_car_id: input.external_car_id ?? null,
+            ops_cost: 0,
+          })),
+        },
       },
     });
 
@@ -682,6 +715,14 @@ export async function assignOrder(orderId: string, input: AssignOrderInput) {
     await tx.order.update({
       where: { id: orderId },
       data: { order_status: "ASSIGNED" },
+    });
+
+    // Reflect the assignment on the schedule: any internal day-line of this
+    // order that has no driver yet inherits this driver+car. (Multi-day orders
+    // with per-day drivers are managed on the Schedule page instead.)
+    await tx.orderServiceItem.updateMany({
+      where: { order_id: orderId, is_external: false, driver_id: null },
+      data: { driver_id: input.driver_id, car_id: input.car_id },
     });
 
     return newTrip;
