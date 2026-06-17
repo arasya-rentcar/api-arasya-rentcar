@@ -99,6 +99,19 @@ export async function listOrders() {
   return prisma.order.findMany({
     orderBy: { created_at: "desc" },
     include: {
+      final_finance: {
+        select: {
+          id: true,
+          total_user_amount: true,
+          total_ops_cost: true,
+          total_driver_amount: true,
+          margin_amount: true,
+          invoice_no_raw: true,
+        },
+      },
+      sheet_import_rows: {
+        select: { id: true, sheet_id: true, gid: true, row_number: true },
+      },
       trip: {
         select: {
           id: true,
