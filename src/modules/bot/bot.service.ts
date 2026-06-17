@@ -7,6 +7,7 @@ import {
   BotFinishInput,
   BotReportInput,
 } from "./bot.validation";
+import { upsertCustomerForOrder } from "../customers/customers.service";
 
 function normalizePhone(phone = ""): string {
   let digits = phone.replace(/[^0-9]/g, "");
@@ -227,39 +228,52 @@ export async function createBotOrder(input: BotCreateOrderInput) {
   const finalPrice = serviceItems?.length
     ? serviceItemsTotal(serviceItems)
     : Number(input.final_price || 0);
+  const orderDate = new Date(input.order_date);
 
-  return prisma.order.create({
-    data: {
-      order_code: input.order_code,
-      source: "WHATSAPP",
-      customer_name: input.customer_name,
-      customer_phone: normalizePhone(input.customer_phone),
-      pickup_location: input.pickup_location,
-      dropoff_location: input.dropoff_location,
-      order_date: new Date(input.order_date),
-      service_start_at: new Date(input.order_date),
-      final_price: new Prisma.Decimal(finalPrice),
-      service_type: input.service_type,
-      passenger_count: input.passenger_count,
-      notes: input.notes,
-      area: input.area,
-      driver_origin: input.driver_origin,
-      raw_order_text: input.raw_order_text,
-      whatsapp_message_id: input.whatsapp_message_id,
-      service_items: serviceItems?.length
-        ? { create: serviceItems }
-        : undefined,
-      customers: input.customers?.length
-        ? {
-            create: input.customers.map((c, index) => ({
-              name: c.name,
-              phone: c.phone ? normalizePhone(c.phone) : null,
-              is_primary: c.is_primary ?? index === 0,
-            })),
-          }
-        : undefined,
-    },
-    include: orderInclude(),
+  return prisma.$transaction(async (tx) => {
+    // Link / upsert the customer by phone so WhatsApp orders count toward
+    // repeat-order stats just like web orders.
+    const customer = await upsertCustomerForOrder(tx, {
+      name: input.customer_name,
+      phone: input.customer_phone,
+      amount: finalPrice,
+      orderDate,
+    });
+
+    return tx.order.create({
+      data: {
+        order_code: input.order_code,
+        source: "WHATSAPP",
+        customer_name: input.customer_name,
+        customer_phone: normalizePhone(input.customer_phone),
+        customer_id: customer?.id ?? null,
+        pickup_location: input.pickup_location,
+        dropoff_location: input.dropoff_location,
+        order_date: orderDate,
+        service_start_at: orderDate,
+        final_price: new Prisma.Decimal(finalPrice),
+        service_type: input.service_type,
+        passenger_count: input.passenger_count,
+        notes: input.notes,
+        area: input.area,
+        driver_origin: input.driver_origin,
+        raw_order_text: input.raw_order_text,
+        whatsapp_message_id: input.whatsapp_message_id,
+        service_items: serviceItems?.length
+          ? { create: serviceItems }
+          : undefined,
+        customers: input.customers?.length
+          ? {
+              create: input.customers.map((c, index) => ({
+                name: c.name,
+                phone: c.phone ? normalizePhone(c.phone) : null,
+                is_primary: c.is_primary ?? index === 0,
+              })),
+            }
+          : undefined,
+      },
+      include: orderInclude(),
+    });
   });
 }
 

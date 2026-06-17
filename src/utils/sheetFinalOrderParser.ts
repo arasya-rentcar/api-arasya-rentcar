@@ -1,5 +1,23 @@
 import crypto from "crypto";
 import { OrderStatus, PaymentStatus } from "@prisma/client";
+import { computeMargin, MARGIN_FORMULA_VERSION } from "./margin";
+
+/**
+ * Decide if a sheet DRIVER/VENDOR cell is an external vendor.
+ * Heuristic (TEN 2026-06-17): a parenthesis pattern like "Vendor(Driver)"
+ * marks a sub-contracted vendor, and any name not in the internal-driver
+ * allowlist is treated as external. Pass normalized internal nicknames.
+ */
+export function isExternalDriver(
+  driverVendorRaw: string | null | undefined,
+  internalNames: Set<string> = new Set(),
+): boolean {
+  const raw = (driverVendorRaw || "").trim();
+  if (!raw) return false; // unknown -> treat as internal (no flat margin)
+  if (raw.includes("(")) return true; // vendor(driver) sub-contract
+  const key = raw.toLowerCase().replace(/\s+/g, " ").trim();
+  return !internalNames.has(key);
+}
 
 export const DEFAULT_ARASYA_SHEET_ID = "1atWWhrQwcCAi-ivqrc7RZtL45YRCEN-1efrJ9fODugs";
 export const DEFAULT_ARASYA_GID = "0";
@@ -194,7 +212,10 @@ export function fetchSheetCsvUrl(sheetId: string, gid: string): string {
   return `https://docs.google.com/spreadsheets/d/${sheetId}/export?format=csv&gid=${gid}`;
 }
 
-export function buildOrderAndFinance(row: SheetRow) {
+export function buildOrderAndFinance(
+  row: SheetRow,
+  internalNames: Set<string> = new Set(),
+) {
   const serviceDate = parseSheetDate(row["TANGGAL"]);
   const totalUser = parseMoney(row["TOTAL USER"]);
   const sellPrice = parseMoney(row["HARGA JUAL"]);
@@ -208,9 +229,14 @@ export function buildOrderAndFinance(row: SheetRow) {
   const packageRaw = cleanCell(row["PAKET"]);
   const note = cleanCell(row["KETERANGAN "]);
 
+  const externalForOrder = isExternalDriver(
+    cleanCell(row["DRIVER/VENDOR"]) || null,
+    internalNames,
+  );
   const order = {
     order_code: cleanCell(row["NO INVOICE "]) || null,
     source: "IMPORT" as const,
+    is_external: externalForOrder,
     customer_name: customerName,
     customer_phone: "-",
     pickup_location: route || "-",
@@ -262,8 +288,22 @@ export function buildOrderAndFinance(row: SheetRow) {
     total_ops_cost: parseMoney(row["TOTAL OPS COST"]),
     unit_rental_price: parseMoney(row["HARGA SEWA UNIT"]),
     margin_amount: parseMoney(row["MARGIN"]),
+    margin_formula_version: null as string | null,
     raw_row_json: row,
   };
+
+  // Compute margin when the sheet did not already provide one.
+  const isExternal = isExternalDriver(finance.driver_vendor_raw, internalNames);
+  if (finance.margin_amount == null) {
+    finance.margin_amount = computeMargin({
+      isExternal,
+      total_user_amount: finance.total_user_amount,
+      total_ops_cost: finance.total_ops_cost,
+      sell_price: finance.sell_price,
+      rtr_amount: finance.rtr_amount,
+    });
+    finance.margin_formula_version = MARGIN_FORMULA_VERSION;
+  }
 
   const warnings: string[] = [];
   if (cleanCell(row["TANGGAL"]) && !serviceDate) warnings.push(`Could not parse service date: ${row["TANGGAL"]}`);

@@ -26,12 +26,39 @@ async function loadCsv(options: ImportOptions) {
   return res.text();
 }
 
+/**
+ * Build a set of internal-driver nicknames (lowercased, including the part
+ * inside parentheses) so the importer can flag external vendors correctly.
+ */
+async function loadInternalDriverNames(): Promise<Set<string>> {
+  const drivers = await prisma.driver.findMany({
+    where: { type: "INTERNAL" },
+    select: { name: true },
+  });
+  const set = new Set<string>();
+  for (const d of drivers) {
+    const full = d.name.toLowerCase().replace(/\s+/g, " ").trim();
+    if (full) set.add(full);
+    // also index the name inside parentheses, e.g. "Hary Priyatna ( Donal )"
+    const m = d.name.match(/\(([^)]+)\)/);
+    if (m) {
+      const inner = m[1].toLowerCase().replace(/\s+/g, " ").trim();
+      if (inner) set.add(inner);
+    }
+    // and the bare first token, e.g. "Rori Afridal" -> "rori"
+    const first = full.split(" ")[0];
+    if (first) set.add(first);
+  }
+  return set;
+}
+
 export async function previewSheetImport(options: ImportOptions = {}) {
   const csv = await loadCsv(options);
   const { headers, rows } = rowsFromCsv(csv);
+  const internalNames = await loadInternalDriverNames();
   const meaningful = rows.filter(({ row }) => isMeaningfulOrderRow(row));
   const parsed = meaningful.map(({ rowNumber, row }) => {
-    const built = buildOrderAndFinance(row);
+    const built = buildOrderAndFinance(row, internalNames);
     return {
       row_number: rowNumber,
       row_hash: rowHash(row),
@@ -58,6 +85,7 @@ export async function importSheetRows(options: ImportOptions = {}) {
   const gid = options.gid || DEFAULT_ARASYA_GID;
   const csv = await loadCsv({ ...options, sheetId, gid });
   const { rows } = rowsFromCsv(csv);
+  const internalNames = await loadInternalDriverNames();
   const meaningful = rows.filter(({ row }) => isMeaningfulOrderRow(row));
 
   let imported = 0;
@@ -65,7 +93,7 @@ export async function importSheetRows(options: ImportOptions = {}) {
   const results: { row_number: number; order_id?: string; status: string; warnings: string[] }[] = [];
 
   for (const { rowNumber, row } of meaningful) {
-    const built = buildOrderAndFinance(row);
+    const built = buildOrderAndFinance(row, internalNames);
     const hash = rowHash(row);
     const existingImport = await prisma.sheetImportRow.findUnique({
       where: { sheet_id_gid_row_number: { sheet_id: sheetId, gid, row_number: rowNumber } },
