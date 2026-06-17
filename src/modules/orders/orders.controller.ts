@@ -66,6 +66,7 @@ export async function searchOrdersController(
       order_status: str(q.order_status),
       payment_status: str(q.payment_status),
       source: str(q.source),
+      bucket: str(q.bucket),
       has_finance: str(q.has_finance),
       date_field:
         q.date_field === "service_start_at" ? "service_start_at" : "order_date",

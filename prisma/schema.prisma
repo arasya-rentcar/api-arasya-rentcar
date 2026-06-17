@@ -219,6 +219,9 @@ model Order {
   review_reason          String?
   order_status           OrderStatus          @default(CREATED)
   payment_status         PaymentStatus        @default(UNPAID)
+  is_final               Boolean              @default(false)
+  invoice_missing        Boolean              @default(false)
+  is_refunded            Boolean              @default(false)
   created_at             DateTime             @default(now())
   updated_at             DateTime             @updatedAt
   customers              OrderCustomer[]
@@ -237,6 +240,9 @@ model Order {
   @@index([source])
   @@index([order_status])
   @@index([needs_review])
+  @@index([is_final])
+  @@index([invoice_missing])
+  @@index([is_refunded])
   @@index([service_start_at])
   @@index([service_end_at])
   @@index([customer_id])

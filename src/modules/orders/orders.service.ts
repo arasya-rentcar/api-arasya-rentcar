@@ -231,6 +231,7 @@ export interface SearchOrdersParams {
   order_status?: string;
   payment_status?: string;
   source?: string;
+  bucket?: string; // ALL | ACTIVE | MISSING_INVOICE | CANCELLED | NOT_FINAL | REFUNDED
   has_finance?: string; // "true" | "false"
   date_field?: "order_date" | "service_start_at";
   date_from?: string;
@@ -274,6 +275,28 @@ export async function searchOrders(params: SearchOrdersParams) {
   }
   if (params.order_status && params.order_status !== "ALL")
     and.push({ order_status: params.order_status });
+  switch (params.bucket) {
+    case "ACTIVE":
+      and.push({ order_status: { not: "CANCELLED" } });
+      and.push({ invoice_missing: false });
+      and.push({ is_refunded: false });
+      break;
+    case "MISSING_INVOICE":
+      and.push({ invoice_missing: true });
+      break;
+    case "CANCELLED":
+      and.push({ order_status: "CANCELLED" });
+      break;
+    case "NOT_FINAL":
+      and.push({ is_final: false });
+      and.push({ order_status: { not: "CANCELLED" } });
+      break;
+    case "REFUNDED":
+      and.push({ is_refunded: true });
+      break;
+    default:
+      break;
+  }
   if (params.payment_status && params.payment_status !== "ALL")
     and.push({ payment_status: params.payment_status });
   if (params.source && params.source !== "ALL")
