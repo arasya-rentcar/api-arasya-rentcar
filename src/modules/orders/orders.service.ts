@@ -7,6 +7,7 @@ import {
   CreateAdjustmentInput,
   CreateChangeLogInput,
 } from "./orders.validation";
+import { upsertCustomerForOrder } from "../customers/customers.service";
 
 function normalizeOrderCustomers(input: {
   customer_name: string;
@@ -68,30 +69,79 @@ export async function createOrder(input: CreateOrderInput) {
   const calculatedFinalPrice = serviceItems?.length
     ? serviceItemsTotal(serviceItems)
     : input.final_price;
-  return prisma.order.create({
-    data: {
-      customer_name: primary.name,
-      customer_phone: primary.phone || input.customer_phone,
-      customers: { create: customers },
-      pickup_location: input.pickup_location,
-      dropoff_location: input.dropoff_location,
-      order_date: new Date(input.order_date),
-      service_start_at: input.service_start_at
-        ? new Date(input.service_start_at)
-        : null,
-      service_end_at: input.service_end_at
-        ? new Date(input.service_end_at)
-        : null,
-      final_price: calculatedFinalPrice,
-      service_type: input.service_type ?? null,
-      passenger_count: input.passenger_count ?? null,
-      area: input.area ?? null,
-      notes: input.notes ?? null,
-      driver_origin: input.driver_origin ?? null,
-      service_items: serviceItems?.length
-        ? { create: serviceItems }
-        : undefined,
-    },
+  const orderDate = new Date(input.order_date);
+  const isExternal = input.is_external ?? false;
+
+  return prisma.$transaction(async (tx) => {
+    // Validate external links if provided.
+    if (input.external_vendor_id) {
+      const vendor = await tx.externalVendor.findUnique({
+        where: { id: input.external_vendor_id },
+      });
+      if (!vendor) throw new AppError("External vendor not found", 404);
+    }
+    if (input.external_car_id) {
+      const car = await tx.externalCar.findUnique({
+        where: { id: input.external_car_id },
+      });
+      if (!car) throw new AppError("External car not found", 404);
+      if (
+        input.external_vendor_id &&
+        car.vendor_id !== input.external_vendor_id
+      )
+        throw new AppError(
+          "External car does not belong to the given vendor",
+          400,
+        );
+    }
+
+    // Link / upsert the primary customer by phone and bump repeat-order stats.
+    const customer = await upsertCustomerForOrder(tx, {
+      name: primary.name,
+      phone: primary.phone || input.customer_phone,
+      amount: Number(calculatedFinalPrice),
+      orderDate,
+    });
+
+    const order = await tx.order.create({
+      data: {
+        customer_name: primary.name,
+        customer_phone: primary.phone || input.customer_phone,
+        customer_id: customer?.id ?? null,
+        customers: { create: customers },
+        pickup_location: input.pickup_location,
+        dropoff_location: input.dropoff_location,
+        order_date: orderDate,
+        service_start_at: input.service_start_at
+          ? new Date(input.service_start_at)
+          : null,
+        service_end_at: input.service_end_at
+          ? new Date(input.service_end_at)
+          : null,
+        final_price: calculatedFinalPrice,
+        service_type: input.service_type ?? null,
+        passenger_count: input.passenger_count ?? null,
+        area: input.area ?? null,
+        notes: input.notes ?? null,
+        driver_origin: input.driver_origin ?? null,
+        is_external: isExternal,
+        external_vendor_id: input.external_vendor_id ?? null,
+        external_car_id: input.external_car_id ?? null,
+        service_items: serviceItems?.length
+          ? { create: serviceItems }
+          : undefined,
+      },
+    });
+
+    // Bump vendor usage count for the External menu sort.
+    if (input.external_vendor_id) {
+      await tx.externalVendor.update({
+        where: { id: input.external_vendor_id },
+        data: { order_count: { increment: 1 } },
+      });
+    }
+
+    return order;
   });
 }
 

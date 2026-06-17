@@ -199,6 +199,13 @@ model Order {
   raw_order_text         String?
   whatsapp_message_id    String?
   driver_message_sent_at DateTime?
+  customer_id            String?
+  customer               Customer?            @relation(fields: [customer_id], references: [id], onDelete: SetNull)
+  is_external            Boolean              @default(false)
+  external_vendor_id     String?
+  external_vendor        ExternalVendor?      @relation(fields: [external_vendor_id], references: [id], onDelete: SetNull)
+  external_car_id        String?
+  external_car           ExternalCar?         @relation(fields: [external_car_id], references: [id], onDelete: SetNull)
   needs_review           Boolean              @default(false)
   review_reason          String?
   order_status           OrderStatus          @default(CREATED)
@@ -223,7 +230,61 @@ model Order {
   @@index([needs_review])
   @@index([service_start_at])
   @@index([service_end_at])
+  @@index([customer_id])
+  @@index([external_vendor_id])
+  @@index([external_car_id])
+  @@index([is_external])
   @@map("orders")
+}
+
+model Customer {
+  id            String   @id @default(uuid())
+  name          String
+  phone         String   @unique
+  email         String?
+  tags          String[] @default([])
+  total_orders  Int      @default(0)
+  total_spent   Decimal  @default(0) @db.Decimal(14, 2)
+  first_order_at DateTime?
+  last_order_at DateTime?
+  notes         String?
+  orders        Order[]
+  created_at    DateTime @default(now())
+  updated_at    DateTime @updatedAt
+
+  @@index([phone])
+  @@index([total_orders])
+  @@map("customers")
+}
+
+model ExternalVendor {
+  id          String        @id @default(uuid())
+  name        String
+  phone       String?
+  notes       String?
+  order_count Int           @default(0)
+  cars        ExternalCar[]
+  orders      Order[]
+  created_at  DateTime      @default(now())
+  updated_at  DateTime      @updatedAt
+
+  @@index([name])
+  @@map("external_vendors")
+}
+
+model ExternalCar {
+  id           String         @id @default(uuid())
+  vendor_id    String
+  vendor       ExternalVendor @relation(fields: [vendor_id], references: [id], onDelete: Cascade)
+  model        String
+  plate_number String?
+  notes        String?
+  orders       Order[]
+  created_at   DateTime       @default(now())
+  updated_at   DateTime       @updatedAt
+
+  @@index([vendor_id])
+  @@map("external_cars")
 }
 
 model OrderCustomer {

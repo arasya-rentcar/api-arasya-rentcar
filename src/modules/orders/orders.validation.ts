@@ -50,6 +50,9 @@ export const createOrderSchema = z
     area: z.string().optional(),
     notes: z.string().optional(),
     driver_origin: z.string().optional(),
+    is_external: z.boolean().optional(),
+    external_vendor_id: z.string().uuid().optional(),
+    external_car_id: z.string().uuid().optional(),
   })
   .refine(
     (v) =>
@@ -79,6 +82,9 @@ export const updateOrderSchema = z
     area: z.string().optional(),
     notes: z.string().optional(),
     driver_origin: z.string().optional(),
+    is_external: z.boolean().optional(),
+    external_vendor_id: z.string().uuid().optional(),
+    external_car_id: z.string().uuid().optional(),
     payment_status: z.enum(["UNPAID", "DP_PAID", "PAID"]).optional(),
     change_reason: z.string().optional(),
   })
