@@ -5,7 +5,8 @@
   "main": "dist/server.js",
   "scripts": {
     "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
-    "build": "tsc",
+    "build": "tsc && npm run copy:assets",
+    "copy:assets": "mkdir -p dist/src/assets/brand && cp -r src/assets/brand/. dist/src/assets/brand/",
     "start": "node dist/server.js",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",

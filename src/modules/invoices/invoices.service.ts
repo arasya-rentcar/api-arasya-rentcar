@@ -9,6 +9,23 @@ import {
   SendInvoiceWhatsappInput,
 } from "./invoices.validation";
 
+// Build the descriptive note lines shown under the table (pickup / dropoff /
+// what's included), mirroring the official invoice/kuitansi templates.
+function buildNoteLines(order: {
+  pickup_location?: string | null;
+  dropoff_location?: string | null;
+}): string[] {
+  const lines: string[] = [];
+  if (order.pickup_location) lines.push(`Jemput : ${order.pickup_location}`);
+  if (order.dropoff_location)
+    lines.push(`Tujuan : pemakaian area ${order.dropoff_location}`);
+  lines.push("Harga termasuk mobil supir bbm tol makan supir");
+  lines.push(
+    "Parkir/tiket masuk kawasan dan tips supir seikhlasnya dari Tamu",
+  );
+  return lines;
+}
+
 export async function generateInvoice(
   orderId: string,
   input: GenerateInvoiceInput,
@@ -112,8 +129,10 @@ export async function generateInvoice(
 
   const pdfBuffer = await generateInvoicePDF({
     invoiceNumber,
+    displayNumber: order.order_code ?? null,
     issueDate,
     customerName: order.customer_name,
+    customerPhone: order.customer_phone ?? null,
     pickupLocation: order.pickup_location,
     dropoffLocation: order.dropoff_location,
     finalPrice,
@@ -123,10 +142,12 @@ export async function generateInvoice(
     previouslyPaid: alreadyInvoiced,
     documentMode: "INVOICE",
     dueDate,
+    noteLines: buildNoteLines(order),
     items: order.service_items.map((item) => ({
       serviceDate: item.service_date,
       description: item.description,
       serviceKind: item.service_kind,
+      servicePackage: item.service_package,
       pickupLocation: item.pickup_location,
       dropoffLocation: item.dropoff_location,
       quantity: item.quantity,
@@ -235,13 +256,49 @@ export async function markInvoicePaid(
   });
   const previouslyPaid = Number(priorAgg._sum.amount ?? 0);
 
+  // Build the "payments received" lines for the kuitansi: all PAID invoices so
+  // far (DP / settlement / etc.) plus the one being paid now.
+  const priorPaid = await prisma.invoice.findMany({
+    where: { order_id: invoice.order_id, status: "PAID", id: { not: invoice.id } },
+    orderBy: { issue_date: "asc" },
+  });
+  const typeLabelId: Record<string, string> = {
+    DP: "Pembayaran DP diterima",
+    SETTLEMENT: "Pelunasan diterima",
+    FULL: "Pembayaran diterima",
+    ADDITIONAL: "Pembayaran tambahan diterima",
+  };
+  const fmtTgl = (d: Date) =>
+    new Date(d).toLocaleDateString("id-ID", {
+      day: "numeric",
+      month: "long",
+      year: "numeric",
+    });
+  const paymentsReceived = [
+    ...priorPaid.map((p) => ({
+      label: `${typeLabelId[p.invoice_type] ?? "Pembayaran diterima"} tanggal ${fmtTgl(p.paid_at ?? p.issue_date)}`,
+      amount: Number(p.amount),
+    })),
+    {
+      label: `${typeLabelId[invoice.invoice_type] ?? "Pembayaran diterima"} tanggal ${fmtTgl(paidAt)}`,
+      amount: Number(invoice.amount),
+    },
+  ];
+  const totalReceived = paymentsReceived.reduce((s, p) => s + p.amount, 0);
+  const remainingBalance = Math.max(
+    Number(invoice.order.final_price) - totalReceived,
+    0,
+  );
+
   // Regenerate the PDF as a Kwitansi/Receipt (LUNAS stamp, payment date).
   let receiptUrl = invoice.file_url;
   try {
     const pdfBuffer = await generateInvoicePDF({
       invoiceNumber: invoice.invoice_number,
+      displayNumber: invoice.order.order_code ?? null,
       issueDate: invoice.issue_date,
       customerName: invoice.order.customer_name,
+      customerPhone: invoice.order.customer_phone ?? null,
       pickupLocation: invoice.order.pickup_location,
       dropoffLocation: invoice.order.dropoff_location,
       finalPrice: Number(invoice.order.final_price),
@@ -251,10 +308,14 @@ export async function markInvoicePaid(
       previouslyPaid,
       documentMode: "RECEIPT",
       paidAt,
+      paymentsReceived,
+      remainingBalance,
+      noteLines: buildNoteLines(invoice.order),
       items: invoice.order.service_items.map((item) => ({
         serviceDate: item.service_date,
         description: item.description,
         serviceKind: item.service_kind,
+        servicePackage: item.service_package,
         pickupLocation: item.pickup_location,
         dropoffLocation: item.dropoff_location,
         quantity: item.quantity,
