@@ -291,7 +291,9 @@ export async function markInvoicePaid(
   );
 
   // Regenerate the PDF as a Kwitansi/Receipt (LUNAS stamp, payment date).
-  let receiptUrl = invoice.file_url;
+  // IMPORTANT: this is stored in receipt_url, NOT file_url. The original
+  // invoice PDF (file_url) is kept so the order keeps BOTH documents paired.
+  let receiptUrl: string | null = null;
   try {
     const pdfBuffer = await generateInvoicePDF({
       invoiceNumber: invoice.invoice_number,
@@ -338,7 +340,7 @@ export async function markInvoicePaid(
       data: {
         status: "PAID",
         paid_at: paidAt,
-        file_url: receiptUrl,
+        receipt_url: receiptUrl,
         ...(input.payment_method
           ? { payment_method: input.payment_method as never }
           : {}),
