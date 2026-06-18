@@ -47,6 +47,7 @@ function normalizeServiceItems(input: CreateOrderInput | UpdateOrderInput) {
       end_at: item.end_at ? new Date(item.end_at) : null,
       description: item.description || null,
       service_kind: item.service_kind || null,
+      service_package: item.service_package || null,
       pickup_location: item.pickup_location,
       dropoff_location: item.dropoff_location,
       driver_origin_location: item.driver_origin_location || null,
@@ -538,7 +539,24 @@ export async function getOrderById(id: string) {
         select: { id: true, name: true, phone: true, total_orders: true },
       },
       customers: { orderBy: { created_at: "asc" as const } },
-      service_items: { orderBy: { sort_order: "asc" as const } },
+      service_items: {
+        orderBy: { sort_order: "asc" as const },
+        include: {
+          driver: { select: { id: true, name: true } },
+          car: {
+            select: {
+              id: true,
+              model: true,
+              plate_number: true,
+              unit_code: true,
+            },
+          },
+          external_vendor: { select: { id: true, name: true } },
+          external_car: {
+            select: { id: true, model: true, plate_number: true },
+          },
+        },
+      },
       adjustments: { orderBy: { created_at: "desc" as const } },
       change_logs: { orderBy: { created_at: "desc" as const } },
     },

@@ -326,6 +326,7 @@ model OrderServiceItem {
   end_at                 DateTime?
   description            String?
   service_kind           String?
+  service_package        String?
   pickup_location        String
   dropoff_location       String
   driver_origin_location String?

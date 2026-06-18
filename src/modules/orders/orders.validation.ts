@@ -13,6 +13,7 @@ const orderServiceItemSchema = z
     end_at: z.string().datetime().optional(),
     description: z.string().optional(),
     service_kind: z.string().optional(),
+    service_package: z.string().optional(),
     pickup_location: z.string().min(1),
     dropoff_location: z.string().min(1),
     driver_origin_location: z.string().optional(),
