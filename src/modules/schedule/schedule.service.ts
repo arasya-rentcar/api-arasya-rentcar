@@ -220,18 +220,32 @@ export async function rollupOrderFinance(
     margin += Number(l.margin_amount ?? 0);
     if (l.is_external) anyExternal = true;
   }
+  // Billable adjustments (overtime/parking/etc.) bump the order total too, so
+  // include them — otherwise re-running the rollup would wipe additional
+  // charges back down to the bare service-line sum.
+  const adjustments = await tx.orderAdjustment.findMany({
+    where: { order_id: orderId, is_billable: true },
+  });
+  const adjustmentsTotal = adjustments.reduce(
+    (s, a) => s + Number(a.amount ?? 0) * (a.quantity ?? 1),
+    0,
+  );
+  const finalPrice = revenue + adjustmentsTotal;
+  // Additional billable charges also add to revenue + margin (they are pure
+  // markup with no extra resource cost recorded here).
+  margin += adjustmentsTotal;
   // External lines pay RTR to the vendor; internal lines pay ops_cost to the
   // driver. Roll RTR up so the order-level Finance card no longer shows a
   // blank RTR for external orders. total_driver_amount stays a manual/optional
   // override (Driver Cost) so it does not duplicate Ops Cost.
   await tx.order.update({
     where: { id: orderId },
-    data: { final_price: revenue, is_external: anyExternal },
+    data: { final_price: finalPrice, is_external: anyExternal },
   });
   await tx.orderFinalFinance.upsert({
     where: { order_id: orderId },
     update: {
-      total_user_amount: revenue,
+      total_user_amount: finalPrice,
       total_ops_cost: ops,
       rtr_amount: rtr,
       margin_amount: margin,
@@ -239,7 +253,7 @@ export async function rollupOrderFinance(
     },
     create: {
       order_id: orderId,
-      total_user_amount: revenue,
+      total_user_amount: finalPrice,
       total_ops_cost: ops,
       rtr_amount: rtr,
       margin_amount: margin,

@@ -104,6 +104,20 @@ export async function dashboardAnalytics(opts: RangeOpts = {}) {
     }),
   ]);
 
+  // Billable adjustments per order (pure-markup revenue/margin), so the
+  // order-level margin here matches OrderFinalFinance after rollup.
+  const adjustmentRows = await prisma.orderAdjustment.findMany({
+    where: { is_billable: true, order: { order_status: { not: 'CANCELLED' } } },
+    select: { order_id: true, amount: true, quantity: true },
+  });
+  const adjByOrder = new Map<string, number>();
+  for (const a of adjustmentRows) {
+    adjByOrder.set(
+      a.order_id,
+      (adjByOrder.get(a.order_id) ?? 0) + n(a.amount) * (a.quantity ?? 1),
+    );
+  }
+
   // Map invoices by order
   const invByOrder = new Map<string, typeof invoices>();
   for (const inv of invoices) {
@@ -173,13 +187,16 @@ export async function dashboardAnalytics(opts: RangeOpts = {}) {
   }
   const marginRows = [...marginByOrder.entries()].map(([oid, v]) => {
     const o = orderMap.get(oid)!;
+    const adj = adjByOrder.get(oid) ?? 0;
+    const revenue = v.revenue + adj;
+    const margin = v.margin + adj;
     return {
       order_id: oid,
       order_code: o.order_code,
       customer_name: o.customer_name,
-      revenue: v.revenue,
-      margin: v.margin,
-      margin_pct: v.revenue > 0 ? (v.margin / v.revenue) * 100 : 0,
+      revenue,
+      margin,
+      margin_pct: revenue > 0 ? (margin / revenue) * 100 : 0,
     };
   });
   const topMargin = [...marginRows]
