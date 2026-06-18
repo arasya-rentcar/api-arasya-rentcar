@@ -7,6 +7,7 @@ import {
 } from './payables.validation';
 import {
   listPayables,
+  payablesSummary,
   getPayable,
   updatePayable,
   markPayablePaid,
@@ -15,6 +16,22 @@ import {
   driverPayableHistory,
   vendorPayableHistory,
 } from './payables.service';
+
+export async function payablesSummaryController(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const data = await payablesSummary({
+      date_from: req.query.date_from as string | undefined,
+      date_to: req.query.date_to as string | undefined,
+    });
+    res.json({ status: 'success', data });
+  } catch (err) {
+    next(err);
+  }
+}
 
 export async function listPayablesController(
   req: Request,

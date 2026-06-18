@@ -122,6 +122,62 @@ function recalcTotal(base: number, extrasSum: number): number {
 }
 
 /** List payables with filters, pagination, and summary totals. */
+/**
+ * Dashboard summary: outstanding + paid + count, split by kind
+ * (DRIVER = internal debt, VENDOR = external debt). Optional date range
+ * filters on service_date.
+ */
+export async function payablesSummary(opts: {
+  date_from?: string;
+  date_to?: string;
+} = {}) {
+  const dateFilter: Prisma.DateTimeFilter = {};
+  if (opts.date_from) dateFilter.gte = new Date(opts.date_from);
+  if (opts.date_to) dateFilter.lte = new Date(opts.date_to);
+  const hasDate = opts.date_from || opts.date_to;
+
+  async function forKind(kind: 'DRIVER' | 'VENDOR') {
+    const base: Prisma.PayableWhereInput = { kind };
+    if (hasDate) base.service_date = dateFilter;
+    const [unpaid, paid, unpaidCount, paidCount] = await Promise.all([
+      prisma.payable.aggregate({
+        where: { ...base, status: 'UNPAID' },
+        _sum: { total_amount: true },
+      }),
+      prisma.payable.aggregate({
+        where: { ...base, status: 'PAID' },
+        _sum: { total_amount: true },
+      }),
+      prisma.payable.count({ where: { ...base, status: 'UNPAID' } }),
+      prisma.payable.count({ where: { ...base, status: 'PAID' } }),
+    ]);
+    const outstanding = Number(unpaid._sum.total_amount ?? 0);
+    const paidTotal = Number(paid._sum.total_amount ?? 0);
+    return {
+      outstanding,
+      paid: paidTotal,
+      total: outstanding + paidTotal,
+      unpaid_count: unpaidCount,
+      paid_count: paidCount,
+    };
+  }
+
+  const [driver, vendor] = await Promise.all([
+    forKind('DRIVER'),
+    forKind('VENDOR'),
+  ]);
+
+  return {
+    driver,
+    vendor,
+    combined: {
+      outstanding: driver.outstanding + vendor.outstanding,
+      paid: driver.paid + vendor.paid,
+      total: driver.total + vendor.total,
+    },
+  };
+}
+
 export async function listPayables(query: ListPayablesQuery) {
   const where: Prisma.PayableWhereInput = {};
   if (query.kind) where.kind = query.kind;
