@@ -16,6 +16,16 @@ import {
   updateVendorCar,
   deleteVendorCar,
 } from './external-vendors.service';
+import { getVendorDetail } from '../drivers/drivers.service';
+
+export async function getVendorDetailController(req: Request, res: Response, next: NextFunction): Promise<void> {
+  try {
+    const data = await getVendorDetail(req.params.id);
+    res.json({ status: 'success', data });
+  } catch (err) {
+    next(err);
+  }
+}
 
 export async function createVendorController(
   req: Request,

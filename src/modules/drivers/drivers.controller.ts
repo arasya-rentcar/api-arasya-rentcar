@@ -4,6 +4,8 @@ import {
   createDriver,
   listDrivers,
   getDriverById,
+  getDriverDetail,
+  getVendorDetail,
   updateDriver,
   getMyActiveTrip,
 } from './drivers.service';
@@ -31,6 +33,24 @@ export async function getDriverByIdController(req: Request, res: Response, next:
   try {
     const driver = await getDriverById(req.params.id);
     res.json({ status: 'success', data: driver });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function getDriverDetailController(req: Request, res: Response, next: NextFunction): Promise<void> {
+  try {
+    const data = await getDriverDetail(req.params.id);
+    res.json({ status: 'success', data });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function getVendorDetailController(req: Request, res: Response, next: NextFunction): Promise<void> {
+  try {
+    const data = await getVendorDetail(req.params.id);
+    res.json({ status: 'success', data });
   } catch (err) {
     next(err);
   }

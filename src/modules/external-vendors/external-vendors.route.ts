@@ -7,6 +7,7 @@ import {
   createVendorController,
   listVendorsController,
   getVendorByIdController,
+  getVendorDetailController,
   updateVendorController,
   deleteVendorController,
   addVendorCarController,
@@ -20,6 +21,7 @@ router.use(verifyTokenMiddleware, requireRole('ADMIN'));
 
 router.post('/', createVendorController);
 router.get('/', listVendorsController);
+router.get('/:id/detail', getVendorDetailController);
 router.get('/:id', getVendorByIdController);
 router.put('/:id', updateVendorController);
 router.delete('/:id', deleteVendorController);

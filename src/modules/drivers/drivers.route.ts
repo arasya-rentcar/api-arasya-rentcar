@@ -4,6 +4,7 @@ import {
   createDriverController,
   listDriversController,
   getDriverByIdController,
+  getDriverDetailController,
   updateDriverController,
   getMyTripController,
 } from './drivers.controller';
@@ -18,6 +19,7 @@ router.get('/me/trip', requireRole('DRIVER'), getMyTripController);
 // ADMIN routes
 router.post('/', requireRole('ADMIN'), createDriverController);
 router.get('/', requireRole('ADMIN'), listDriversController);
+router.get('/:id/detail', requireRole('ADMIN'), getDriverDetailController);
 router.get('/:id', requireRole('ADMIN'), getDriverByIdController);
 router.put('/:id', requireRole('ADMIN'), updateDriverController);
 
