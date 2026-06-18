@@ -9,7 +9,7 @@ export async function uploadInvoicePDF(buffer: Buffer, fileName: string): Promis
 
   const { error } = await supabase.storage.from(BUCKET).upload(storagePath, buffer, {
     contentType: 'application/pdf',
-    upsert: false,
+    upsert: true,
   });
 
   if (error) {

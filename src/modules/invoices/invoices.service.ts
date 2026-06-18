@@ -121,6 +121,8 @@ export async function generateInvoice(
     paymentMethod: methodLabels[input.payment_method] ?? input.payment_method,
     amountPaid: input.amount,
     previouslyPaid: alreadyInvoiced,
+    documentMode: "INVOICE",
+    dueDate,
     items: order.service_items.map((item) => ({
       serviceDate: item.service_date,
       description: item.description,
@@ -192,7 +194,9 @@ export async function markInvoicePaid(
 ) {
   const invoice = await prisma.invoice.findUnique({
     where: { id: invoiceId },
-    include: { order: true },
+    include: {
+      order: { include: { service_items: { orderBy: { sort_order: "asc" } } } },
+    },
   });
   if (!invoice) throw new AppError("Invoice not found", 404);
   if (invoice.status === "PAID") return invoice;
@@ -204,6 +208,68 @@ export async function markInvoicePaid(
   }
 
   const paidAt = input.paid_at ? new Date(input.paid_at) : new Date();
+  const paymentMethod = (input.payment_method ||
+    invoice.payment_method) as string;
+
+  const typeLabels: Record<string, string> = {
+    DP: "Down Payment",
+    SETTLEMENT: "Settlement Payment",
+    FULL: "Full Payment",
+    ADDITIONAL: "Additional Charge",
+  };
+  const methodLabels: Record<string, string> = {
+    CASH: "Cash",
+    BANK_TRANSFER: "Bank Transfer",
+    QRIS: "QRIS",
+    OTHER: "Other",
+  };
+
+  // Sum of prior invoices (excluding this one) for the receipt summary.
+  const priorAgg = await prisma.invoice.aggregate({
+    where: {
+      order_id: invoice.order_id,
+      id: { not: invoice.id },
+      status: { notIn: ["REVISED", "CANCELLED"] },
+    },
+    _sum: { amount: true },
+  });
+  const previouslyPaid = Number(priorAgg._sum.amount ?? 0);
+
+  // Regenerate the PDF as a Kwitansi/Receipt (LUNAS stamp, payment date).
+  let receiptUrl = invoice.file_url;
+  try {
+    const pdfBuffer = await generateInvoicePDF({
+      invoiceNumber: invoice.invoice_number,
+      issueDate: invoice.issue_date,
+      customerName: invoice.order.customer_name,
+      pickupLocation: invoice.order.pickup_location,
+      dropoffLocation: invoice.order.dropoff_location,
+      finalPrice: Number(invoice.order.final_price),
+      invoiceType: typeLabels[invoice.invoice_type] ?? invoice.invoice_type,
+      paymentMethod: methodLabels[paymentMethod] ?? paymentMethod,
+      amountPaid: Number(invoice.amount),
+      previouslyPaid,
+      documentMode: "RECEIPT",
+      paidAt,
+      items: invoice.order.service_items.map((item) => ({
+        serviceDate: item.service_date,
+        description: item.description,
+        serviceKind: item.service_kind,
+        pickupLocation: item.pickup_location,
+        dropoffLocation: item.dropoff_location,
+        quantity: item.quantity,
+        unitPrice: Number(item.unit_price),
+        totalPrice: Number(item.total_price),
+      })),
+    });
+    receiptUrl = await uploadInvoicePDF(
+      pdfBuffer,
+      `${invoice.invoice_number}-receipt.pdf`,
+    );
+  } catch (err) {
+    // If receipt PDF fails, still mark paid; keep the existing invoice PDF.
+    console.error("Receipt PDF generation failed:", err);
+  }
 
   return prisma.$transaction(async (tx) => {
     const updated = await tx.invoice.update({
@@ -211,6 +277,7 @@ export async function markInvoicePaid(
       data: {
         status: "PAID",
         paid_at: paidAt,
+        file_url: receiptUrl,
         ...(input.payment_method
           ? { payment_method: input.payment_method as never }
           : {}),

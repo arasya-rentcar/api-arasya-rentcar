@@ -1,4 +1,11 @@
-import { PDFDocument, rgb, StandardFonts, PDFFont, PDFPage } from "pdf-lib";
+import {
+  PDFDocument,
+  rgb,
+  degrees,
+  StandardFonts,
+  PDFFont,
+  PDFPage,
+} from "pdf-lib";
 
 export interface InvoiceLineItem {
   serviceDate?: Date | string | null;
@@ -24,6 +31,21 @@ export interface InvoiceData {
   paymentMethod: string; // e.g. "Cash", "Bank Transfer", "QRIS"
   amountPaid: number; // Amount for this specific invoice
   previouslyPaid: number; // Sum of all prior invoices
+  // Document mode: a normal bill ("INVOICE") or proof of payment ("RECEIPT"/Kwitansi).
+  documentMode?: "INVOICE" | "RECEIPT";
+  paidAt?: Date | string | null; // when the payment was received (receipt)
+  dueDate?: Date | string | null; // due date for settlement invoices
+}
+
+function formatDateId(value: Date | string | null | undefined): string {
+  if (!value) return "-";
+  const d = value instanceof Date ? value : new Date(value);
+  if (isNaN(d.getTime())) return "-";
+  return d.toLocaleDateString("id-ID", {
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+  });
 }
 
 function formatRp(value: number): string {
@@ -108,25 +130,33 @@ export async function generateInvoicePDF(data: InvoiceData): Promise<Buffer> {
     color: rgb(0.65, 0.65, 0.65),
   });
 
-  // Invoice type label + number on the right
-  page.drawText("INVOICE", {
-    x: width - margin - 70,
+  // Document title (INVOICE vs KWITANSI/RECEIPT) + type + number on the right
+  const isReceipt = data.documentMode === "RECEIPT";
+  const docTitle = isReceipt ? "KWITANSI" : "INVOICE";
+  const titleWidth = bold.widthOfTextAtSize(docTitle, 18);
+  page.drawText(docTitle, {
+    x: width - margin - titleWidth,
     y: height - 45,
     size: 18,
     font: bold,
     color: rgb(1, 1, 1),
   });
 
-  page.drawText(sanitizeText(data.invoiceType).toUpperCase(), {
-    x: width - margin - 110,
+  const subLabel = isReceipt
+    ? `RECEIPT - ${sanitizeText(data.invoiceType).toUpperCase()}`
+    : sanitizeText(data.invoiceType).toUpperCase();
+  const subWidth = bold.widthOfTextAtSize(subLabel, 9);
+  page.drawText(subLabel, {
+    x: width - margin - subWidth,
     y: height - 62,
     size: 9,
     font: bold,
-    color: rgb(0.45, 0.85, 0.55),
+    color: isReceipt ? rgb(0.45, 0.85, 0.55) : rgb(0.45, 0.85, 0.55),
   });
 
+  const numWidth = regular.widthOfTextAtSize(data.invoiceNumber, 8);
   page.drawText(data.invoiceNumber, {
-    x: width - margin - 120,
+    x: width - margin - numWidth,
     y: height - 78,
     size: 8,
     font: regular,
@@ -136,13 +166,17 @@ export async function generateInvoicePDF(data: InvoiceData): Promise<Buffer> {
   // ── Info Section ──────────────────────────────────────────────────
   let y = height - 160;
 
-  const issueDateStr = data.issueDate.toLocaleDateString("id-ID", {
-    year: "numeric",
-    month: "long",
-    day: "numeric",
-  });
+  const issueDateStr = formatDateId(data.issueDate);
 
-  drawLabelValue(page, "ISSUE DATE", issueDateStr, margin, y, regular, bold);
+  drawLabelValue(
+    page,
+    isReceipt ? "PAYMENT DATE" : "ISSUE DATE",
+    isReceipt ? formatDateId(data.paidAt ?? data.issueDate) : issueDateStr,
+    margin,
+    y,
+    regular,
+    bold,
+  );
   drawLabelValue(
     page,
     "CUSTOMER NAME",
@@ -152,6 +186,17 @@ export async function generateInvoicePDF(data: InvoiceData): Promise<Buffer> {
     regular,
     bold,
   );
+
+  // Show due date for settlement invoices (not receipts)
+  if (!isReceipt && data.dueDate) {
+    page.drawText(`DUE DATE: ${formatDateId(data.dueDate)}`, {
+      x: margin,
+      y: y - 16,
+      size: 8,
+      font: bold,
+      color: rgb(0.85, 0.4, 0.2),
+    });
+  }
 
   y -= 50;
 
@@ -361,7 +406,7 @@ export async function generateInvoicePDF(data: InvoiceData): Promise<Buffer> {
 
   y -= 22;
 
-  page.drawText("AMOUNT PAID", {
+  page.drawText(isReceipt ? "AMOUNT RECEIVED" : "AMOUNT PAID", {
     x: margin + 10,
     y,
     size: 12,
@@ -369,13 +414,50 @@ export async function generateInvoicePDF(data: InvoiceData): Promise<Buffer> {
     color: rgb(0.07, 0.07, 0.07),
   });
 
-  page.drawText(formatRp(data.amountPaid), {
-    x: width - margin - 90,
+  const amtStr = formatRp(data.amountPaid);
+  const amtWidth = bold.widthOfTextAtSize(amtStr, 13);
+  page.drawText(amtStr, {
+    x: width - margin - amtWidth,
     y,
     size: 13,
     font: bold,
     color: rgb(0.07, 0.07, 0.07),
   });
+
+  // LUNAS / PAID stamp for receipts
+  if (isReceipt) {
+    const stampX = margin + 150;
+    const stampY = y - 30;
+    const stampW = 130;
+    const stampH = 44;
+    page.drawRectangle({
+      x: stampX,
+      y: stampY,
+      width: stampW,
+      height: stampH,
+      borderColor: rgb(0.13, 0.6, 0.3),
+      borderWidth: 2.5,
+      color: rgb(0.9, 0.98, 0.93),
+      opacity: 0.9,
+      rotate: degrees(-8),
+    });
+    page.drawText("LUNAS", {
+      x: stampX + 18,
+      y: stampY + 22,
+      size: 22,
+      font: bold,
+      color: rgb(0.13, 0.6, 0.3),
+      rotate: degrees(-8),
+    });
+    page.drawText("PAID IN FULL", {
+      x: stampX + 20,
+      y: stampY + 8,
+      size: 7,
+      font: bold,
+      color: rgb(0.13, 0.6, 0.3),
+      rotate: degrees(-8),
+    });
+  }
 
   y -= 55;
 
@@ -430,13 +512,18 @@ export async function generateInvoicePDF(data: InvoiceData): Promise<Buffer> {
     color: rgb(0.82, 0.82, 0.82),
   });
 
-  page.drawText("Thank you for choosing ARASYA RENTCAR.", {
-    x: margin,
-    y: 62,
-    size: 9,
-    font: regular,
-    color: rgb(0.5, 0.5, 0.5),
-  });
+  page.drawText(
+    isReceipt
+      ? "Payment received with thanks. Terima kasih telah mempercayai ARASYA RENTCAR."
+      : "Thank you for choosing ARASYA RENTCAR.",
+    {
+      x: margin,
+      y: 62,
+      size: 9,
+      font: regular,
+      color: rgb(0.5, 0.5, 0.5),
+    },
+  );
 
   page.drawText("This document was generated automatically.", {
     x: margin,
