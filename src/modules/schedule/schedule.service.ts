@@ -1,6 +1,7 @@
 import prisma from '../../prisma/client';
 import { AppError } from '../../utils/AppError';
 import { computeLineMargin, MARGIN_FORMULA_VERSION } from '../../utils/margin';
+import { syncPayableForLine } from '../payables/payables.service';
 import {
   ListScheduleQuery,
   AssignScheduleLineInput,
@@ -192,9 +193,10 @@ export async function assignScheduleLine(
       data,
       include: lineInclude,
     });
+    await syncPayableForLine(tx, id);
     await rollupOrderFinance(tx, line.order_id);
     return u;
-  });
+  }, { timeout: 20000, maxWait: 10000 });
   return updated;
 }
 

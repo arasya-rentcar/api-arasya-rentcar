@@ -156,18 +156,19 @@ model User {
 }
 
 model Driver {
-  id       String       @id @default(uuid())
-  user_id  String       @unique
-  user     User         @relation(fields: [user_id], references: [id])
-  name     String
-  phone    String
-  email    String?
-  location String?
-  type     DriverType   @default(INTERNAL)
-  status   DriverStatus @default(AVAILABLE)
-  trips    Trip[]
-  reports  TripReport[]
+  id             String             @id @default(uuid())
+  user_id        String             @unique
+  user           User               @relation(fields: [user_id], references: [id])
+  name           String
+  phone          String
+  email          String?
+  location       String?
+  type           DriverType         @default(INTERNAL)
+  status         DriverStatus       @default(AVAILABLE)
+  trips          Trip[]
+  reports        TripReport[]
   schedule_lines OrderServiceItem[]
+  payables       Payable[]
 
   @@index([phone])
   @@index([type])
@@ -175,12 +176,12 @@ model Driver {
 }
 
 model Car {
-  id              String     @id @default(uuid())
-  plate_number    String     @unique
-  unit_code       String?    @unique
+  id              String             @id @default(uuid())
+  plate_number    String             @unique
+  unit_code       String?            @unique
   model           String
-  status          CarStatus  @default(AVAILABLE)
-  type            DriverType @default(INTERNAL)
+  status          CarStatus          @default(AVAILABLE)
+  type            DriverType         @default(INTERNAL)
   origin_location String?
   trips           Trip[]
   schedule_lines  OrderServiceItem[]
@@ -235,6 +236,7 @@ model Order {
   invoice_delivery_logs  InvoiceDeliveryLog[]
   adjustments            OrderAdjustment[]
   change_logs            OrderChangeLog[]
+  payables               Payable[]
 
   @@index([order_code])
   @@index([source])
@@ -253,19 +255,19 @@ model Order {
 }
 
 model Customer {
-  id            String   @id @default(uuid())
-  name          String
-  phone         String?  @unique
-  email         String?
-  tags          String[] @default([])
-  total_orders  Int      @default(0)
-  total_spent   Decimal  @default(0) @db.Decimal(14, 2)
+  id             String    @id @default(uuid())
+  name           String
+  phone          String?   @unique
+  email          String?
+  tags           String[]  @default([])
+  total_orders   Int       @default(0)
+  total_spent    Decimal   @default(0) @db.Decimal(14, 2)
   first_order_at DateTime?
-  last_order_at DateTime?
-  notes         String?
-  orders        Order[]
-  created_at    DateTime @default(now())
-  updated_at    DateTime @updatedAt
+  last_order_at  DateTime?
+  notes          String?
+  orders         Order[]
+  created_at     DateTime  @default(now())
+  updated_at     DateTime  @updatedAt
 
   @@index([phone])
   @@index([total_orders])
@@ -273,32 +275,33 @@ model Customer {
 }
 
 model ExternalVendor {
-  id          String        @id @default(uuid())
-  name        String
-  phone       String?
-  notes       String?
-  order_count Int           @default(0)
-  cars        ExternalCar[]
-  orders      Order[]
+  id             String             @id @default(uuid())
+  name           String
+  phone          String?
+  notes          String?
+  order_count    Int                @default(0)
+  cars           ExternalCar[]
+  orders         Order[]
   schedule_lines OrderServiceItem[]
-  created_at  DateTime      @default(now())
-  updated_at  DateTime      @updatedAt
+  payables       Payable[]
+  created_at     DateTime           @default(now())
+  updated_at     DateTime           @updatedAt
 
   @@index([name])
   @@map("external_vendors")
 }
 
 model ExternalCar {
-  id           String         @id @default(uuid())
-  vendor_id    String
-  vendor       ExternalVendor @relation(fields: [vendor_id], references: [id], onDelete: Cascade)
-  model        String
-  plate_number String?
-  notes        String?
-  orders       Order[]
+  id             String             @id @default(uuid())
+  vendor_id      String
+  vendor         ExternalVendor     @relation(fields: [vendor_id], references: [id], onDelete: Cascade)
+  model          String
+  plate_number   String?
+  notes          String?
+  orders         Order[]
   schedule_lines OrderServiceItem[]
-  created_at   DateTime       @default(now())
-  updated_at   DateTime       @updatedAt
+  created_at     DateTime           @default(now())
+  updated_at     DateTime           @updatedAt
 
   @@index([vendor_id])
   @@map("external_cars")
@@ -337,26 +340,28 @@ model OrderServiceItem {
   sort_order             Int       @default(0)
 
   // --- Schedule / per-day assignment ---
-  is_external            Boolean        @default(false)
-  line_status            ScheduleStatus @default(SCHEDULED)
-  driver_id              String?
-  driver                 Driver?        @relation(fields: [driver_id], references: [id], onDelete: SetNull)
-  car_id                 String?
-  car                    Car?           @relation(fields: [car_id], references: [id], onDelete: SetNull)
-  external_vendor_id     String?
-  external_vendor        ExternalVendor? @relation(fields: [external_vendor_id], references: [id], onDelete: SetNull)
-  external_car_id        String?
-  external_car           ExternalCar?    @relation(fields: [external_car_id], references: [id], onDelete: SetNull)
-  driver_name_raw        String?
-  plate_raw              String?
+  is_external        Boolean         @default(false)
+  line_status        ScheduleStatus  @default(SCHEDULED)
+  driver_id          String?
+  driver             Driver?         @relation(fields: [driver_id], references: [id], onDelete: SetNull)
+  car_id             String?
+  car                Car?            @relation(fields: [car_id], references: [id], onDelete: SetNull)
+  external_vendor_id String?
+  external_vendor    ExternalVendor? @relation(fields: [external_vendor_id], references: [id], onDelete: SetNull)
+  external_car_id    String?
+  external_car       ExternalCar?    @relation(fields: [external_car_id], references: [id], onDelete: SetNull)
+  driver_name_raw    String?
+  plate_raw          String?
 
   // --- Per-day finance (daily margin = roll-up source) ---
-  rtr_amount             Decimal?  @db.Decimal(12, 2)
-  ops_cost               Decimal   @default(0) @db.Decimal(12, 2)
-  margin_amount          Decimal?  @db.Decimal(12, 2)
+  rtr_amount             Decimal? @db.Decimal(12, 2)
+  ops_cost               Decimal  @default(0) @db.Decimal(12, 2)
+  margin_amount          Decimal? @db.Decimal(12, 2)
   margin_formula_version String?
 
-  created_at             DateTime  @default(now())
+  payable Payable?
+
+  created_at DateTime @default(now())
 
   @@index([order_id])
   @@index([service_date])
@@ -365,6 +370,73 @@ model OrderServiceItem {
   @@index([external_vendor_id])
   @@index([line_status])
   @@map("order_service_items")
+}
+
+enum PayableKind {
+  DRIVER
+  VENDOR
+}
+
+enum PayableStatus {
+  UNPAID
+  PAID
+}
+
+/// Accounts payable: money Arasya owes OUT for a single service-day line.
+/// DRIVER kind mirrors the "TAGIHAN DRIVER" sheet; VENDOR kind mirrors
+/// "Tagihan Vendor". One payable per assigned service line.
+model Payable {
+  id     String        @id @default(uuid())
+  kind   PayableKind
+  status PayableStatus @default(UNPAID)
+
+  service_item_id String           @unique
+  service_item    OrderServiceItem @relation(fields: [service_item_id], references: [id], onDelete: Cascade)
+  order_id        String
+  order           Order            @relation(fields: [order_id], references: [id], onDelete: Cascade)
+
+  driver_id String?
+  driver    Driver?         @relation(fields: [driver_id], references: [id], onDelete: SetNull)
+  vendor_id String?
+  vendor    ExternalVendor? @relation(fields: [vendor_id], references: [id], onDelete: SetNull)
+
+  service_date  DateTime?
+  // FEE (driver) / HARGA (vendor): the base amount owed, synced from the line cost.
+  base_amount   Decimal   @default(0) @db.Decimal(12, 2)
+  // LAINNYA roll-up: sum of extras (overtime, meal, deductions). Can be negative.
+  extras_amount Decimal   @default(0) @db.Decimal(12, 2)
+  // base + extras = TOTAL owed.
+  total_amount  Decimal   @default(0) @db.Decimal(12, 2)
+
+  keterangan     String?
+  paid_at        DateTime?
+  payment_method PaymentMethod?
+
+  extras PayableExtra[]
+
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  @@index([kind])
+  @@index([status])
+  @@index([driver_id])
+  @@index([vendor_id])
+  @@index([order_id])
+  @@index([service_date])
+  @@map("payables")
+}
+
+/// Itemized LAINNYA entries for a payable (overtime, meal, inap, deduction...).
+model PayableExtra {
+  id         String   @id @default(uuid())
+  payable_id String
+  payable    Payable  @relation(fields: [payable_id], references: [id], onDelete: Cascade)
+  label      String
+  amount     Decimal  @default(0) @db.Decimal(12, 2)
+  created_at DateTime @default(now())
+
+  @@index([payable_id])
+  @@map("payable_extras")
 }
 
 model Trip {
@@ -553,50 +625,49 @@ model OrderSummary {
   @@map("order_summaries")
 }
 
-
 model OrderFinalFinance {
-  id                    String   @id @default(uuid())
-  order_id              String   @unique
-  order                 Order    @relation(fields: [order_id], references: [id], onDelete: Cascade)
-  sheet_checked_raw     String?
-  refund_cashback_raw   String?
-  refund_cashback_amount Decimal? @db.Decimal(12, 2)
-  invoice_no_raw        String?
-  service_date_raw      String?
-  service_date          DateTime?
-  vehicle_raw           String?
-  route_raw             String?
-  duration_raw          String?
-  package_raw           String?
-  driver_vendor_raw     String?
-  plate_no_raw          String?
-  sell_price            Decimal? @db.Decimal(12, 2)
-  rtr_amount            Decimal? @db.Decimal(12, 2)
-  dp_amount             Decimal? @db.Decimal(12, 2)
-  additional_amount     Decimal? @db.Decimal(12, 2)
-  user_overtime_amount  Decimal? @db.Decimal(12, 2)
+  id                      String    @id @default(uuid())
+  order_id                String    @unique
+  order                   Order     @relation(fields: [order_id], references: [id], onDelete: Cascade)
+  sheet_checked_raw       String?
+  refund_cashback_raw     String?
+  refund_cashback_amount  Decimal?  @db.Decimal(12, 2)
+  invoice_no_raw          String?
+  service_date_raw        String?
+  service_date            DateTime?
+  vehicle_raw             String?
+  route_raw               String?
+  duration_raw            String?
+  package_raw             String?
+  driver_vendor_raw       String?
+  plate_no_raw            String?
+  sell_price              Decimal?  @db.Decimal(12, 2)
+  rtr_amount              Decimal?  @db.Decimal(12, 2)
+  dp_amount               Decimal?  @db.Decimal(12, 2)
+  additional_amount       Decimal?  @db.Decimal(12, 2)
+  user_overtime_amount    Decimal?  @db.Decimal(12, 2)
   user_overtime_hours_raw String?
-  parking_user_amount   Decimal? @db.Decimal(12, 2)
-  total_user_amount     Decimal? @db.Decimal(12, 2)
-  paid_off_date_raw     String?
-  paid_off_date         DateTime?
-  fuel_amount           Decimal? @db.Decimal(12, 2)
-  toll_amount           Decimal? @db.Decimal(12, 2)
-  driver_fee_amount     Decimal? @db.Decimal(12, 2)
-  driver_overtime_amount Decimal? @db.Decimal(12, 2)
-  parking_cash_amount   Decimal? @db.Decimal(12, 2)
-  other_amount          Decimal? @db.Decimal(12, 2)
-  finance_note          String?
-  total_driver_amount   Decimal? @db.Decimal(12, 2)
-  driver_paid_date_raw  String?
-  driver_paid_date      DateTime?
-  total_ops_cost        Decimal? @db.Decimal(12, 2)
-  unit_rental_price     Decimal? @db.Decimal(12, 2)
-  margin_amount         Decimal? @db.Decimal(12, 2)
-  margin_formula_version String?
-  raw_row_json          Json?
-  created_at            DateTime @default(now())
-  updated_at            DateTime @updatedAt
+  parking_user_amount     Decimal?  @db.Decimal(12, 2)
+  total_user_amount       Decimal?  @db.Decimal(12, 2)
+  paid_off_date_raw       String?
+  paid_off_date           DateTime?
+  fuel_amount             Decimal?  @db.Decimal(12, 2)
+  toll_amount             Decimal?  @db.Decimal(12, 2)
+  driver_fee_amount       Decimal?  @db.Decimal(12, 2)
+  driver_overtime_amount  Decimal?  @db.Decimal(12, 2)
+  parking_cash_amount     Decimal?  @db.Decimal(12, 2)
+  other_amount            Decimal?  @db.Decimal(12, 2)
+  finance_note            String?
+  total_driver_amount     Decimal?  @db.Decimal(12, 2)
+  driver_paid_date_raw    String?
+  driver_paid_date        DateTime?
+  total_ops_cost          Decimal?  @db.Decimal(12, 2)
+  unit_rental_price       Decimal?  @db.Decimal(12, 2)
+  margin_amount           Decimal?  @db.Decimal(12, 2)
+  margin_formula_version  String?
+  raw_row_json            Json?
+  created_at              DateTime  @default(now())
+  updated_at              DateTime  @updatedAt
 
   @@map("order_final_finances")
 }

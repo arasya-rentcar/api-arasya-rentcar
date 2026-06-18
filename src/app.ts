@@ -19,6 +19,7 @@ import sheetImportsRoutes from './modules/sheet-imports/sheet-imports.route';
 import customersRoutes from './modules/customers/customers.route';
 import externalVendorsRoutes from './modules/external-vendors/external-vendors.route';
 import scheduleRoutes from './modules/schedule/schedule.route';
+import payablesRoutes from './modules/payables/payables.route';
 
 import { errorMiddleware } from './middleware/error.middleware';
 
@@ -91,6 +92,7 @@ app.use('/api/v1/sheet-imports', sheetImportsRoutes);
 app.use('/api/v1/customers', customersRoutes);
 app.use('/api/v1/external-vendors', externalVendorsRoutes);
 app.use('/api/v1/schedule', scheduleRoutes);
+app.use('/api/v1/payables', payablesRoutes);
 app.use('/api/v1/trips', tripsRoutes);
 app.use('/api/v1/bot', botLimiter, botRoutes);
 
