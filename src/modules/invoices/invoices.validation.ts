@@ -13,8 +13,14 @@ export const reviseInvoiceSchema = z.object({
   payment_method: z.enum(["CASH", "BANK_TRANSFER", "QRIS", "OTHER"]).optional(),
 });
 
+export const markInvoicePaidSchema = z.object({
+  payment_method: z.enum(["CASH", "BANK_TRANSFER", "QRIS", "OTHER"]).optional(),
+  paid_at: z.string().optional(),
+});
+
 export type GenerateInvoiceInput = z.infer<typeof generateInvoiceSchema>;
 export type ReviseInvoiceInput = z.infer<typeof reviseInvoiceSchema>;
+export type MarkInvoicePaidInput = z.infer<typeof markInvoicePaidSchema>;
 
 export const sendInvoiceWhatsappSchema = z.object({
   target_name: z.string().optional(),

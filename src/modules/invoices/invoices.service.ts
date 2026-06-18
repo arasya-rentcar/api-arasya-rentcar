@@ -19,6 +19,13 @@ export async function generateInvoice(
   });
   if (!order) throw new AppError("Order not found", 404);
 
+  // Rental base = sum of service lines (additionals/adjustments are billed separately,
+  // each as its own ADDITIONAL invoice). DP percentage is based on this rental base.
+  const rentalBase = order.service_items.reduce(
+    (sum, item) => sum + Number(item.total_price || 0),
+    0,
+  );
+
   // Calculate how much has already been invoiced
   const aggregate = await prisma.invoice.aggregate({
     where: {
@@ -47,6 +54,24 @@ export async function generateInvoice(
     );
   }
 
+  // Validate: DP must be at least 20% of the rental base (minimum down payment).
+  // Customer may pay more than 20%, but never less.
+  if (input.invoice_type === "DP" && rentalBase > 0) {
+    const minDp = Math.round(rentalBase * 0.2);
+    if (input.amount < minDp) {
+      throw new AppError(
+        `DP must be at least 20% of the rental price (minimum ${minDp}). Rental base: ${rentalBase}.`,
+        409,
+      );
+    }
+    if (input.amount > rentalBase) {
+      throw new AppError(
+        `DP (${input.amount}) cannot exceed the rental price (${rentalBase}).`,
+        409,
+      );
+    }
+  }
+
   // Guard: active invoice total must never exceed order.final_price.
   // Extra charges should update the order final_price first, then create an invoice.
   if (input.amount > remaining) {
@@ -58,6 +83,17 @@ export async function generateInvoice(
 
   const invoiceNumber = await generateInvoiceNumber();
   const issueDate = new Date();
+
+  // Settlement (remaining rental balance) is due on the first day of service.
+  let dueDate: Date | null = null;
+  if (input.invoice_type === "SETTLEMENT") {
+    const firstServiceDate = order.service_items
+      .map((i) => i.service_date)
+      .filter((d): d is Date => !!d)
+      .sort((a, b) => a.getTime() - b.getTime())[0];
+    dueDate =
+      firstServiceDate || order.service_start_at || order.order_date || null;
+  }
 
   // Determine PDF description label
   const typeLabels: Record<string, string> = {
@@ -113,26 +149,12 @@ export async function generateInvoice(
         note: input.note,
         file_url: fileUrl,
         status: "ISSUED",
+        due_date: dueDate,
       },
     });
 
-    // Compute new payment status
-    const newTotal = alreadyInvoiced + input.amount;
-    let paymentStatus: "UNPAID" | "DP_PAID" | "PAID" = order.payment_status as
-      | "UNPAID"
-      | "DP_PAID"
-      | "PAID";
-    if (newTotal >= finalPrice) {
-      paymentStatus = "PAID";
-    } else if (newTotal > 0) {
-      paymentStatus = "DP_PAID";
-    }
-
-    await tx.order.update({
-      where: { id: orderId },
-      data: { payment_status: paymentStatus },
-    });
-
+    // NOTE: issuing an invoice does NOT change payment_status.
+    // payment_status only advances when an invoice is marked PAID (see markInvoicePaid).
     return [newInvoice];
   });
 
@@ -159,6 +181,60 @@ export async function updateInvoiceStatus(
   return prisma.invoice.update({
     where: { id: invoiceId },
     data: { status },
+  });
+}
+
+// Mark an invoice PAID -> it now prints as a Kwitansi/Receipt.
+// Recomputes the order payment_status from the sum of all PAID invoices.
+export async function markInvoicePaid(
+  invoiceId: string,
+  input: { payment_method?: string; paid_at?: string } = {},
+) {
+  const invoice = await prisma.invoice.findUnique({
+    where: { id: invoiceId },
+    include: { order: true },
+  });
+  if (!invoice) throw new AppError("Invoice not found", 404);
+  if (invoice.status === "PAID") return invoice;
+  if (["REVISED", "CANCELLED"].includes(invoice.status)) {
+    throw new AppError(
+      `Cannot mark a ${invoice.status} invoice as paid`,
+      409,
+    );
+  }
+
+  const paidAt = input.paid_at ? new Date(input.paid_at) : new Date();
+
+  return prisma.$transaction(async (tx) => {
+    const updated = await tx.invoice.update({
+      where: { id: invoiceId },
+      data: {
+        status: "PAID",
+        paid_at: paidAt,
+        ...(input.payment_method
+          ? { payment_method: input.payment_method as never }
+          : {}),
+      },
+    });
+
+    // Sum of all PAID invoices for this order (settled money received).
+    const paidAgg = await tx.invoice.aggregate({
+      where: { order_id: invoice.order_id, status: "PAID" },
+      _sum: { amount: true },
+    });
+    const paidTotal = Number(paidAgg._sum.amount ?? 0);
+    const finalPrice = Number(invoice.order.final_price);
+
+    let paymentStatus: "UNPAID" | "DP_PAID" | "PAID" = "UNPAID";
+    if (paidTotal >= finalPrice && finalPrice > 0) paymentStatus = "PAID";
+    else if (paidTotal > 0) paymentStatus = "DP_PAID";
+
+    await tx.order.update({
+      where: { id: invoice.order_id },
+      data: { payment_status: paymentStatus },
+    });
+
+    return updated;
   });
 }
 

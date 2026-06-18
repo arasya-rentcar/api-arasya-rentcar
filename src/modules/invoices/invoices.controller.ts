@@ -3,12 +3,14 @@ import {
   generateInvoiceSchema,
   reviseInvoiceSchema,
   sendInvoiceWhatsappSchema,
+  markInvoicePaidSchema,
 } from "./invoices.validation";
 import {
   generateInvoice,
   getInvoicesByOrder,
   reviseInvoice,
   sendInvoiceWhatsapp,
+  markInvoicePaid,
 } from "./invoices.service";
 
 export async function generateInvoiceController(
@@ -47,6 +49,20 @@ export async function reviseInvoiceController(
     const input = reviseInvoiceSchema.parse(req.body);
     const invoice = await reviseInvoice(req.params.invoiceId, input);
     res.status(201).json({ status: "success", data: invoice });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function markInvoicePaidController(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const input = markInvoicePaidSchema.parse(req.body ?? {});
+    const invoice = await markInvoicePaid(req.params.invoiceId, input);
+    res.json({ status: "success", data: invoice });
   } catch (err) {
     next(err);
   }

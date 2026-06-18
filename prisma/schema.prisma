@@ -405,6 +405,8 @@ model Invoice {
   invoice_type   InvoiceType          @default(FULL)
   payment_method PaymentMethod        @default(CASH)
   issue_date     DateTime             @default(now())
+  due_date       DateTime?
+  paid_at        DateTime?
   amount         Decimal              @db.Decimal(12, 2)
   note           String?
   file_url       String?

@@ -30,6 +30,23 @@ function formatRp(value: number): string {
   return `Rp ${new Intl.NumberFormat("id-ID").format(value)}`;
 }
 
+// The standard PDF fonts (WinAnsi/Latin-1) cannot encode arbitrary Unicode
+// (e.g. the arrow "→", middle dot "·", curly quotes, emoji). Any such char
+// throws at draw time and crashes invoice generation. Map common ones to safe
+// ASCII and drop anything else outside Latin-1.
+function sanitizeText(input: unknown): string {
+  if (input === null || input === undefined) return "";
+  return String(input)
+    .replace(/[\u2192\u279C\u27A1]/g, "->")
+    .replace(/[\u2018\u2019\u201A\u2032]/g, "'")
+    .replace(/[\u201C\u201D\u201E\u2033]/g, '"')
+    .replace(/[\u2013\u2014]/g, "-")
+    .replace(/[\u00B7\u2022]/g, "-")
+    .replace(/\u2026/g, "...")
+    // strip anything still outside the Latin-1 range the standard font supports
+    .replace(/[^\u0000-\u00FF]/g, "");
+}
+
 function drawLabelValue(
   page: PDFPage,
   label: string,
@@ -39,14 +56,14 @@ function drawLabelValue(
   labelFont: PDFFont,
   valueFont: PDFFont,
 ): void {
-  page.drawText(label, {
+  page.drawText(sanitizeText(label), {
     x,
     y: y + 14,
     size: 8,
     font: labelFont,
     color: rgb(0.5, 0.5, 0.5),
   });
-  page.drawText(value, {
+  page.drawText(sanitizeText(value), {
     x,
     y,
     size: 10,
@@ -100,7 +117,7 @@ export async function generateInvoicePDF(data: InvoiceData): Promise<Buffer> {
     color: rgb(1, 1, 1),
   });
 
-  page.drawText(data.invoiceType.toUpperCase(), {
+  page.drawText(sanitizeText(data.invoiceType).toUpperCase(), {
     x: width - margin - 110,
     y: height - 62,
     size: 9,
@@ -245,14 +262,16 @@ export async function generateInvoicePDF(data: InvoiceData): Promise<Buffer> {
           })
         : "-";
     const route = [item.pickupLocation, item.dropoffLocation]
+      .map((s) => sanitizeText(s))
       .filter(Boolean)
-      .join(" → ");
+      .join(" -> ");
     const description =
-      item.description || route || `Service Item ${index + 1}`;
-    const kind = item.serviceKind ? `${item.serviceKind} — ` : "";
-    const detail =
+      sanitizeText(item.description) || route || `Service Item ${index + 1}`;
+    const kind = item.serviceKind ? `${sanitizeText(item.serviceKind)} - ` : "";
+    const detail = sanitizeText(
       kind +
-      (route && item.description ? `${description} (${route})` : description);
+        (route && item.description ? `${description} (${route})` : description),
+    );
     const qty = item.quantity ?? 1;
     const amount = Number(item.totalPrice ?? 0);
 
@@ -379,7 +398,7 @@ export async function generateInvoicePDF(data: InvoiceData): Promise<Buffer> {
   });
 
   const paymentRows: [string, string][] = [
-    ["Payment Method", data.paymentMethod],
+    ["Payment Method", sanitizeText(data.paymentMethod)],
     ["Bank", "BCA"],
     ["Account Number", "1234567890"],
     ["Account Name", "ARASYA RENTCAR"],
@@ -387,14 +406,14 @@ export async function generateInvoicePDF(data: InvoiceData): Promise<Buffer> {
 
   for (const [label, value] of paymentRows) {
     y -= 18;
-    page.drawText(label, {
+    page.drawText(sanitizeText(label), {
       x: margin,
       y,
       size: 9,
       font: regular,
       color: rgb(0.5, 0.5, 0.5),
     });
-    page.drawText(value, {
+    page.drawText(sanitizeText(value), {
       x: margin + 130,
       y,
       size: 9,

@@ -17,6 +17,7 @@ import {
   getInvoiceByOrderController,
   reviseInvoiceController,
   sendInvoiceWhatsappController,
+  markInvoicePaidController,
 } from "./orders.controller";
 
 const router = Router();
@@ -35,6 +36,7 @@ router.post("/:id/change-logs", createOrderChangeLogController);
 router.post("/:id/generate-invoice", generateInvoiceController);
 router.get("/:id/invoice", getInvoiceByOrderController);
 router.post("/:id/invoice/:invoiceId/revise", reviseInvoiceController);
+router.post("/:id/invoice/:invoiceId/mark-paid", markInvoicePaidController);
 router.post(
   "/:id/invoice/:invoiceId/send-whatsapp",
   sendInvoiceWhatsappController,
