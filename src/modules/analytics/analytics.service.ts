@@ -64,6 +64,7 @@ export async function dashboardAnalytics(opts: RangeOpts = {}) {
       },
     }),
     prisma.payable.findMany({
+      where: { order: { order_status: { not: 'CANCELLED' } } },
       select: {
         id: true,
         kind: true,
@@ -78,6 +79,7 @@ export async function dashboardAnalytics(opts: RangeOpts = {}) {
     }),
     prisma.orderServiceItem.findMany({
       where: {
+        order: { order_status: { not: 'CANCELLED' } },
         OR: [{ driver_id: { not: null } }, { external_vendor_id: { not: null } }],
       },
       select: {
