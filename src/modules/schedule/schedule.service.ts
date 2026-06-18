@@ -210,14 +210,20 @@ export async function rollupOrderFinance(
   });
   let revenue = 0;
   let ops = 0;
+  let rtr = 0;
   let margin = 0;
   let anyExternal = false;
   for (const l of lines) {
     revenue += Number(l.total_price ?? 0);
     ops += Number(l.ops_cost ?? 0);
+    rtr += Number(l.rtr_amount ?? 0);
     margin += Number(l.margin_amount ?? 0);
     if (l.is_external) anyExternal = true;
   }
+  // External lines pay RTR to the vendor; internal lines pay ops_cost to the
+  // driver. Roll RTR up so the order-level Finance card no longer shows a
+  // blank RTR for external orders. total_driver_amount stays a manual/optional
+  // override (Driver Cost) so it does not duplicate Ops Cost.
   await tx.order.update({
     where: { id: orderId },
     data: { final_price: revenue, is_external: anyExternal },
@@ -227,6 +233,7 @@ export async function rollupOrderFinance(
     update: {
       total_user_amount: revenue,
       total_ops_cost: ops,
+      rtr_amount: rtr,
       margin_amount: margin,
       margin_formula_version: MARGIN_FORMULA_VERSION,
     },
@@ -234,6 +241,7 @@ export async function rollupOrderFinance(
       order_id: orderId,
       total_user_amount: revenue,
       total_ops_cost: ops,
+      rtr_amount: rtr,
       margin_amount: margin,
       margin_formula_version: MARGIN_FORMULA_VERSION,
     },
