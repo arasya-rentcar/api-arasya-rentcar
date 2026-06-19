@@ -75,7 +75,17 @@ export async function getOrderStatementController(
   next: NextFunction,
 ): Promise<void> {
   try {
-    const result = await generateOrderStatement(req.params.id);
+    // Accept an optional invoice selection from body (POST) or query (?invoice_ids=a,b).
+    const raw =
+      (req.body && (req.body.invoice_ids ?? req.body.invoiceIds)) ??
+      req.query.invoice_ids;
+    let invoiceIds: string[] | undefined;
+    if (Array.isArray(raw)) {
+      invoiceIds = raw.map(String);
+    } else if (typeof raw === "string" && raw.trim()) {
+      invoiceIds = raw.split(",").map((s) => s.trim()).filter(Boolean);
+    }
+    const result = await generateOrderStatement(req.params.id, invoiceIds);
     res.json({ status: "success", data: result });
   } catch (err) {
     next(err);

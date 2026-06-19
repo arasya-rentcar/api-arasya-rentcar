@@ -372,7 +372,10 @@ export async function markInvoicePaid(
 // line items + billable adjustments + every payment received + running balance
 // (LUNAS stamp when fully settled). Kept separate from per-payment invoice /
 // kuitansi documents which remain individually accessible.
-export async function generateOrderStatement(orderId: string) {
+export async function generateOrderStatement(
+  orderId: string,
+  invoiceIds?: string[],
+) {
   const order = await prisma.order.findUnique({
     where: { id: orderId },
     include: {
@@ -382,6 +385,22 @@ export async function generateOrderStatement(orderId: string) {
     },
   });
   if (!order) throw new AppError("Order not found", 404);
+
+  // Optional admin selection: only include the chosen invoices in the combined
+  // statement. When omitted/empty, fall back to ALL invoices (legacy behavior).
+  const selectedIds = (invoiceIds ?? []).filter(Boolean);
+  if (selectedIds.length > 0) {
+    const known = new Set(order.invoices.map((i) => i.id));
+    const unknown = selectedIds.filter((id) => !known.has(id));
+    if (unknown.length > 0) {
+      throw new AppError(
+        `Invoice(s) not found on this order: ${unknown.join(", ")}`,
+        400,
+      );
+    }
+    const selectedSet = new Set(selectedIds);
+    order.invoices = order.invoices.filter((i) => selectedSet.has(i.id));
+  }
 
   const finalPrice = Number(order.final_price);
 

@@ -37,6 +37,8 @@ router.post("/:id/change-logs", createOrderChangeLogController);
 router.post("/:id/generate-invoice", generateInvoiceController);
 router.get("/:id/invoice", getInvoiceByOrderController);
 router.get("/:id/statement", getOrderStatementController);
+// POST variant carries an optional { invoice_ids: string[] } selection.
+router.post("/:id/statement", getOrderStatementController);
 router.post("/:id/invoice/:invoiceId/revise", reviseInvoiceController);
 router.post("/:id/invoice/:invoiceId/mark-paid", markInvoicePaidController);
 router.post(
