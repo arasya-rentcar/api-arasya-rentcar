@@ -737,7 +737,12 @@ export async function sendInvoiceWhatsapp(
   const invoice = await prisma.invoice.findUnique({
     where: { id: invoiceId },
     include: {
-      order: { include: { customers: { orderBy: { created_at: "asc" } } } },
+      order: {
+        include: {
+          customers: { orderBy: { created_at: "asc" } },
+          service_items: { orderBy: { sort_order: "asc" } },
+        },
+      },
     },
   });
   if (!invoice) throw new AppError("Invoice not found", 404);
@@ -760,16 +765,41 @@ export async function sendInvoiceWhatsapp(
     invoice.order.customers.find((c) => c.phone)?.name ||
     invoice.order.customer_name;
   const amount = Number(invoice.amount);
+  const rentalBase = invoice.order.service_items.reduce(
+    (sum, item) => sum + Number(item.total_price || 0),
+    0,
+  );
+  const rentalTotal = rentalBase > 0 ? rentalBase : amount;
+  const dpAmount = Math.round(rentalTotal * 0.2);
+  const settlementAmount = rentalTotal - dpAmount;
   const messageText = [
-    `Halo Bapak/Ibu ${targetName || invoice.order.customer_name},`,
-    "",
-    "Berikut kami kirimkan invoice Arasya Rentcar:",
+    `Halo Kak ${targetName || invoice.order.customer_name},`,
     "",
     `Invoice: ${invoice.invoice_number}`,
-    `Total: ${formatRupiah(amount)}`,
     input.message_note ? `Catatan: ${input.message_note}` : "",
     "",
-    "Mohon dicek ya. Terima kasih 🙏",
+    `Total biaya sewa senilai ${formatRupiah(rentalTotal)}`,
+    "",
+    `Jika sudah sesuai, silakan transfer DP 20% atau senilai ${formatRupiah(dpAmount)} pada saat pemesanan.`,
+    "",
+    `Pelunasan senilai ${formatRupiah(settlementAmount)} dibayarkan saat mobil kami sudah sampai di lokasi penjemputan.`,
+    "",
+    "Pembayaran dapat ditransfer ke rekening:",
+    "",
+    "Bank Central Asia (BCA)",
+    "0954840782",
+    "a/n PT Ayomi Raya Karsa",
+    "",
+    "MANDIRI",
+    "1330015925837",
+    "a/n Q Ahmada Arifin",
+    "",
+    "Atau Scan QR kami diatas",
+    "a/n Arasya Rental Mobil",
+    "",
+    "Setelah DP kami terima, data mobil dan supir segera kami kirimkan maksimal H-1 ya kak.",
+    "",
+    "Terima kasih 🙏🏻😃",
   ]
     .filter((line) => line !== "")
     .join("\n");
