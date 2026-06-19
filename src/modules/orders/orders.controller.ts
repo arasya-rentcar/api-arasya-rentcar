@@ -24,6 +24,7 @@ import {
   reviseInvoiceController,
   sendInvoiceWhatsappController,
   markInvoicePaidController,
+  getOrderStatementController,
 } from "../invoices/invoices.controller";
 
 export async function createOrderController(
@@ -171,4 +172,5 @@ export {
   reviseInvoiceController,
   sendInvoiceWhatsappController,
   markInvoicePaidController,
+  getOrderStatementController,
 };

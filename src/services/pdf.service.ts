@@ -43,12 +43,14 @@ export interface InvoiceData {
   paymentMethod: string;
   amountPaid: number;
   previouslyPaid: number;
-  documentMode?: "INVOICE" | "RECEIPT";
+  documentMode?: "INVOICE" | "RECEIPT" | "STATEMENT";
   paidAt?: Date | string | null;
   dueDate?: Date | string | null;
-  // Receipt-specific: list of received payments (DP / pelunasan), and remaining.
+  // Receipt/Statement: list of received payments (DP / pelunasan), and remaining.
   paymentsReceived?: PaymentReceived[];
   remainingBalance?: number | null;
+  // Force the LUNAS/paid stamp (used by STATEMENT when fully settled).
+  showPaidStamp?: boolean;
   // Free-form footer notes shown under the table (pickup/dropoff/inclusions).
   noteLines?: string[];
   // Optional extra "additional charges" section (combined invoice).
@@ -160,6 +162,7 @@ export async function generateInvoicePDF(data: InvoiceData): Promise<Buffer> {
   const margin = 42;
   const right = width - margin;
   const isReceipt = data.documentMode === "RECEIPT";
+  const isStatement = data.documentMode === "STATEMENT";
 
   // Embed brand assets (real logo / signature / paid stamp) if present.
   let logo: PDFImage | null = null;
@@ -212,7 +215,11 @@ export async function generateInvoicePDF(data: InvoiceData): Promise<Buffer> {
   }
 
   // Document title top-right
-  const title = isReceipt ? "KUITANSI" : "INVOICE";
+  const title = isStatement
+    ? "STATEMENT"
+    : isReceipt
+      ? "KUITANSI"
+      : "INVOICE";
   drawRight(title, y - 24, 26, bold, rgb(0.1, 0.1, 0.1));
 
   // Tagline / address / phone (left, under logo)
@@ -442,8 +449,8 @@ export async function generateInvoicePDF(data: InvoiceData): Promise<Buffer> {
     }
   }
 
-  // Receipt: payment-received lines as full-width rows under the table.
-  if (isReceipt && data.paymentsReceived?.length) {
+  // Receipt + Statement: payment-received lines as full-width rows under the table.
+  if ((isReceipt || isStatement) && data.paymentsReceived?.length) {
     y -= 8;
     for (const p of data.paymentsReceived) {
       const labelLines = wrapText(
@@ -487,19 +494,19 @@ export async function generateInvoicePDF(data: InvoiceData): Promise<Buffer> {
     ty -= sz + 7;
   };
 
-  if (isReceipt) {
+  if (isReceipt || isStatement) {
+    const totalReceived = (data.paymentsReceived ?? []).reduce(
+      (s, p) => s + Math.abs(p.amount),
+      0,
+    );
     drawTotalRow("TOTAL BIAYA PERJALANAN", formatRp(data.finalPrice));
+    if (isStatement) {
+      drawTotalRow("TOTAL DIBAYAR", formatRp(totalReceived));
+    }
     const remaining =
       data.remainingBalance != null
         ? data.remainingBalance
-        : Math.max(
-            data.finalPrice -
-              (data.paymentsReceived ?? []).reduce(
-                (s, p) => s + Math.abs(p.amount),
-                0,
-              ),
-            0,
-          );
+        : Math.max(data.finalPrice - totalReceived, 0);
     ty -= 4;
     page.drawLine({
       start: { x: totalsLabelX, y: ty + 6 },
@@ -588,8 +595,8 @@ export async function generateInvoicePDF(data: InvoiceData): Promise<Buffer> {
   const sigBoxX = right - 150;
   let sigY = 150;
 
-  // Paid stamp behind the signature (receipts only)
-  if (isReceipt && stamp) {
+  // Paid stamp behind the signature (receipts always; statement when settled)
+  if ((isReceipt || data.showPaidStamp) && stamp) {
     const sw = 95;
     const sh = (stamp.height / stamp.width) * sw;
     page.drawImage(stamp, {

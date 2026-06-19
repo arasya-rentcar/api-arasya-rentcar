@@ -11,6 +11,7 @@ import {
   reviseInvoice,
   sendInvoiceWhatsapp,
   markInvoicePaid,
+  generateOrderStatement,
 } from "./invoices.service";
 
 export async function generateInvoiceController(
@@ -63,6 +64,19 @@ export async function markInvoicePaidController(
     const input = markInvoicePaidSchema.parse(req.body ?? {});
     const invoice = await markInvoicePaid(req.params.invoiceId, input);
     res.json({ status: "success", data: invoice });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function getOrderStatementController(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const result = await generateOrderStatement(req.params.id);
+    res.json({ status: "success", data: result });
   } catch (err) {
     next(err);
   }

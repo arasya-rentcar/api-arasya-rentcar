@@ -368,6 +368,106 @@ export async function markInvoicePaid(
   });
 }
 
+// Build a single combined STATEMENT PDF for the whole order: all service-day
+// line items + billable adjustments + every payment received + running balance
+// (LUNAS stamp when fully settled). Kept separate from per-payment invoice /
+// kuitansi documents which remain individually accessible.
+export async function generateOrderStatement(orderId: string) {
+  const order = await prisma.order.findUnique({
+    where: { id: orderId },
+    include: {
+      service_items: { orderBy: { sort_order: "asc" } },
+      adjustments: { orderBy: { created_at: "asc" } },
+      invoices: { orderBy: { issue_date: "asc" } },
+    },
+  });
+  if (!order) throw new AppError("Order not found", 404);
+
+  const finalPrice = Number(order.final_price);
+
+  // Service-day line items.
+  const items = order.service_items.map((item) => ({
+    serviceDate: item.service_date,
+    description: item.description,
+    serviceKind: item.service_kind,
+    servicePackage: item.service_package,
+    pickupLocation: item.pickup_location,
+    dropoffLocation: item.dropoff_location,
+    quantity: item.quantity,
+    unitPrice: Number(item.unit_price),
+    totalPrice: Number(item.total_price),
+  }));
+
+  // Billable additional charges (overtime/parking/etc.).
+  const additionalItems = order.adjustments
+    .filter((a) => a.is_billable)
+    .map((a) => ({
+      description: a.description,
+      quantity: a.quantity,
+      unitPrice: Number(a.amount),
+      totalPrice: Number(a.amount) * (a.quantity ?? 1),
+    }));
+
+  // Every payment actually received (PAID invoices only).
+  const typeLabelId: Record<string, string> = {
+    DP: "Pembayaran DP diterima",
+    SETTLEMENT: "Pelunasan diterima",
+    FULL: "Pembayaran diterima",
+    ADDITIONAL: "Pembayaran tambahan diterima",
+  };
+  const fmtTgl = (d: Date) =>
+    new Date(d).toLocaleDateString("id-ID", {
+      day: "numeric",
+      month: "long",
+      year: "numeric",
+    });
+  const paidInvoices = order.invoices.filter((i) => i.status === "PAID");
+  const paymentsReceived = paidInvoices.map((p) => ({
+    label: `${typeLabelId[p.invoice_type] ?? "Pembayaran diterima"} tanggal ${fmtTgl(p.paid_at ?? p.issue_date)}`,
+    amount: Number(p.amount),
+  }));
+  const totalReceived = paymentsReceived.reduce((s, p) => s + p.amount, 0);
+  const remainingBalance = Math.max(finalPrice - totalReceived, 0);
+  const fullyPaid = remainingBalance <= 0 && finalPrice > 0;
+
+  const invoiceNumber = `${order.order_code ?? order.id}-STATEMENT`;
+  const pdfBuffer = await generateInvoicePDF({
+    invoiceNumber,
+    displayNumber: order.order_code ?? null,
+    issueDate: new Date(),
+    customerName: order.customer_name,
+    customerPhone: order.customer_phone ?? null,
+    pickupLocation: order.pickup_location,
+    dropoffLocation: order.dropoff_location,
+    finalPrice,
+    invoiceType: "Statement",
+    paymentMethod: "-",
+    amountPaid: totalReceived,
+    previouslyPaid: 0,
+    documentMode: "STATEMENT",
+    paymentsReceived,
+    remainingBalance,
+    showPaidStamp: fullyPaid,
+    noteLines: buildNoteLines(order),
+    items,
+    additionalItems: additionalItems.length ? additionalItems : undefined,
+  });
+
+  const fileUrl = await uploadInvoicePDF(
+    pdfBuffer,
+    `${invoiceNumber}.pdf`,
+  );
+  return {
+    order_id: order.id,
+    order_code: order.order_code,
+    statement_url: fileUrl,
+    final_price: finalPrice,
+    total_received: totalReceived,
+    remaining_balance: remainingBalance,
+    fully_paid: fullyPaid,
+  };
+}
+
 export async function reviseInvoice(
   invoiceId: string,
   input: ReviseInvoiceInput,
