@@ -94,9 +94,11 @@ export async function dashboardAnalytics(opts: RangeOpts = {}) {
         driver_id: true,
         external_vendor_id: true,
         order_id: true,
+        external_car_id: true,
         driver: { select: { id: true, name: true } },
         external_vendor: { select: { id: true, name: true } },
         car: { select: { id: true, model: true, plate_number: true } },
+        external_car: { select: { id: true, model: true, plate_number: true } },
       },
     }),
     prisma.car.findMany({
@@ -282,6 +284,49 @@ export async function dashboardAnalytics(opts: RangeOpts = {}) {
     }
   }
 
+  // ── 9. Rental frequency (internal vs external, cars vs drivers/vendors) ──
+  type FreqAgg = { id: string; label: string; count: number; revenue: number };
+  const bump = (
+    map: Map<string, FreqAgg>,
+    id: string,
+    label: string,
+    revenue: number,
+  ) => {
+    const a = map.get(id) ?? { id, label, count: 0, revenue: 0 };
+    a.count += 1;
+    a.revenue += revenue;
+    map.set(id, a);
+  };
+  const intCarFreq = new Map<string, FreqAgg>();
+  const extCarFreq = new Map<string, FreqAgg>();
+  const intDriverFreq = new Map<string, FreqAgg>();
+  const extVendorFreq = new Map<string, FreqAgg>();
+  for (const l of serviceLines) {
+    const rev = n(l.total_price);
+    if (l.is_external) {
+      if (l.external_car?.id) {
+        const plate = l.external_car.plate_number
+          ? ` (${l.external_car.plate_number})`
+          : '';
+        bump(extCarFreq, l.external_car.id, `${l.external_car.model}${plate}`, rev);
+      }
+      if (l.external_vendor?.id)
+        bump(extVendorFreq, l.external_vendor.id, l.external_vendor.name, rev);
+    } else {
+      if (l.car?.id) {
+        const plate = l.car.plate_number ? ` (${l.car.plate_number})` : '';
+        bump(intCarFreq, l.car.id, `${l.car.model}${plate}`, rev);
+      }
+      if (l.driver?.id) bump(intDriverFreq, l.driver.id, l.driver.name, rev);
+    }
+  }
+  const topN = (m: Map<string, FreqAgg>) =>
+    [...m.values()].sort((a, b) => b.count - a.count || b.revenue - a.revenue).slice(0, 10);
+  const frequency = {
+    internal: { cars: topN(intCarFreq), drivers: topN(intDriverFreq) },
+    external: { cars: topN(extCarFreq), vendors: topN(extVendorFreq) },
+  };
+
   // ── 7. Car utilization (internal fleet) ──────────────────────────────────
   const carUse = new Map<string, number>();
   for (const l of serviceLines) {
@@ -355,5 +400,6 @@ export async function dashboardAnalytics(opts: RangeOpts = {}) {
     },
     car_utilization: carUtilization,
     monthly_trend: monthlyTrend,
+    frequency,
   };
 }
