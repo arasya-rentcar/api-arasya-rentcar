@@ -32,14 +32,27 @@ export async function generateInvoice(
 ) {
   const order = await prisma.order.findUnique({
     where: { id: orderId },
-    include: { service_items: { orderBy: { sort_order: "asc" } } },
+    include: {
+      service_items: { orderBy: { sort_order: "asc" } },
+      adjustments: { orderBy: { created_at: "asc" } },
+    },
   });
   if (!order) throw new AppError("Order not found", 404);
+
+  const isCombined = input.invoice_type === "COMBINED";
 
   // Rental base = sum of service lines (additionals/adjustments are billed separately,
   // each as its own ADDITIONAL invoice). DP percentage is based on this rental base.
   const rentalBase = order.service_items.reduce(
     (sum, item) => sum + Number(item.total_price || 0),
+    0,
+  );
+
+  // Billable additional charges (overtime/parking/etc.) — only used for COMBINED,
+  // which rolls rental + extras into a single invoice (and a single Kwitansi).
+  const billableAdjustments = order.adjustments.filter((a) => a.is_billable);
+  const additionalsTotal = billableAdjustments.reduce(
+    (sum, a) => sum + Number(a.amount) * (a.quantity ?? 1),
     0,
   );
 
@@ -61,6 +74,33 @@ export async function generateInvoice(
       "Cannot generate FULL invoice when partial payments already exist",
       409,
     );
+  }
+
+  // COMBINED bills rental + all billable additionals as one invoice, so like FULL
+  // it must be the only/first active invoice on the order.
+  if (isCombined && alreadyInvoiced > 0) {
+    throw new AppError(
+      "Cannot generate a Combined invoice when other active invoices already exist",
+      409,
+    );
+  }
+
+  // Prevent double-billing: a separate ADDITIONAL invoice can't coexist with an
+  // active COMBINED invoice (which already includes the additionals), and vice-versa.
+  if (input.invoice_type === "ADDITIONAL") {
+    const hasActiveCombined = await prisma.invoice.count({
+      where: {
+        order_id: orderId,
+        invoice_type: "COMBINED",
+        status: { notIn: ["REVISED", "CANCELLED"] },
+      },
+    });
+    if (hasActiveCombined > 0) {
+      throw new AppError(
+        "An active Combined invoice already includes additional charges. Revise it instead of adding a separate Additional invoice.",
+        409,
+      );
+    }
   }
 
   // Validate: SETTLEMENT requires a previous DP
@@ -118,7 +158,19 @@ export async function generateInvoice(
     SETTLEMENT: "Settlement Payment",
     FULL: "Full Payment",
     ADDITIONAL: "Additional Charge",
+    COMBINED: "Rental + Additional (Combined)",
   };
+
+  // For COMBINED, render the billable adjustments as an "Additional Charges"
+  // section in the same PDF as the rental service lines.
+  const additionalItems = isCombined
+    ? billableAdjustments.map((a) => ({
+        description: a.description,
+        quantity: a.quantity ?? 1,
+        unitPrice: Number(a.amount),
+        totalPrice: Number(a.amount) * (a.quantity ?? 1),
+      }))
+    : undefined;
 
   const methodLabels: Record<string, string> = {
     CASH: "Cash",
@@ -154,6 +206,7 @@ export async function generateInvoice(
       unitPrice: Number(item.unit_price),
       totalPrice: Number(item.total_price),
     })),
+    additionalItems,
   });
 
   const fileName = `${invoiceNumber}.pdf`;
@@ -216,7 +269,12 @@ export async function markInvoicePaid(
   const invoice = await prisma.invoice.findUnique({
     where: { id: invoiceId },
     include: {
-      order: { include: { service_items: { orderBy: { sort_order: "asc" } } } },
+      order: {
+        include: {
+          service_items: { orderBy: { sort_order: "asc" } },
+          adjustments: { orderBy: { created_at: "asc" } },
+        },
+      },
     },
   });
   if (!invoice) throw new AppError("Invoice not found", 404);
@@ -237,6 +295,7 @@ export async function markInvoicePaid(
     SETTLEMENT: "Settlement Payment",
     FULL: "Full Payment",
     ADDITIONAL: "Additional Charge",
+    COMBINED: "Rental + Additional (Combined)",
   };
   const methodLabels: Record<string, string> = {
     CASH: "Cash",
@@ -244,6 +303,20 @@ export async function markInvoicePaid(
     QRIS: "QRIS",
     OTHER: "Other",
   };
+
+  // For a COMBINED invoice the kwitansi mirrors the invoice: rental lines plus
+  // an Additional Charges section.
+  const receiptAdditionalItems =
+    invoice.invoice_type === "COMBINED"
+      ? invoice.order.adjustments
+          .filter((a) => a.is_billable)
+          .map((a) => ({
+            description: a.description,
+            quantity: a.quantity ?? 1,
+            unitPrice: Number(a.amount),
+            totalPrice: Number(a.amount) * (a.quantity ?? 1),
+          }))
+      : undefined;
 
   // Sum of prior invoices (excluding this one) for the receipt summary.
   const priorAgg = await prisma.invoice.aggregate({
@@ -324,6 +397,7 @@ export async function markInvoicePaid(
         unitPrice: Number(item.unit_price),
         totalPrice: Number(item.total_price),
       })),
+      additionalItems: receiptAdditionalItems,
     });
     receiptUrl = await uploadInvoicePDF(
       pdfBuffer,

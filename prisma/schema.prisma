@@ -80,6 +80,7 @@ enum InvoiceType {
   SETTLEMENT
   FULL
   ADDITIONAL
+  COMBINED
 }
 
 enum PaymentMethod {
