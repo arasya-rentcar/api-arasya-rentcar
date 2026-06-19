@@ -772,11 +772,14 @@ export async function sendInvoiceWhatsapp(
   const rentalTotal = rentalBase > 0 ? rentalBase : amount;
   const dpAmount = Math.round(rentalTotal * 0.2);
   const settlementAmount = rentalTotal - dpAmount;
+  const noteLines = input.message_note
+    ? [`Catatan: ${input.message_note}`, ""]
+    : [];
   const messageText = [
     `Halo Kak ${targetName || invoice.order.customer_name},`,
     "",
     `Invoice: ${invoice.invoice_number}`,
-    input.message_note ? `Catatan: ${input.message_note}` : "",
+    ...noteLines,
     "",
     `Total biaya sewa senilai ${formatRupiah(rentalTotal)}`,
     "",
@@ -800,9 +803,7 @@ export async function sendInvoiceWhatsapp(
     "Setelah DP kami terima, data mobil dan supir segera kami kirimkan maksimal H-1 ya kak.",
     "",
     "Terima kasih 🙏🏻😃",
-  ]
-    .filter((line) => line !== "")
-    .join("\n");
+  ].join("\n");
 
   const log = await prisma.invoiceDeliveryLog.create({
     data: {
