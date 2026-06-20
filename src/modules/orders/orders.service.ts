@@ -105,12 +105,14 @@ export async function createOrder(input: CreateOrderInput) {
         );
     }
 
-    // Link / upsert the primary customer by phone and bump repeat-order stats.
+    // Link / upsert the primary customer and bump repeat-order stats. If a
+    // master customer_id was chosen (#15), lock to it instead of phone-matching.
     const customer = await upsertCustomerForOrder(tx, {
       name: primary.name,
       phone: primary.phone || input.customer_phone,
       amount: Number(calculatedFinalPrice),
       orderDate,
+      customerId: input.customer_id,
     });
 
     // Auto-generate the running order code (per-customer seq, booking date).

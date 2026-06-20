@@ -169,12 +169,28 @@ export async function findOrCreateCustomer(
  */
 export async function upsertCustomerForOrder(
   client: Db,
-  params: { name: string; phone?: string | null; amount: number; orderDate: Date },
+  params: {
+    name: string;
+    phone?: string | null;
+    amount: number;
+    orderDate: Date;
+    // Sprint 5 #15: lock to a chosen master customer (skip phone fuzzy-match).
+    customerId?: string | null;
+  },
 ) {
-  const { customer } = await findOrCreateCustomer(client, {
-    name: params.name,
-    phone: params.phone,
-  });
+  let customer;
+  if (params.customerId) {
+    const existing = await client.customer.findUnique({
+      where: { id: params.customerId },
+    });
+    if (!existing) throw new AppError('Selected customer not found', 404);
+    customer = existing;
+  } else {
+    ({ customer } = await findOrCreateCustomer(client, {
+      name: params.name,
+      phone: params.phone,
+    }));
+  }
 
   return client.customer.update({
     where: { id: customer.id },

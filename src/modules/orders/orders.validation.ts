@@ -34,6 +34,8 @@ const orderServiceItemSchema = z
 
 export const createOrderSchema = z
   .object({
+    // Sprint 5 #15: optionally lock the primary PIC to an existing master customer.
+    customer_id: z.string().uuid().optional(),
     customer_name: z.string().min(1, "Customer name is required"),
     customer_phone: z.string().min(1, "Customer phone is required"),
     customers: z.array(orderCustomerSchema).optional(),
