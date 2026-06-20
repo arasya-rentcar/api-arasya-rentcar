@@ -148,9 +148,17 @@ export const createChangeLogSchema = z.object({
   actor: z.string().optional(),
 });
 
+// Sprint 5: mark refund settled. Amount optional (defaults to derived refund
+// due); proof file is required and validated in the controller/service.
+export const markOrderRefundedSchema = z.object({
+  note: z.string().optional(),
+  amount: z.coerce.number().positive().optional(),
+});
+
 export type UpsertOrderFinanceInput = z.infer<typeof upsertOrderFinanceSchema>;
 export type CreateOrderInput = z.infer<typeof createOrderSchema>;
 export type UpdateOrderInput = z.infer<typeof updateOrderSchema>;
 export type AssignOrderInput = z.infer<typeof assignOrderSchema>;
 export type CreateAdjustmentInput = z.infer<typeof createAdjustmentSchema>;
 export type CreateChangeLogInput = z.infer<typeof createChangeLogSchema>;
+export type MarkOrderRefundedInput = z.infer<typeof markOrderRefundedSchema>;

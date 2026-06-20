@@ -10,6 +10,13 @@ import {
 import { upsertCustomerForOrder } from "../customers/customers.service";
 import { computeMargin, MARGIN_FORMULA_VERSION } from "../../utils/margin";
 import { nextOrderCode } from "../../utils/codes";
+import {
+  uploadFile,
+  assertValidUpload,
+  getSignedUrl,
+  PAYMENT_PROOFS_BUCKET,
+  type UploadedFile,
+} from "../../services/storage.service";
 
 function normalizeOrderCustomers(input: {
   customer_name: string;
@@ -837,4 +844,70 @@ export async function createOrderChangeLog(
   return prisma.orderChangeLog.create({
     data: { order_id: orderId, ...input },
   });
+}
+
+// Sprint 5: how much refund the order owes the customer = money received beyond
+// the order total. paid_to_date holds actual money received (Sprint 2).
+export function computeRefundDue(order: {
+  paid_to_date: unknown;
+  final_price: unknown;
+}): number {
+  const paid = Number(order.paid_to_date ?? 0);
+  const total = Number(order.final_price ?? 0);
+  return Math.max(paid - total, 0);
+}
+
+// Sprint 5: mark an order's refund as settled. A refund proof file is REQUIRED
+// (cash-flow must be evidenced, per Ten). Idempotent-safe: re-marking updates
+// the proof/amount/note. Refund amount is derived live (paid_to_date - total)
+// unless explicitly provided.
+export async function markOrderRefunded(
+  orderId: string,
+  input: { note?: string; amount?: number; proof?: UploadedFile },
+) {
+  const proofFile = assertValidUpload(input.proof);
+  const order = await prisma.order.findUnique({ where: { id: orderId } });
+  if (!order) throw new AppError("Order not found", 404);
+
+  const refundDue = computeRefundDue(order);
+  const amount = input.amount != null ? input.amount : refundDue;
+  if (amount <= 0) {
+    throw new AppError(
+      "No refund is due on this order (paid amount does not exceed the order total).",
+      400,
+    );
+  }
+
+  const proofUpload = await uploadFile(proofFile, {
+    bucket: PAYMENT_PROOFS_BUCKET,
+    prefix: `refunds/${orderId}`,
+  });
+
+  return prisma.order.update({
+    where: { id: orderId },
+    data: {
+      is_refunded: true,
+      refunded_at: new Date(),
+      refund_amount: amount,
+      refund_proof_url: proofUpload.path,
+      refund_note: input.note ?? null,
+    },
+  });
+}
+
+// Sprint 5: short-lived signed URL for the (private) refund proof.
+export async function getRefundProofUrl(orderId: string) {
+  const order = await prisma.order.findUnique({
+    where: { id: orderId },
+    select: { refund_proof_url: true },
+  });
+  if (!order || !order.refund_proof_url) {
+    throw new AppError("No refund proof on file for this order", 404);
+  }
+  const url = await getSignedUrl(
+    PAYMENT_PROOFS_BUCKET,
+    order.refund_proof_url,
+    60 * 60,
+  );
+  return { url, expires_in: 3600 };
 }

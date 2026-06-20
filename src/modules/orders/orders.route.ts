@@ -27,6 +27,8 @@ import {
   markInvoicePaidController,
   getOrderStatementController,
   getPaymentProofController,
+  markOrderRefundedController,
+  getRefundProofController,
 } from "./orders.controller";
 
 const router = Router();
@@ -63,5 +65,13 @@ router.post(
   "/:id/invoice/:invoiceId/send-whatsapp",
   sendInvoiceWhatsappController,
 );
+// Sprint 5: mark a refund settled. Refund proof file REQUIRED (field "proof").
+router.post(
+  "/:id/mark-refunded",
+  upload.single("proof"),
+  markOrderRefundedController,
+);
+// Signed URL to view the refund proof.
+router.get("/:id/refund-proof", getRefundProofController);
 
 export default router;

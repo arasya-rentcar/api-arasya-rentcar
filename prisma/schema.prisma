@@ -238,6 +238,11 @@ model Order {
   is_final               Boolean              @default(false)
   invoice_missing        Boolean              @default(false)
   is_refunded            Boolean              @default(false)
+  // Sprint 5: refund settlement record (proof REQUIRED to mark refunded).
+  refunded_at            DateTime?
+  refund_amount          Decimal?             @db.Decimal(12, 2)
+  refund_proof_url       String?
+  refund_note            String?
   created_at             DateTime             @default(now())
   updated_at             DateTime             @updatedAt
   customers              OrderCustomer[]

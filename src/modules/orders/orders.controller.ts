@@ -6,6 +6,7 @@ import {
   createAdjustmentSchema,
   createChangeLogSchema,
   upsertOrderFinanceSchema,
+  markOrderRefundedSchema,
 } from "./orders.validation";
 import {
   createOrder,
@@ -17,6 +18,8 @@ import {
   createOrderAdjustment,
   createOrderChangeLog,
   upsertOrderFinance,
+  markOrderRefunded,
+  getRefundProofUrl,
 } from "./orders.service";
 import {
   generateInvoiceController,
@@ -37,6 +40,46 @@ export async function createOrderController(
     const input = createOrderSchema.parse(req.body);
     const order = await createOrder(input);
     res.status(201).json({ status: "success", data: order });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// Sprint 5: mark refund settled (proof file required, field "proof").
+export async function markOrderRefundedController(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const input = markOrderRefundedSchema.parse(req.body ?? {});
+    const file = (req as Request & { file?: Express.Multer.File }).file;
+    const order = await markOrderRefunded(req.params.id, {
+      ...input,
+      proof: file
+        ? {
+            buffer: file.buffer,
+            mimetype: file.mimetype,
+            size: file.size,
+            originalname: file.originalname,
+          }
+        : undefined,
+    });
+    res.json({ status: "success", data: order });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// Sprint 5: signed URL to view the refund proof.
+export async function getRefundProofController(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const data = await getRefundProofUrl(req.params.id);
+    res.json({ status: "success", data });
   } catch (err) {
     next(err);
   }
