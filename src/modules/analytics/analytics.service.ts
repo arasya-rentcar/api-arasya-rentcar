@@ -478,6 +478,7 @@ export async function revenueReport(opts: RevenueOpts = {}) {
     },
     select: {
       id: true,
+      order_id: true,
       total_price: true,
       ops_cost: true,
       margin_amount: true,
@@ -486,12 +487,16 @@ export async function revenueReport(opts: RevenueOpts = {}) {
       is_external: true,
       car_id: true,
       car: { select: { id: true, model: true, plate_number: true, unit_code: true } },
+      driver_id: true,
+      driver: { select: { id: true, name: true, phone: true, type: true } },
       external_vendor_id: true,
       external_vendor: { select: { id: true, name: true } },
       external_car_id: true,
       external_car: { select: { id: true, model: true, plate_number: true } },
       order: { select: { order_status: true } },
-      payable: { select: { kind: true, total_amount: true } },
+      payable: {
+        select: { kind: true, total_amount: true, status: true, paid_at: true },
+      },
     },
   });
 
@@ -504,13 +509,32 @@ export async function revenueReport(opts: RevenueOpts = {}) {
     car_label: string;
     plate: string | null;
     unit_code: string | null;
-    final: { gross: number; ops: number; net_margin: number; trips: number };
-    estimated: { gross: number; ops: number; net_margin: number; trips: number };
-    // null-margin tracking so we can show "—" instead of a misleading 0.
+    final: { gross: number; ops: number; net_margin: number; trips: number; driver_fee: number };
+    estimated: { gross: number; ops: number; net_margin: number; trips: number; driver_fee: number };
     final_margin_known: boolean;
     est_margin_known: boolean;
+    final_order_ids: Set<string>;
+    est_order_ids: Set<string>;
   };
   const aMap = new Map<string, ABucket>();
+
+  // ── Section C — driver fee report, GROUP BY driver_id (internal drivers) ────
+  type CBucket = {
+    driver_id: string | null;
+    driver_name: string;
+    driver_phone: string | null;
+    fee_paid: number;     // payable.status=PAID — received
+    fee_pending: number;  // payable.status=UNPAID — still owed
+    fee_total: number;    // = paid + pending (accrued in period)
+    trips: number;
+    order_ids: Set<string>;
+  };
+  const cMap = new Map<string, CBucket>();
+
+  // KPI — distinct order counts by channel.
+  const internalOrderIds = new Set<string>();
+  const vendorOrderIds = new Set<string>();
+  const freelanceOrderIds = new Set<string>();
 
   // ── Section B — vendor margin, GROUP BY vendor -> external_car ───────────────
   type BUnit = {
@@ -519,6 +543,8 @@ export async function revenueReport(opts: RevenueOpts = {}) {
     plate: string | null;
     final: { customer_billed: number; vendor_cost: number; arasya_margin: number; trips: number };
     estimated: { customer_billed: number; vendor_cost: number; arasya_margin: number; trips: number };
+    final_order_ids: Set<string>;
+    est_order_ids: Set<string>;
   };
   type BVendor = {
     vendor_id: string | null;
@@ -526,6 +552,8 @@ export async function revenueReport(opts: RevenueOpts = {}) {
     final: { customer_billed: number; vendor_cost: number; arasya_margin: number; trips: number };
     estimated: { customer_billed: number; vendor_cost: number; arasya_margin: number; trips: number };
     units: Map<string, BUnit>;
+    final_order_ids: Set<string>;
+    est_order_ids: Set<string>;
   };
   const bMap = new Map<string, BVendor>();
 
@@ -535,6 +563,7 @@ export async function revenueReport(opts: RevenueOpts = {}) {
 
     if (!external) {
       // Internal car line.
+      internalOrderIds.add(l.order_id);
       const key = l.car_id ?? '__unassigned__';
       if (!aMap.has(key)) {
         aMap.set(key, {
@@ -546,24 +575,63 @@ export async function revenueReport(opts: RevenueOpts = {}) {
               : 'Belum ada unit',
           plate: l.car?.plate_number ?? null,
           unit_code: l.car?.unit_code ?? null,
-          final: { gross: 0, ops: 0, net_margin: 0, trips: 0 },
-          estimated: { gross: 0, ops: 0, net_margin: 0, trips: 0 },
+          final: { gross: 0, ops: 0, net_margin: 0, trips: 0, driver_fee: 0 },
+          estimated: { gross: 0, ops: 0, net_margin: 0, trips: 0, driver_fee: 0 },
           final_margin_known: false,
           est_margin_known: false,
+          final_order_ids: new Set(),
+          est_order_ids: new Set(),
         });
       }
       const b = aMap.get(key)!;
       const slot = isFinal(l) ? b.final : b.estimated;
+      const orderSlot = isFinal(l) ? b.final_order_ids : b.est_order_ids;
       slot.gross += billed;
       slot.ops += n(l.ops_cost);
       slot.trips += 1;
+      orderSlot.add(l.order_id);
+      // Driver fee on this line, accrual basis.
+      const driverFee =
+        l.payable && l.payable.kind === 'DRIVER' ? n(l.payable.total_amount) : 0;
+      slot.driver_fee += driverFee;
       if (l.margin_amount != null) {
         slot.net_margin += n(l.margin_amount);
         if (isFinal(l)) b.final_margin_known = true;
         else b.est_margin_known = true;
       }
+      // Section C — per internal driver fee.
+      if (
+        l.driver_id &&
+        l.driver &&
+        l.driver.type === 'INTERNAL' &&
+        l.payable &&
+        l.payable.kind === 'DRIVER'
+      ) {
+        const dkey = l.driver_id;
+        if (!cMap.has(dkey)) {
+          cMap.set(dkey, {
+            driver_id: dkey,
+            driver_name: l.driver.name,
+            driver_phone: l.driver.phone,
+            fee_paid: 0,
+            fee_pending: 0,
+            fee_total: 0,
+            trips: 0,
+            order_ids: new Set(),
+          });
+        }
+        const d = cMap.get(dkey)!;
+        const amt = n(l.payable.total_amount);
+        d.fee_total += amt;
+        if (l.payable.status === 'PAID') d.fee_paid += amt;
+        else d.fee_pending += amt;
+        d.trips += 1;
+        d.order_ids.add(l.order_id);
+      }
     } else {
       // External / vendor line.
+      if (l.external_vendor_id) vendorOrderIds.add(l.order_id);
+      else freelanceOrderIds.add(l.order_id);
       const vkey = l.external_vendor_id ?? '__freelance__';
       if (!bMap.has(vkey)) {
         bMap.set(vkey, {
@@ -572,6 +640,8 @@ export async function revenueReport(opts: RevenueOpts = {}) {
           final: { customer_billed: 0, vendor_cost: 0, arasya_margin: 0, trips: 0 },
           estimated: { customer_billed: 0, vendor_cost: 0, arasya_margin: 0, trips: 0 },
           units: new Map(),
+          final_order_ids: new Set(),
+          est_order_ids: new Set(),
         });
       }
       const v = bMap.get(vkey)!;
@@ -583,6 +653,8 @@ export async function revenueReport(opts: RevenueOpts = {}) {
           plate: l.external_car?.plate_number ?? null,
           final: { customer_billed: 0, vendor_cost: 0, arasya_margin: 0, trips: 0 },
           estimated: { customer_billed: 0, vendor_cost: 0, arasya_margin: 0, trips: 0 },
+          final_order_ids: new Set(),
+          est_order_ids: new Set(),
         });
       }
       const u = v.units.get(ukey)!;
@@ -591,14 +663,18 @@ export async function revenueReport(opts: RevenueOpts = {}) {
       const final = isFinal(l);
       const vSlot = final ? v.final : v.estimated;
       const uSlot = final ? u.final : u.estimated;
+      const vOrdSlot = final ? v.final_order_ids : v.est_order_ids;
+      const uOrdSlot = final ? u.final_order_ids : u.est_order_ids;
       vSlot.customer_billed += billed;
       vSlot.vendor_cost += vendorCost;
       vSlot.arasya_margin += billed - vendorCost;
       vSlot.trips += 1;
+      vOrdSlot.add(l.order_id);
       uSlot.customer_billed += billed;
       uSlot.vendor_cost += vendorCost;
       uSlot.arasya_margin += billed - vendorCost;
       uSlot.trips += 1;
+      uOrdSlot.add(l.order_id);
     }
   }
 
@@ -613,13 +689,17 @@ export async function revenueReport(opts: RevenueOpts = {}) {
         gross: round(b.final.gross),
         ops: round(b.final.ops),
         net_margin: b.final_margin_known ? round(b.final.net_margin) : null,
+        driver_fee: round(b.final.driver_fee),
         trips: b.final.trips,
+        orders: b.final_order_ids.size,
       },
       estimated: {
         gross: round(b.estimated.gross),
         ops: round(b.estimated.ops),
         net_margin: b.est_margin_known ? round(b.estimated.net_margin) : null,
+        driver_fee: round(b.estimated.driver_fee),
         trips: b.estimated.trips,
+        orders: b.est_order_ids.size,
       },
     }))
     .sort((a, b) => b.final.gross + b.estimated.gross - (a.final.gross + a.estimated.gross));
@@ -633,12 +713,14 @@ export async function revenueReport(opts: RevenueOpts = {}) {
         vendor_cost: round(v.final.vendor_cost),
         arasya_margin: round(v.final.arasya_margin),
         trips: v.final.trips,
+        orders: v.final_order_ids.size,
       },
       estimated: {
         customer_billed: round(v.estimated.customer_billed),
         vendor_cost: round(v.estimated.vendor_cost),
         arasya_margin: round(v.estimated.arasya_margin),
         trips: v.estimated.trips,
+        orders: v.est_order_ids.size,
       },
       units: Array.from(v.units.values()).map((u) => ({
         external_car_id: u.external_car_id,
@@ -649,12 +731,14 @@ export async function revenueReport(opts: RevenueOpts = {}) {
           vendor_cost: round(u.final.vendor_cost),
           arasya_margin: round(u.final.arasya_margin),
           trips: u.final.trips,
+          orders: u.final_order_ids.size,
         },
         estimated: {
           customer_billed: round(u.estimated.customer_billed),
           vendor_cost: round(u.estimated.vendor_cost),
           arasya_margin: round(u.estimated.arasya_margin),
           trips: u.estimated.trips,
+          orders: u.est_order_ids.size,
         },
       })),
     }))
@@ -671,9 +755,11 @@ export async function revenueReport(opts: RevenueOpts = {}) {
         gross: acc.gross + c[k].gross,
         ops: acc.ops + c[k].ops,
         net_margin: acc.net_margin + (c[k].net_margin ?? 0),
+        driver_fee: acc.driver_fee + c[k].driver_fee,
         trips: acc.trips + c[k].trips,
+        orders: acc.orders + c[k].orders,
       }),
-      { gross: 0, ops: 0, net_margin: 0, trips: 0 },
+      { gross: 0, ops: 0, net_margin: 0, driver_fee: 0, trips: 0, orders: 0 },
     );
   const sumB = (k: 'final' | 'estimated') =>
     sectionB.reduce(
@@ -682,12 +768,48 @@ export async function revenueReport(opts: RevenueOpts = {}) {
         vendor_cost: acc.vendor_cost + v[k].vendor_cost,
         arasya_margin: acc.arasya_margin + v[k].arasya_margin,
         trips: acc.trips + v[k].trips,
+        orders: acc.orders + v[k].orders,
       }),
-      { customer_billed: 0, vendor_cost: 0, arasya_margin: 0, trips: 0 },
+      { customer_billed: 0, vendor_cost: 0, arasya_margin: 0, trips: 0, orders: 0 },
     );
+
+  // Section C rows + totals.
+  const sectionC = Array.from(cMap.values())
+    .map((d) => ({
+      driver_id: d.driver_id,
+      driver_name: d.driver_name,
+      driver_phone: d.driver_phone,
+      fee_paid: round(d.fee_paid),
+      fee_pending: round(d.fee_pending),
+      fee_total: round(d.fee_total),
+      trips: d.trips,
+      orders: d.order_ids.size,
+    }))
+    .sort((a, b) => b.fee_total - a.fee_total);
+  const cTotals = sectionC.reduce(
+    (acc, d) => ({
+      fee_paid: acc.fee_paid + d.fee_paid,
+      fee_pending: acc.fee_pending + d.fee_pending,
+      fee_total: acc.fee_total + d.fee_total,
+      trips: acc.trips + d.trips,
+      orders: acc.orders + d.orders,
+    }),
+    { fee_paid: 0, fee_pending: 0, fee_total: 0, trips: 0, orders: 0 },
+  );
+
+  const internalOrders = internalOrderIds.size;
+  const vendorOrders = vendorOrderIds.size;
+  const freelanceOrders = freelanceOrderIds.size;
 
   return {
     range: { from: start.toISOString(), to: end.toISOString() },
+    order_counts: {
+      internal: internalOrders,
+      vendor: vendorOrders,
+      freelance: freelanceOrders,
+      external_total: vendorOrders + freelanceOrders,
+      total: internalOrders + vendorOrders + freelanceOrders,
+    },
     internal_cars: {
       rows: sectionA,
       totals: { final: sumA('final'), estimated: sumA('estimated') },
@@ -695,6 +817,10 @@ export async function revenueReport(opts: RevenueOpts = {}) {
     vendor_margin: {
       rows: sectionB,
       totals: { final: sumB('final'), estimated: sumB('estimated') },
+    },
+    driver_fees: {
+      rows: sectionC,
+      totals: cTotals,
     },
   };
 }
