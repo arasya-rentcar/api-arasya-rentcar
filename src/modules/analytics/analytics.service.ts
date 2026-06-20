@@ -698,3 +698,335 @@ export async function revenueReport(opts: RevenueOpts = {}) {
     },
   };
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Dashboard v2 — one-page owner/finance view
+//
+// Accounting rules (LOCKED — do not change without bumping the rule set):
+//
+//   ACCRUAL (basis = OrderServiceItem.service_date, WIB calendar in range)
+//     revenue       = Σ OrderServiceItem.total_price (order/line ≠ CANCELLED)
+//     ops_cost      = Σ OrderServiceItem.ops_cost
+//     driver_cost   = Σ Payable.total_amount WHERE kind=DRIVER
+//     vendor_cost   = Σ Payable.total_amount WHERE kind=VENDOR
+//     margin        = revenue − ops_cost − driver_cost − vendor_cost
+//     margin_pct    = margin / revenue (null if revenue=0)
+//
+//   CASH (basis = payment_date / paid_at WIB in range)
+//     collected     = Σ Receipt.amount        (any payment_method)
+//     paid_out      = Σ Payable.total_amount  WHERE status=PAID AND paid_at∈range
+//     net_cash      = collected − paid_out
+//
+//   OUTSTANDING (current snapshot; NOT period-scoped)
+//     ar_outstanding = Σ (Order.final_price − Order.paid_to_date)
+//                      WHERE order_status≠CANCELLED AND payment_status≠PAID
+//     ap_outstanding = Σ Payable.total_amount WHERE status=UNPAID
+//
+//     Overdue rule (Arasya: due day-1 of service):
+//       ar overdue = AR rows where MIN(service_items.service_date) ≤ today (WIB)
+//       ap overdue = Payable rows where service_date ≤ today (WIB)
+//
+//   Δ vs prior period = same calc over a window of identical length placed
+//     immediately before the current window. Returns null when prior=0.
+//
+// All money in IDR (no FX). Decimal coerced to number via n() everywhere.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const DAY_MS = 86400000;
+
+// "Today" in WIB as a UTC Date for service_date comparison.
+function wibTodayEnd(): Date {
+  const nowWib = new Date(Date.now() + WIB_OFFSET_MS);
+  const y = nowWib.getUTCFullYear();
+  const m = nowWib.getUTCMonth();
+  const d = nowWib.getUTCDate();
+  // End of today WIB = next day 00:00 WIB − 1ms, expressed in UTC.
+  return new Date(Date.UTC(y, m, d + 1, 0, 0, 0) - WIB_OFFSET_MS - 1);
+}
+
+function pct(part: number, whole: number): number | null {
+  if (whole === 0) return null;
+  return part / whole;
+}
+
+function delta(curr: number, prev: number): number | null {
+  if (prev === 0) return null;
+  return (curr - prev) / Math.abs(prev);
+}
+
+interface AccrualSlice {
+  revenue: number;
+  ops_cost: number;
+  driver_cost: number;
+  vendor_cost: number;
+  margin: number;
+  margin_pct: number | null;
+  trips: number;
+}
+
+async function accrualSlice(start: Date, end: Date): Promise<AccrualSlice> {
+  const lines = await prisma.orderServiceItem.findMany({
+    where: {
+      service_date: { gte: start, lte: end },
+      line_status: { not: 'CANCELLED' },
+      order: { order_status: { not: 'CANCELLED' } },
+    },
+    select: {
+      total_price: true,
+      ops_cost: true,
+      payable: { select: { kind: true, total_amount: true } },
+    },
+  });
+  let revenue = 0;
+  let ops_cost = 0;
+  let driver_cost = 0;
+  let vendor_cost = 0;
+  for (const l of lines) {
+    revenue += n(l.total_price);
+    ops_cost += n(l.ops_cost);
+    if (l.payable) {
+      const amt = n(l.payable.total_amount);
+      if (l.payable.kind === 'DRIVER') driver_cost += amt;
+      else if (l.payable.kind === 'VENDOR') vendor_cost += amt;
+    }
+  }
+  const margin = revenue - ops_cost - driver_cost - vendor_cost;
+  return {
+    revenue,
+    ops_cost,
+    driver_cost,
+    vendor_cost,
+    margin,
+    margin_pct: pct(margin, revenue),
+    trips: lines.length,
+  };
+}
+
+async function cashSlice(start: Date, end: Date) {
+  const [receipts, settledPayables] = await Promise.all([
+    prisma.receipt.aggregate({
+      _sum: { amount: true },
+      where: { payment_date: { gte: start, lte: end } },
+    }),
+    prisma.payable.aggregate({
+      _sum: { total_amount: true },
+      where: { status: 'PAID', paid_at: { gte: start, lte: end } },
+    }),
+  ]);
+  const collected = n(receipts._sum.amount);
+  const paid_out = n(settledPayables._sum.total_amount);
+  return { collected, paid_out, net_cash: collected - paid_out };
+}
+
+// Per-channel accrual (internal vs vendor) for the Channel Split panel.
+async function channelSplit(start: Date, end: Date) {
+  const lines = await prisma.orderServiceItem.findMany({
+    where: {
+      service_date: { gte: start, lte: end },
+      line_status: { not: 'CANCELLED' },
+      order: { order_status: { not: 'CANCELLED' } },
+    },
+    select: {
+      total_price: true,
+      ops_cost: true,
+      is_external: true,
+      payable: { select: { kind: true, total_amount: true } },
+    },
+  });
+  const internal = { revenue: 0, ops_cost: 0, driver_cost: 0, margin: 0, trips: 0 };
+  const vendor = { billed: 0, vendor_cost: 0, margin: 0, trips: 0 };
+  for (const l of lines) {
+    const price = n(l.total_price);
+    if (l.is_external) {
+      vendor.billed += price;
+      if (l.payable?.kind === 'VENDOR') vendor.vendor_cost += n(l.payable.total_amount);
+      vendor.trips += 1;
+    } else {
+      internal.revenue += price;
+      internal.ops_cost += n(l.ops_cost);
+      if (l.payable?.kind === 'DRIVER') internal.driver_cost += n(l.payable.total_amount);
+      internal.trips += 1;
+    }
+  }
+  internal.margin = internal.revenue - internal.ops_cost - internal.driver_cost;
+  vendor.margin = vendor.billed - vendor.vendor_cost;
+  return {
+    internal: { ...internal, margin_pct: pct(internal.margin, internal.revenue) },
+    vendor: { ...vendor, margin_pct: pct(vendor.margin, vendor.billed) },
+  };
+}
+
+// Current outstanding snapshot + overdue detail (top 5 each by amount).
+async function outstandingSnapshot() {
+  const today = wibTodayEnd();
+
+  // AR: orders not paid in full, not cancelled.
+  const arOrders = await prisma.order.findMany({
+    where: {
+      order_status: { not: 'CANCELLED' },
+      payment_status: { not: 'PAID' },
+    },
+    select: {
+      id: true,
+      order_code: true,
+      customer_name: true,
+      final_price: true,
+      paid_to_date: true,
+      order_date: true,
+      service_items: {
+        select: { service_date: true },
+        orderBy: { service_date: 'asc' },
+        take: 1,
+      },
+    },
+  });
+  let ar_outstanding = 0;
+  type AROverdue = {
+    id: string; order_code: string | null; customer: string;
+    amount: number; service_date: string | null; days_overdue: number;
+  };
+  const arOverdue: AROverdue[] = [];
+  for (const o of arOrders) {
+    const due = n(o.final_price) - n(o.paid_to_date);
+    if (due <= 0) continue;
+    ar_outstanding += due;
+    // Earliest service line determines the due date (Arasya: due day-1).
+    const sd = o.service_items[0]?.service_date ?? null;
+    const ref = sd ?? o.order_date;
+    if (ref && ref <= today) {
+      arOverdue.push({
+        id: o.id,
+        order_code: o.order_code,
+        customer: o.customer_name,
+        amount: due,
+        service_date: sd ? sd.toISOString() : null,
+        days_overdue: Math.max(0, Math.floor((today.getTime() - ref.getTime()) / DAY_MS)),
+      });
+    }
+  }
+  arOverdue.sort((a, b) => b.amount * (b.days_overdue + 1) - a.amount * (a.days_overdue + 1));
+
+  // AP: payables unsettled.
+  const apPayables = await prisma.payable.findMany({
+    where: { status: 'UNPAID' },
+    select: {
+      id: true,
+      kind: true,
+      service_date: true,
+      total_amount: true,
+      order: { select: { id: true, order_code: true } },
+      driver: { select: { name: true } },
+      vendor: { select: { name: true } },
+    },
+  });
+  let ap_outstanding = 0;
+  type APOverdue = {
+    id: string; kind: 'DRIVER' | 'VENDOR'; counterparty: string;
+    amount: number; service_date: string | null; days_overdue: number;
+    order_id: string | null; order_code: string | null;
+  };
+  const apOverdue: APOverdue[] = [];
+  for (const p of apPayables) {
+    const amt = n(p.total_amount);
+    ap_outstanding += amt;
+    if (p.service_date && p.service_date <= today) {
+      apOverdue.push({
+        id: p.id,
+        kind: p.kind,
+        counterparty:
+          p.kind === 'DRIVER'
+            ? p.driver?.name ?? 'Driver'
+            : p.vendor?.name ?? 'Vendor',
+        amount: amt,
+        service_date: p.service_date.toISOString(),
+        days_overdue: Math.max(0, Math.floor((today.getTime() - p.service_date.getTime()) / DAY_MS)),
+        order_id: p.order?.id ?? null,
+        order_code: p.order?.order_code ?? null,
+      });
+    }
+  }
+  apOverdue.sort((a, b) => b.amount * (b.days_overdue + 1) - a.amount * (a.days_overdue + 1));
+
+  return {
+    ar_outstanding,
+    ap_outstanding,
+    ar_overdue_count: arOverdue.length,
+    ap_overdue_count: apOverdue.length,
+    ar_overdue_top: arOverdue.slice(0, 5),
+    ap_overdue_top: apOverdue.slice(0, 5),
+  };
+}
+
+// Trailing 6 months ending at the period's end month (revenue bar + margin line).
+async function trailing6mTrend(periodEnd: Date) {
+  const endWib = new Date(periodEnd.getTime() + WIB_OFFSET_MS);
+  const refY = endWib.getUTCFullYear();
+  const refM = endWib.getUTCMonth();
+  const months: { label: string; start: Date; end: Date }[] = [];
+  for (let i = 5; i >= 0; i--) {
+    const y = refY;
+    const m = refM - i;
+    const start = new Date(Date.UTC(y, m, 1, 0, 0, 0) - WIB_OFFSET_MS);
+    const end = new Date(Date.UTC(y, m + 1, 1, 0, 0, 0) - WIB_OFFSET_MS - 1);
+    const label = new Date(Date.UTC(y, m, 1)).toISOString().slice(0, 7); // YYYY-MM
+    months.push({ label, start, end });
+  }
+  const points = await Promise.all(
+    months.map(async (mo) => {
+      const a = await accrualSlice(mo.start, mo.end);
+      return {
+        month: mo.label,
+        revenue: a.revenue,
+        margin: a.margin,
+        margin_pct: a.margin_pct,
+      };
+    }),
+  );
+  return points;
+}
+
+export async function dashboardV2(opts: RangeOpts = {}) {
+  const { start, end } = wibMonthBounds(opts.date_from, opts.date_to);
+
+  // Prior period = same length immediately before [start, end].
+  const len = end.getTime() - start.getTime();
+  const priorEnd = new Date(start.getTime() - 1);
+  const priorStart = new Date(priorEnd.getTime() - len);
+
+  const [accCurr, accPrev, cashCurr, cashPrev, channel, outstanding, trend] =
+    await Promise.all([
+      accrualSlice(start, end),
+      accrualSlice(priorStart, priorEnd),
+      cashSlice(start, end),
+      cashSlice(priorStart, priorEnd),
+      channelSplit(start, end),
+      outstandingSnapshot(),
+      trailing6mTrend(end),
+    ]);
+
+  return {
+    range: {
+      date_from: start.toISOString(),
+      date_to: end.toISOString(),
+      prior_from: priorStart.toISOString(),
+      prior_to: priorEnd.toISOString(),
+    },
+    accrual: {
+      ...accCurr,
+      delta: {
+        revenue: delta(accCurr.revenue, accPrev.revenue),
+        margin: delta(accCurr.margin, accPrev.margin),
+        ops_cost: delta(accCurr.ops_cost, accPrev.ops_cost),
+      },
+      prior: accPrev,
+    },
+    cash: {
+      ...cashCurr,
+      delta: { net_cash: delta(cashCurr.net_cash, cashPrev.net_cash) },
+      prior: cashPrev,
+    },
+    channel,
+    outstanding,
+    trend, // trailing 6 months (revenue + margin)
+  };
+}
