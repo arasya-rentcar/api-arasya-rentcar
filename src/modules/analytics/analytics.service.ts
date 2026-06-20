@@ -4,6 +4,54 @@ import { Prisma } from '@prisma/client';
 const n = (v: Prisma.Decimal | number | null | undefined) =>
   v == null ? 0 : Number(v);
 
+const WIB_OFFSET_MS = 7 * 60 * 60 * 1000; // Asia/Jakarta is UTC+7, no DST.
+
+// Current-month window expressed in UTC for WIB calendar boundaries (#5).
+// Defaults to "this month" in Jakarta; explicit YYYY-MM-DD ends override it.
+function wibMonthBounds(fromStr?: string, toStr?: string): { start: Date; end: Date } {
+  if (fromStr || toStr) {
+    const startBase = fromStr ? new Date(`${fromStr}T00:00:00Z`) : new Date();
+    const sWib = new Date(startBase.getTime());
+    const start = fromStr
+      ? new Date(
+          Date.UTC(
+            sWib.getUTCFullYear(),
+            sWib.getUTCMonth(),
+            sWib.getUTCDate(),
+            0,
+            0,
+            0,
+          ) - WIB_OFFSET_MS,
+        )
+      : new Date(0);
+    const endBase = toStr ? new Date(`${toStr}T00:00:00Z`) : new Date();
+    const eWib = new Date(endBase.getTime());
+    const end = toStr
+      ? new Date(
+          Date.UTC(
+            eWib.getUTCFullYear(),
+            eWib.getUTCMonth(),
+            eWib.getUTCDate(),
+            0,
+            0,
+            0,
+          ) -
+            WIB_OFFSET_MS +
+            24 * 60 * 60 * 1000 -
+            1,
+        )
+      : new Date();
+    return { start, end };
+  }
+  // No range -> current WIB month.
+  const nowWib = new Date(Date.now() + WIB_OFFSET_MS);
+  const y = nowWib.getUTCFullYear();
+  const m = nowWib.getUTCMonth();
+  const start = new Date(Date.UTC(y, m, 1, 0, 0, 0) - WIB_OFFSET_MS);
+  const end = new Date(Date.UTC(y, m + 1, 1, 0, 0, 0) - WIB_OFFSET_MS - 1);
+  return { start, end };
+}
+
 function daysBetween(a: Date, b: Date) {
   return Math.floor((a.getTime() - b.getTime()) / 86400000);
 }
@@ -401,5 +449,252 @@ export async function dashboardAnalytics(opts: RangeOpts = {}) {
     car_utilization: carUtilization,
     monthly_trend: monthlyTrend,
     frequency,
+  };
+}
+
+// ─── #5 Revenue Report (§4f) ─────────────────────────────────────────────────
+// Two clearly-separated sections so owned-asset revenue is never mixed with
+// pass-through vendor money:
+//   A. Internal cars  — revenue per owned unit (gross / ops / net margin).
+//   B. Vendor margin  — Arasya's markup over vendor cost (customer_billed -
+//                       vendor_cost), drillable vendor -> unit.
+// Basis = OrderServiceItem.service_date (WIB). Each metric is split into
+//   Final     = lines on DONE/finalized orders (realized), and
+//   Estimated = still-open lines (same formula, flagged estimated).
+// "Final" line test: order_status DONE OR line_status DONE.
+interface RevenueOpts {
+  date_from?: string;
+  date_to?: string;
+}
+
+export async function revenueReport(opts: RevenueOpts = {}) {
+  const { start, end } = wibMonthBounds(opts.date_from, opts.date_to);
+
+  const lines = await prisma.orderServiceItem.findMany({
+    where: {
+      service_date: { gte: start, lte: end },
+      order: { order_status: { not: 'CANCELLED' } },
+      line_status: { not: 'CANCELLED' },
+    },
+    select: {
+      id: true,
+      total_price: true,
+      ops_cost: true,
+      margin_amount: true,
+      rtr_amount: true,
+      line_status: true,
+      is_external: true,
+      car_id: true,
+      car: { select: { id: true, model: true, plate_number: true, unit_code: true } },
+      external_vendor_id: true,
+      external_vendor: { select: { id: true, name: true } },
+      external_car_id: true,
+      external_car: { select: { id: true, model: true, plate_number: true } },
+      order: { select: { order_status: true } },
+      payable: { select: { kind: true, total_amount: true } },
+    },
+  });
+
+  const isFinal = (l: (typeof lines)[number]) =>
+    l.order?.order_status === 'DONE' || l.line_status === 'DONE';
+
+  // ── Section A — internal cars, GROUP BY car_id ──────────────────────────────
+  type ABucket = {
+    car_id: string | null;
+    car_label: string;
+    plate: string | null;
+    unit_code: string | null;
+    final: { gross: number; ops: number; net_margin: number; trips: number };
+    estimated: { gross: number; ops: number; net_margin: number; trips: number };
+    // null-margin tracking so we can show "—" instead of a misleading 0.
+    final_margin_known: boolean;
+    est_margin_known: boolean;
+  };
+  const aMap = new Map<string, ABucket>();
+
+  // ── Section B — vendor margin, GROUP BY vendor -> external_car ───────────────
+  type BUnit = {
+    external_car_id: string | null;
+    car_label: string;
+    plate: string | null;
+    final: { customer_billed: number; vendor_cost: number; arasya_margin: number; trips: number };
+    estimated: { customer_billed: number; vendor_cost: number; arasya_margin: number; trips: number };
+  };
+  type BVendor = {
+    vendor_id: string | null;
+    vendor_name: string;
+    final: { customer_billed: number; vendor_cost: number; arasya_margin: number; trips: number };
+    estimated: { customer_billed: number; vendor_cost: number; arasya_margin: number; trips: number };
+    units: Map<string, BUnit>;
+  };
+  const bMap = new Map<string, BVendor>();
+
+  for (const l of lines) {
+    const billed = n(l.total_price);
+    const external = l.is_external || !!l.external_vendor_id || !!l.external_car_id;
+
+    if (!external) {
+      // Internal car line.
+      const key = l.car_id ?? '__unassigned__';
+      if (!aMap.has(key)) {
+        aMap.set(key, {
+          car_id: l.car_id,
+          car_label: l.car
+            ? l.car.model
+            : l.car_id
+              ? 'Unknown car'
+              : 'Belum ada unit',
+          plate: l.car?.plate_number ?? null,
+          unit_code: l.car?.unit_code ?? null,
+          final: { gross: 0, ops: 0, net_margin: 0, trips: 0 },
+          estimated: { gross: 0, ops: 0, net_margin: 0, trips: 0 },
+          final_margin_known: false,
+          est_margin_known: false,
+        });
+      }
+      const b = aMap.get(key)!;
+      const slot = isFinal(l) ? b.final : b.estimated;
+      slot.gross += billed;
+      slot.ops += n(l.ops_cost);
+      slot.trips += 1;
+      if (l.margin_amount != null) {
+        slot.net_margin += n(l.margin_amount);
+        if (isFinal(l)) b.final_margin_known = true;
+        else b.est_margin_known = true;
+      }
+    } else {
+      // External / vendor line.
+      const vkey = l.external_vendor_id ?? '__freelance__';
+      if (!bMap.has(vkey)) {
+        bMap.set(vkey, {
+          vendor_id: l.external_vendor_id,
+          vendor_name: l.external_vendor?.name ?? 'Freelance (tanpa vendor)',
+          final: { customer_billed: 0, vendor_cost: 0, arasya_margin: 0, trips: 0 },
+          estimated: { customer_billed: 0, vendor_cost: 0, arasya_margin: 0, trips: 0 },
+          units: new Map(),
+        });
+      }
+      const v = bMap.get(vkey)!;
+      const ukey = l.external_car_id ?? '__no_unit__';
+      if (!v.units.has(ukey)) {
+        v.units.set(ukey, {
+          external_car_id: l.external_car_id,
+          car_label: l.external_car?.model ?? 'Unit tidak tercatat',
+          plate: l.external_car?.plate_number ?? null,
+          final: { customer_billed: 0, vendor_cost: 0, arasya_margin: 0, trips: 0 },
+          estimated: { customer_billed: 0, vendor_cost: 0, arasya_margin: 0, trips: 0 },
+        });
+      }
+      const u = v.units.get(ukey)!;
+      const vendorCost =
+        l.payable && l.payable.kind === 'VENDOR' ? n(l.payable.total_amount) : 0;
+      const final = isFinal(l);
+      const vSlot = final ? v.final : v.estimated;
+      const uSlot = final ? u.final : u.estimated;
+      vSlot.customer_billed += billed;
+      vSlot.vendor_cost += vendorCost;
+      vSlot.arasya_margin += billed - vendorCost;
+      vSlot.trips += 1;
+      uSlot.customer_billed += billed;
+      uSlot.vendor_cost += vendorCost;
+      uSlot.arasya_margin += billed - vendorCost;
+      uSlot.trips += 1;
+    }
+  }
+
+  const round = (x: number) => Math.round(x * 100) / 100;
+  const sectionA = Array.from(aMap.values())
+    .map((b) => ({
+      car_id: b.car_id,
+      car_label: b.car_label,
+      plate: b.plate,
+      unit_code: b.unit_code,
+      final: {
+        gross: round(b.final.gross),
+        ops: round(b.final.ops),
+        net_margin: b.final_margin_known ? round(b.final.net_margin) : null,
+        trips: b.final.trips,
+      },
+      estimated: {
+        gross: round(b.estimated.gross),
+        ops: round(b.estimated.ops),
+        net_margin: b.est_margin_known ? round(b.estimated.net_margin) : null,
+        trips: b.estimated.trips,
+      },
+    }))
+    .sort((a, b) => b.final.gross + b.estimated.gross - (a.final.gross + a.estimated.gross));
+
+  const sectionB = Array.from(bMap.values())
+    .map((v) => ({
+      vendor_id: v.vendor_id,
+      vendor_name: v.vendor_name,
+      final: {
+        customer_billed: round(v.final.customer_billed),
+        vendor_cost: round(v.final.vendor_cost),
+        arasya_margin: round(v.final.arasya_margin),
+        trips: v.final.trips,
+      },
+      estimated: {
+        customer_billed: round(v.estimated.customer_billed),
+        vendor_cost: round(v.estimated.vendor_cost),
+        arasya_margin: round(v.estimated.arasya_margin),
+        trips: v.estimated.trips,
+      },
+      units: Array.from(v.units.values()).map((u) => ({
+        external_car_id: u.external_car_id,
+        car_label: u.car_label,
+        plate: u.plate,
+        final: {
+          customer_billed: round(u.final.customer_billed),
+          vendor_cost: round(u.final.vendor_cost),
+          arasya_margin: round(u.final.arasya_margin),
+          trips: u.final.trips,
+        },
+        estimated: {
+          customer_billed: round(u.estimated.customer_billed),
+          vendor_cost: round(u.estimated.vendor_cost),
+          arasya_margin: round(u.estimated.arasya_margin),
+          trips: u.estimated.trips,
+        },
+      })),
+    }))
+    .sort(
+      (a, b) =>
+        b.final.arasya_margin + b.estimated.arasya_margin -
+        (a.final.arasya_margin + a.estimated.arasya_margin),
+    );
+
+  // Roll-up totals.
+  const sumA = (k: 'final' | 'estimated') =>
+    sectionA.reduce(
+      (acc, c) => ({
+        gross: acc.gross + c[k].gross,
+        ops: acc.ops + c[k].ops,
+        net_margin: acc.net_margin + (c[k].net_margin ?? 0),
+        trips: acc.trips + c[k].trips,
+      }),
+      { gross: 0, ops: 0, net_margin: 0, trips: 0 },
+    );
+  const sumB = (k: 'final' | 'estimated') =>
+    sectionB.reduce(
+      (acc, v) => ({
+        customer_billed: acc.customer_billed + v[k].customer_billed,
+        vendor_cost: acc.vendor_cost + v[k].vendor_cost,
+        arasya_margin: acc.arasya_margin + v[k].arasya_margin,
+        trips: acc.trips + v[k].trips,
+      }),
+      { customer_billed: 0, vendor_cost: 0, arasya_margin: 0, trips: 0 },
+    );
+
+  return {
+    range: { from: start.toISOString(), to: end.toISOString() },
+    internal_cars: {
+      rows: sectionA,
+      totals: { final: sumA('final'), estimated: sumA('estimated') },
+    },
+    vendor_margin: {
+      rows: sectionB,
+      totals: { final: sumB('final'), estimated: sumB('estimated') },
+    },
   };
 }
