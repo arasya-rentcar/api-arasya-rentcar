@@ -800,6 +800,14 @@ export async function revenueReport(opts: RevenueOpts = {}) {
   const internalOrders = internalOrderIds.size;
   const vendorOrders = vendorOrderIds.size;
   const freelanceOrders = freelanceOrderIds.size;
+  // Distinct unions so mixed orders (internal + external lines in one order)
+  // are never double-counted. Per-channel counts can overlap; total must not.
+  const externalUnion = new Set<string>([...vendorOrderIds, ...freelanceOrderIds]);
+  const allUnion = new Set<string>([
+    ...internalOrderIds,
+    ...vendorOrderIds,
+    ...freelanceOrderIds,
+  ]);
 
   return {
     range: { from: start.toISOString(), to: end.toISOString() },
@@ -807,8 +815,8 @@ export async function revenueReport(opts: RevenueOpts = {}) {
       internal: internalOrders,
       vendor: vendorOrders,
       freelance: freelanceOrders,
-      external_total: vendorOrders + freelanceOrders,
-      total: internalOrders + vendorOrders + freelanceOrders,
+      external_total: externalUnion.size,
+      total: allUnion.size,
     },
     internal_cars: {
       rows: sectionA,
