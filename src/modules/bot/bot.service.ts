@@ -8,6 +8,7 @@ import {
   BotReportInput,
 } from "./bot.validation";
 import { upsertCustomerForOrder } from "../customers/customers.service";
+import { nextOrderCode } from "../../utils/codes";
 import {
   findOrCreateVendor,
   findOrCreateVendorCar,
@@ -285,9 +286,24 @@ export async function createBotOrder(input: BotCreateOrderInput) {
       }
     }
 
+    // Use the caller-provided order_code if present (G5: never overwrite an
+    // existing manual code); otherwise auto-generate the running code.
+    let orderCode = input.order_code ?? null;
+    let orderSeq: number | null = null;
+    if (!orderCode) {
+      const gen = await nextOrderCode(
+        tx,
+        { id: customer.id, code: customer.code },
+        orderDate,
+      );
+      orderCode = gen.code;
+      orderSeq = gen.seq;
+    }
+
     return tx.order.create({
       data: {
-        order_code: input.order_code,
+        order_code: orderCode,
+        customer_seq: orderSeq,
         source: "WHATSAPP",
         customer_name: input.customer_name,
         customer_phone: normalizePhone(input.customer_phone),

@@ -9,6 +9,7 @@ import {
 } from "./orders.validation";
 import { upsertCustomerForOrder } from "../customers/customers.service";
 import { computeMargin, MARGIN_FORMULA_VERSION } from "../../utils/margin";
+import { nextOrderCode } from "../../utils/codes";
 
 function normalizeOrderCustomers(input: {
   customer_name: string;
@@ -105,8 +106,17 @@ export async function createOrder(input: CreateOrderInput) {
       orderDate,
     });
 
+    // Auto-generate the running order code (per-customer seq, booking date).
+    const { seq: orderSeq, code: orderCode } = await nextOrderCode(
+      tx,
+      { id: customer.id, code: customer.code },
+      orderDate,
+    );
+
     const order = await tx.order.create({
       data: {
+        order_code: orderCode,
+        customer_seq: orderSeq,
         customer_name: primary.name,
         customer_phone: primary.phone || input.customer_phone,
         customer_id: customer?.id ?? null,

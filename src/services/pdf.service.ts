@@ -40,6 +40,8 @@ export interface InvoiceData {
   finalPrice: number;
   items?: InvoiceLineItem[];
   invoiceType: string;
+  // Raw type so the PDF can pick the right totals layout (DP/SETTLEMENT/etc.).
+  invoiceKind?: "DP" | "SETTLEMENT" | "FULL" | "ADDITIONAL" | "COMBINED" | string;
   paymentMethod: string;
   amountPaid: number;
   previouslyPaid: number;
@@ -49,6 +51,8 @@ export interface InvoiceData {
   // Receipt/Statement: list of received payments (DP / pelunasan), and remaining.
   paymentsReceived?: PaymentReceived[];
   remainingBalance?: number | null;
+  // Sprint 2: refund owed when total received exceeds the ORDER total.
+  refundDue?: number | null;
   // Force the LUNAS/paid stamp (used by STATEMENT when fully settled).
   showPaidStamp?: boolean;
   // Free-form footer notes shown under the table (pickup/dropoff/inclusions).
@@ -96,11 +100,15 @@ function tryReadAsset(name: string): Buffer | null {
   }
 }
 
+// #10: all printed dates render in Asia/Jakarta (GMT+7) so a UTC server host
+// never shifts the calendar day.
+const JAKARTA_TZ = "Asia/Jakarta";
 function formatDateId(value: Date | string | null | undefined): string {
   if (!value) return "-";
   const d = value instanceof Date ? value : new Date(value);
   if (isNaN(d.getTime())) return "-";
   return d.toLocaleDateString("id-ID", {
+    timeZone: JAKARTA_TZ,
     year: "numeric",
     month: "long",
     day: "numeric",
@@ -360,6 +368,7 @@ export async function generateInvoicePDF(data: InvoiceData): Promise<Buffer> {
     const dateStr =
       rawDate && !Number.isNaN(rawDate.getTime())
         ? rawDate.toLocaleDateString("id-ID", {
+            timeZone: JAKARTA_TZ,
             day: "2-digit",
             month: "long",
             year: "numeric",
@@ -500,13 +509,14 @@ export async function generateInvoicePDF(data: InvoiceData): Promise<Buffer> {
       0,
     );
     drawTotalRow("TOTAL BIAYA PERJALANAN", formatRp(data.finalPrice));
-    if (isStatement) {
-      drawTotalRow("TOTAL DIBAYAR", formatRp(totalReceived));
-    }
+    // Show total received on receipts too (not just statements) so overpayment
+    // is visible against the trip total.
+    drawTotalRow("TOTAL DIBAYAR", formatRp(totalReceived));
     const remaining =
       data.remainingBalance != null
         ? data.remainingBalance
         : Math.max(data.finalPrice - totalReceived, 0);
+    const refundDue = data.refundDue != null ? Number(data.refundDue) : 0;
     ty -= 4;
     page.drawLine({
       start: { x: totalsLabelX, y: ty + 6 },
@@ -515,18 +525,74 @@ export async function generateInvoicePDF(data: InvoiceData): Promise<Buffer> {
       color: rgb(0.7, 0.7, 0.7),
     });
     drawTotalRow("SISA TAGIHAN", formatRp(remaining), { bold: true });
+    if (refundDue > 0) {
+      // Overpaid past the order total -> refund due (flagged red).
+      const rowSize = 9;
+      page.drawText(sanitizeText("KELEBIHAN BAYAR (REFUND)"), {
+        x: totalsLabelX,
+        y: ty,
+        size: rowSize,
+        font: bold,
+        color: rgb(0.8, 0.1, 0.1),
+      });
+      drawRightAt(
+        formatRp(refundDue),
+        jumlahRightX,
+        ty,
+        rowSize,
+        bold,
+        rgb(0.8, 0.1, 0.1),
+      );
+      ty -= rowSize + 7;
+    }
     drawTotalRow("TOTAL", formatRp(remaining), { bold: true, size: 11 });
   } else {
-    drawTotalRow("SUBTOTAL", formatRp(data.finalPrice));
-    drawTotalRow("LAIN-LAIN", "Rp -");
-    ty -= 4;
-    page.drawLine({
-      start: { x: totalsLabelX, y: ty + 6 },
-      end: { x: right, y: ty + 6 },
-      thickness: 0.5,
-      color: rgb(0.7, 0.7, 0.7),
-    });
-    drawTotalRow("TOTAL", formatRp(data.finalPrice), { bold: true, size: 11 });
+    const kind = data.invoiceKind ?? "FULL";
+    const divider = () => {
+      ty -= 4;
+      page.drawLine({
+        start: { x: totalsLabelX, y: ty + 6 },
+        end: { x: right, y: ty + 6 },
+        thickness: 0.5,
+        color: rgb(0.7, 0.7, 0.7),
+      });
+    };
+    const total = data.finalPrice;
+    const dueNow = data.amountPaid; // amount this invoice asks for
+
+    if (kind === "DP") {
+      // #9: a DP invoice shows the full rental price, the DP being paid now,
+      // and the remaining balance. The big TOTAL = the DP due on THIS invoice.
+      const sisa = Math.max(total - dueNow, 0);
+      drawTotalRow("Total Tagihan", formatRp(total));
+      drawTotalRow("DP (dibayar sekarang)", formatRp(dueNow));
+      drawTotalRow("Sisa Tagihan", formatRp(sisa));
+      divider();
+      drawTotalRow("TOTAL (dibayar sekarang)", formatRp(dueNow), {
+        bold: true,
+        size: 11,
+      });
+    } else if (kind === "SETTLEMENT") {
+      // Option B: Total - DP sudah dibayar = Sisa; TOTAL line = remaining only.
+      const alreadyPaid = data.previouslyPaid;
+      const sisa = Math.max(total - alreadyPaid, 0);
+      drawTotalRow("Total Tagihan", formatRp(total));
+      drawTotalRow("DP sudah dibayar", formatRp(alreadyPaid));
+      drawTotalRow("Sisa harus dibayar", formatRp(sisa));
+      divider();
+      drawTotalRow("TOTAL", formatRp(sisa), { bold: true, size: 11 });
+    } else if (kind === "ADDITIONAL") {
+      // Additional invoice bills only the extra charge, not the whole trip.
+      drawTotalRow("Total Tambahan", formatRp(dueNow));
+      divider();
+      drawTotalRow("TOTAL", formatRp(dueNow), { bold: true, size: 11 });
+    } else {
+      // FULL / COMBINED: bill the whole amount.
+      drawTotalRow("SUBTOTAL", formatRp(total));
+      drawTotalRow("LAIN-LAIN", "Rp -");
+      divider();
+      drawTotalRow("TOTAL", formatRp(total), { bold: true, size: 11 });
+    }
     if (data.dueDate) {
       drawTotalRow("Jatuh tempo", formatDateId(data.dueDate), { size: 8 });
     }
@@ -595,8 +661,23 @@ export async function generateInvoicePDF(data: InvoiceData): Promise<Buffer> {
   const sigBoxX = right - 150;
   let sigY = 150;
 
-  // Paid stamp behind the signature (receipts always; statement when settled)
-  if ((isReceipt || data.showPaidStamp) && stamp) {
+  // Stamp behind the signature. A receipt that still has a remaining balance is
+  // a partial (DP) payment -> show a "DP DITERIMA" text stamp instead of LUNAS.
+  const receiptRemaining =
+    data.remainingBalance != null
+      ? Number(data.remainingBalance)
+      : Math.max(
+          data.finalPrice -
+            (data.paymentsReceived ?? []).reduce(
+              (s, p) => s + Math.abs(p.amount),
+              0,
+            ),
+          0,
+        );
+  const isFullySettled = receiptRemaining <= 0;
+
+  if ((isReceipt || data.showPaidStamp) && isFullySettled && stamp) {
+    // Fully paid -> LUNAS image stamp.
     const sw = 95;
     const sh = (stamp.height / stamp.width) * sw;
     page.drawImage(stamp, {
@@ -604,6 +685,31 @@ export async function generateInvoicePDF(data: InvoiceData): Promise<Buffer> {
       y: sigY - 10,
       width: sw,
       height: sh,
+      opacity: 0.9,
+    });
+  } else if (isReceipt && !isFullySettled) {
+    // Partial DP payment -> red bordered "DP DITERIMA" text stamp.
+    const boxW = 110;
+    const boxH = 30;
+    const bx = sigBoxX - 14;
+    const by = sigY - 4;
+    const red = rgb(0.8, 0.1, 0.1);
+    page.drawRectangle({
+      x: bx,
+      y: by,
+      width: boxW,
+      height: boxH,
+      borderColor: red,
+      borderWidth: 2,
+      opacity: 0,
+      borderOpacity: 0.9,
+    });
+    page.drawText("DP DITERIMA", {
+      x: bx + 12,
+      y: by + boxH / 2 - 5,
+      size: 14,
+      font: bold,
+      color: red,
       opacity: 0.9,
     });
   }

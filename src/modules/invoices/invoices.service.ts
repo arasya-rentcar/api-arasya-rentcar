@@ -1,8 +1,23 @@
 import prisma from "../../prisma/client";
 import { AppError } from "../../utils/AppError";
-import { generateInvoiceNumber } from "../../utils/invoiceNumber";
+import { nextInvoiceNumber, nextReceiptNumber } from "../../utils/codes";
+import {
+  buildDpInvoiceCaption,
+  buildSettlementInvoiceCaption,
+  buildAdditionalInvoiceCaption,
+  formatTripDuration,
+  greetingFor,
+  isSameDay,
+} from "../../utils/waCaptions";
 import { generateInvoicePDF } from "../../services/pdf.service";
-import { uploadInvoicePDF } from "../../services/storage.service";
+import {
+  uploadInvoicePDF,
+  uploadFile,
+  assertValidUpload,
+  getSignedUrl,
+  PAYMENT_PROOFS_BUCKET,
+  type UploadedFile,
+} from "../../services/storage.service";
 import {
   GenerateInvoiceInput,
   ReviseInvoiceInput,
@@ -35,9 +50,18 @@ export async function generateInvoice(
     include: {
       service_items: { orderBy: { sort_order: "asc" } },
       adjustments: { orderBy: { created_at: "asc" } },
+      customer: true,
     },
   });
   if (!order) throw new AppError("Order not found", 404);
+  // G6: an invoice cannot be numbered without a customer (the invoice number
+  // embeds the customer code + per-customer sequence).
+  if (!order.customer) {
+    throw new AppError(
+      "Order has no linked customer; cannot issue a numbered invoice",
+      409,
+    );
+  }
 
   const isCombined = input.invoice_type === "COMBINED";
 
@@ -138,8 +162,18 @@ export async function generateInvoice(
     );
   }
 
-  const invoiceNumber = await generateInvoiceNumber();
-  const issueDate = new Date();
+  // Reserve the invoice number atomically (per-customer invoice_seq) in a short
+  // transaction BEFORE building the PDF, so the pooler never times out and two
+  // concurrent invoices for the same customer can't collide.
+  const issueDate = input.issue_date ? new Date(input.issue_date) : new Date();
+  const { seq: invoiceSeq, number: invoiceNumber } = await prisma.$transaction(
+    (tx) =>
+      nextInvoiceNumber(
+        tx,
+        { id: order.customer!.id, code: order.customer!.code },
+        issueDate,
+      ),
+  );
 
   // Settlement (remaining rental balance) is due on the first day of service.
   let dueDate: Date | null = null;
@@ -193,6 +227,7 @@ export async function generateInvoice(
     amountPaid: input.amount,
     previouslyPaid: alreadyInvoiced,
     documentMode: "INVOICE",
+    invoiceKind: input.invoice_type,
     dueDate,
     noteLines: buildNoteLines(order),
     items: order.service_items.map((item) => ({
@@ -218,6 +253,7 @@ export async function generateInvoice(
       data: {
         order_id: orderId,
         invoice_number: invoiceNumber,
+        customer_seq: invoiceSeq,
         invoice_type: input.invoice_type,
         payment_method: input.payment_method,
         issue_date: issueDate,
@@ -227,6 +263,12 @@ export async function generateInvoice(
         status: "ISSUED",
         due_date: dueDate,
       },
+    });
+
+    // Keep the customer's billed total in sync (G9: total_billed = sum invoices).
+    await tx.customer.update({
+      where: { id: order.customer!.id },
+      data: { total_billed: { increment: input.amount } },
     });
 
     // NOTE: issuing an invoice does NOT change payment_status.
@@ -260,12 +302,37 @@ export async function updateInvoiceStatus(
   });
 }
 
+// Sprint 3: return a short-lived signed URL for an invoice's payment proof.
+export async function getPaymentProofUrl(invoiceId: string) {
+  const receipt = await prisma.receipt.findFirst({
+    where: { invoice_id: invoiceId },
+    orderBy: { created_at: "desc" },
+  });
+  if (!receipt || !receipt.payment_proof_url) {
+    throw new AppError("No payment proof on file for this invoice", 404);
+  }
+  const url = await getSignedUrl(
+    PAYMENT_PROOFS_BUCKET,
+    receipt.payment_proof_url,
+    60 * 60,
+  );
+  return { url, expires_in: 3600 };
+}
+
 // Mark an invoice PAID -> it now prints as a Kwitansi/Receipt.
 // Recomputes the order payment_status from the sum of all PAID invoices.
 export async function markInvoicePaid(
   invoiceId: string,
-  input: { payment_method?: string; paid_at?: string } = {},
+  input: {
+    payment_method?: string;
+    paid_at?: string;
+    amount_received?: number;
+    proof?: UploadedFile;
+  } = {},
 ) {
+  // Sprint 3: a payment proof is REQUIRED to mark an invoice paid (cash too:
+  // upload a photo taken when the money was received). Validate early.
+  const proofFile = assertValidUpload(input.proof);
   const invoice = await prisma.invoice.findUnique({
     where: { id: invoiceId },
     include: {
@@ -273,6 +340,7 @@ export async function markInvoicePaid(
         include: {
           service_items: { orderBy: { sort_order: "asc" } },
           adjustments: { orderBy: { created_at: "asc" } },
+          customer: true,
         },
       },
     },
@@ -289,6 +357,15 @@ export async function markInvoicePaid(
   const paidAt = input.paid_at ? new Date(input.paid_at) : new Date();
   const paymentMethod = (input.payment_method ||
     invoice.payment_method) as string;
+
+  // Sprint 2 payment model: record the ACTUAL money received, which may be more
+  // than the invoice amount (overpayment). Defaults to the invoice amount.
+  const invoiceAmount = Number(invoice.amount);
+  const amountReceived =
+    input.amount_received != null ? Number(input.amount_received) : invoiceAmount;
+  // Surplus paid against THIS invoice (carried toward the rest of the order).
+  const overpayThisInvoice = Math.max(amountReceived - invoiceAmount, 0);
+  const orderTotal = Number(invoice.order.final_price);
 
   const typeLabels: Record<string, string> = {
     DP: "Down Payment",
@@ -343,25 +420,33 @@ export async function markInvoicePaid(
   };
   const fmtTgl = (d: Date) =>
     new Date(d).toLocaleDateString("id-ID", {
+      timeZone: "Asia/Jakarta",
       day: "numeric",
       month: "long",
       year: "numeric",
     });
+  // Prior receipts hold the ACTUAL money received per prior invoice (may exceed
+  // the invoice amount on overpayment). Map by invoice_id for accurate totals.
+  const priorReceipts = await prisma.receipt.findMany({
+    where: { invoice_id: { in: priorPaid.map((p) => p.id) } },
+  });
+  const receivedByInvoice = new Map(
+    priorReceipts.map((r) => [r.invoice_id, Number(r.amount)]),
+  );
   const paymentsReceived = [
     ...priorPaid.map((p) => ({
       label: `${typeLabelId[p.invoice_type] ?? "Pembayaran diterima"} tanggal ${fmtTgl(p.paid_at ?? p.issue_date)}`,
-      amount: Number(p.amount),
+      amount: receivedByInvoice.get(p.id) ?? Number(p.amount),
     })),
     {
       label: `${typeLabelId[invoice.invoice_type] ?? "Pembayaran diterima"} tanggal ${fmtTgl(paidAt)}`,
-      amount: Number(invoice.amount),
+      amount: amountReceived,
     },
   ];
   const totalReceived = paymentsReceived.reduce((s, p) => s + p.amount, 0);
-  const remainingBalance = Math.max(
-    Number(invoice.order.final_price) - totalReceived,
-    0,
-  );
+  const remainingBalance = Math.max(orderTotal - totalReceived, 0);
+  // Refund is due ONLY when total received exceeds the ORDER total (never the DP).
+  const refundDue = Math.max(totalReceived - orderTotal, 0);
 
   // Regenerate the PDF as a Kwitansi/Receipt (LUNAS stamp, payment date).
   // IMPORTANT: this is stored in receipt_url, NOT file_url. The original
@@ -379,12 +464,14 @@ export async function markInvoicePaid(
       finalPrice: Number(invoice.order.final_price),
       invoiceType: typeLabels[invoice.invoice_type] ?? invoice.invoice_type,
       paymentMethod: methodLabels[paymentMethod] ?? paymentMethod,
-      amountPaid: Number(invoice.amount),
+      amountPaid: amountReceived,
       previouslyPaid,
       documentMode: "RECEIPT",
       paidAt,
       paymentsReceived,
       remainingBalance,
+      // Sprint 2: overpayment/refund details live ONLY in the PDF.
+      refundDue,
       noteLines: buildNoteLines(invoice.order),
       items: invoice.order.service_items.map((item) => ({
         serviceDate: item.service_date,
@@ -408,6 +495,27 @@ export async function markInvoicePaid(
     console.error("Receipt PDF generation failed:", err);
   }
 
+  // Upload the payment proof to the private bucket (signed URLs are minted on
+  // read). Store only the storage path on the receipt.
+  const proofUpload = await uploadFile(proofFile, {
+    bucket: PAYMENT_PROOFS_BUCKET,
+    prefix: `invoice/${invoice.id}`,
+    public: false,
+  });
+
+  // Reserve the kwitansi number atomically (per-customer kwitansi_seq) before
+  // the main transaction. Receipts always belong to a customer (via the order).
+  const customer = invoice.order.customer;
+  let receiptNumber: string | null = null;
+  let receiptSeq: number | null = null;
+  if (customer) {
+    const gen = await prisma.$transaction((tx) =>
+      nextReceiptNumber(tx, { id: customer.id, code: customer.code }, paidAt),
+    );
+    receiptNumber = gen.number;
+    receiptSeq = gen.seq;
+  }
+
   return prisma.$transaction(async (tx) => {
     const updated = await tx.invoice.update({
       where: { id: invoiceId },
@@ -421,21 +529,42 @@ export async function markInvoicePaid(
       },
     });
 
-    // Sum of all PAID invoices for this order (settled money received).
-    const paidAgg = await tx.invoice.aggregate({
-      where: { order_id: invoice.order_id, status: "PAID" },
-      _sum: { amount: true },
-    });
-    const paidTotal = Number(paidAgg._sum.amount ?? 0);
-    const finalPrice = Number(invoice.order.final_price);
+    // Create the Kwitansi/Receipt row (idempotency: one receipt per invoice
+    // payment event; the early `status === PAID` return above prevents repeats).
+    if (customer && receiptNumber && receiptSeq !== null) {
+      await tx.receipt.create({
+        data: {
+          receipt_number: receiptNumber,
+          invoice_id: invoice.id,
+          customer_id: customer.id,
+          customer_seq: receiptSeq,
+          payment_date: paidAt,
+          // ACTUAL money received (may exceed the invoice amount on overpayment).
+          amount: amountReceived,
+          payment_method: paymentMethod as never,
+          file_url: receiptUrl,
+          // Private storage path; resolved to a signed URL on read.
+          payment_proof_url: proofUpload.path,
+        },
+      });
+      // total_paid = sum of receipts (cash actually collected, G9).
+      await tx.customer.update({
+        where: { id: customer.id },
+        data: { total_paid: { increment: amountReceived } },
+      });
+    }
+
+    // paid_to_date = sum of ACTUAL money received across the order (= totalReceived,
+    // prior receipts + this payment). Drives payment_status + refund flag.
+    const paidTotal = totalReceived;
 
     let paymentStatus: "UNPAID" | "DP_PAID" | "PAID" = "UNPAID";
-    if (paidTotal >= finalPrice && finalPrice > 0) paymentStatus = "PAID";
+    if (paidTotal >= orderTotal && orderTotal > 0) paymentStatus = "PAID";
     else if (paidTotal > 0) paymentStatus = "DP_PAID";
 
     await tx.order.update({
       where: { id: invoice.order_id },
-      data: { payment_status: paymentStatus },
+      data: { payment_status: paymentStatus, paid_to_date: paidTotal },
     });
 
     return updated;
@@ -510,6 +639,7 @@ export async function generateOrderStatement(
   };
   const fmtTgl = (d: Date) =>
     new Date(d).toLocaleDateString("id-ID", {
+      timeZone: "Asia/Jakarta",
       day: "numeric",
       month: "long",
       year: "numeric",
@@ -772,38 +902,65 @@ export async function sendInvoiceWhatsapp(
   const rentalTotal = rentalBase > 0 ? rentalBase : amount;
   const dpAmount = Math.round(rentalTotal * 0.2);
   const settlementAmount = rentalTotal - dpAmount;
-  const noteLines = input.message_note
-    ? [`Catatan: ${input.message_note}`, ""]
-    : [];
-  const messageText = [
-    `Halo Kak ${targetName || invoice.order.customer_name},`,
-    "",
-    `Invoice: ${invoice.invoice_number}`,
-    ...noteLines,
-    "",
-    `Total biaya sewa senilai ${formatRupiah(rentalTotal)}`,
-    "",
-    `Jika sudah sesuai, silakan transfer DP 20% atau senilai ${formatRupiah(dpAmount)} pada saat pemesanan.`,
-    "",
-    `Pelunasan senilai ${formatRupiah(settlementAmount)} dibayarkan saat mobil kami sudah sampai di lokasi penjemputan.`,
-    "",
-    "Pembayaran dapat ditransfer ke rekening:",
-    "",
-    "Bank Central Asia (BCA)",
-    "0954840782",
-    "a/n PT Ayomi Raya Karsa",
-    "",
-    "MANDIRI",
-    "1330015925837",
-    "a/n Q Ahmada Arifin",
-    "",
-    "Atau Scan QR kami diatas",
-    "a/n Arasya Rental Mobil",
-    "",
-    "Setelah DP kami terima, data mobil dan supir segera kami kirimkan maksimal H-1 ya kak.",
-    "",
-    "Terima kasih 🙏🏻😃",
-  ].join("\n");
+
+  // ── Sprint 2: per-type WhatsApp caption (bold, dynamic dates/greeting/H-1) ──
+  const now = new Date();
+  const serviceDates = invoice.order.service_items
+    .map((i) => i.service_date)
+    .filter((d): d is Date => !!d);
+  const duration = formatTripDuration(serviceDates);
+  const firstServiceDate =
+    [...serviceDates].sort((a, b) => a.getTime() - b.getTime())[0] ||
+    invoice.order.service_start_at ||
+    invoice.order.order_date ||
+    null;
+  // "Same-day" handover wording when the first service day is today (no H-1).
+  const sameDay = isSameDay(firstServiceDate, now);
+  const greeting = greetingFor(now);
+
+  // DP payment timestamp for the settlement reminder (first PAID DP invoice).
+  let dpPaidAt: Date | null = null;
+  if (invoice.invoice_type === "SETTLEMENT") {
+    const dpInvoice = await prisma.invoice.findFirst({
+      where: {
+        order_id: invoice.order_id,
+        invoice_type: "DP",
+        status: "PAID",
+      },
+      orderBy: { paid_at: "asc" },
+    });
+    dpPaidAt = dpInvoice?.paid_at ?? dpInvoice?.issue_date ?? null;
+  }
+
+  const captionCtx = {
+    duration,
+    total: rentalTotal,
+    dp: dpAmount,
+    sisa: settlementAmount,
+    additionalTotal: amount,
+    greeting,
+    dpPaidAt,
+    sameDay,
+  };
+
+  let baseCaption: string;
+  switch (invoice.invoice_type) {
+    case "SETTLEMENT":
+      baseCaption = buildSettlementInvoiceCaption(captionCtx);
+      break;
+    case "ADDITIONAL":
+      baseCaption = buildAdditionalInvoiceCaption(captionCtx);
+      break;
+    // DP / FULL / COMBINED all use the DP-style "please pay" caption.
+    default:
+      baseCaption = buildDpInvoiceCaption(captionCtx);
+      break;
+  }
+
+  // Optional admin note is prepended (kept out of the locked template body).
+  const messageText = input.message_note
+    ? `Catatan: ${input.message_note}\n\n${baseCaption}`
+    : baseCaption;
 
   const log = await prisma.invoiceDeliveryLog.create({
     data: {

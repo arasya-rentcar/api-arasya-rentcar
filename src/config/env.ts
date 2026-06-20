@@ -21,6 +21,16 @@ const envSchema = z.object({
   CORS_ORIGINS: z.string().default(''),
   // Trust proxy hops (nginx). Rate limiting + real IP need this set to 1 behind nginx.
   TRUST_PROXY: z.coerce.number().int().min(0).default(1),
+  // #A1/#A2 H-1 trip-team confirmation sweep. Local WIB time "HH:MM" (24h).
+  // Set CONFIRMATION_SWEEP_ENABLED=false to disable the daily cron entirely.
+  CONFIRMATION_SWEEP_TIME: z
+    .string()
+    .regex(/^([01]?\d|2[0-3]):[0-5]\d$/, 'CONFIRMATION_SWEEP_TIME must be HH:MM')
+    .default('17:00'),
+  CONFIRMATION_SWEEP_ENABLED: z
+    .enum(['true', 'false'])
+    .default('true')
+    .transform((v) => v === 'true'),
 });
 
 const parsed = envSchema.safeParse(process.env);

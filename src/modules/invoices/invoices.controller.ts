@@ -12,6 +12,7 @@ import {
   sendInvoiceWhatsapp,
   markInvoicePaid,
   generateOrderStatement,
+  getPaymentProofUrl,
 } from "./invoices.service";
 
 export async function generateInvoiceController(
@@ -62,8 +63,33 @@ export async function markInvoicePaidController(
 ): Promise<void> {
   try {
     const input = markInvoicePaidSchema.parse(req.body ?? {});
-    const invoice = await markInvoicePaid(req.params.invoiceId, input);
+    // Sprint 3: a payment proof file (field "proof") is REQUIRED to mark paid.
+    const file = (req as Request & { file?: Express.Multer.File }).file;
+    const invoice = await markInvoicePaid(req.params.invoiceId, {
+      ...input,
+      proof: file
+        ? {
+            buffer: file.buffer,
+            mimetype: file.mimetype,
+            size: file.size,
+            originalname: file.originalname,
+          }
+        : undefined,
+    });
     res.json({ status: "success", data: invoice });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function getPaymentProofController(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const data = await getPaymentProofUrl(req.params.invoiceId);
+    res.json({ status: "success", data });
   } catch (err) {
     next(err);
   }

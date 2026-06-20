@@ -7,6 +7,7 @@ import {
   normalizePhone,
 } from './customers.validation';
 import type { Prisma } from '@prisma/client';
+import { mintCustomerCode } from '../../utils/codes';
 
 const ORDERS_PAGE_SIZE = 10;
 
@@ -14,14 +15,18 @@ export async function createCustomer(input: CreateCustomerInput) {
   const phone = normalizePhone(input.phone);
   const existing = await prisma.customer.findUnique({ where: { phone } });
   if (existing) throw new AppError('Customer with this phone already exists', 409);
-  return prisma.customer.create({
-    data: {
-      name: input.name,
-      phone,
-      email: input.email || null,
-      tags: input.tags ?? [],
-      notes: input.notes || null,
-    },
+  return prisma.$transaction(async (tx) => {
+    const { code } = await mintCustomerCode(tx);
+    return tx.customer.create({
+      data: {
+        code,
+        name: input.name,
+        phone,
+        email: input.email || null,
+        tags: input.tags ?? [],
+        notes: input.notes || null,
+      },
+    });
   });
 }
 
@@ -150,8 +155,9 @@ export async function findOrCreateCustomer(
     if (byName) return { customer: byName, created: false };
   }
 
+  const { code } = await mintCustomerCode(client);
   const customer = await client.customer.create({
-    data: { name, phone: phone || null },
+    data: { code, name, phone: phone || null },
   });
   return { customer, created: true };
 }

@@ -3,11 +3,15 @@ import { AppError } from '../../utils/AppError';
 import { computeLineMargin, MARGIN_FORMULA_VERSION } from '../../utils/margin';
 import { syncPayableForLine } from '../payables/payables.service';
 import {
+  deriveState,
+  maybeAutoSendOnAssign,
+} from '../confirmation/confirmation.service';
+import {
   ListScheduleQuery,
   AssignScheduleLineInput,
   DriverAvailabilityQuery,
 } from './schedule.validation';
-import type { Prisma } from '@prisma/client';
+import type { Prisma, ScheduleStatus } from '@prisma/client';
 
 const lineInclude = {
   order: {
@@ -25,11 +29,23 @@ const lineInclude = {
   external_car: { select: { id: true, model: true, plate_number: true } },
 } satisfies Prisma.OrderServiceItemInclude;
 
+const WIB_OFFSET_MS = 7 * 60 * 60 * 1000; // Asia/Jakarta is UTC+7, no DST.
+
+/**
+ * Day window for a calendar date interpreted in **Asia/Jakarta (WIB, GMT+7)**.
+ * A date of 2026-06-20 (WIB) spans 2026-06-19T17:00:00Z .. 2026-06-20T16:59:59.999Z.
+ * Fixes the old UTC-based bounds that day-shifted late-evening Jakarta lines.
+ */
 function dayBounds(dateStr?: string): { start: Date; end: Date } {
+  // Determine the target Y/M/D in WIB. If a date string is given, take its WIB
+  // calendar date; otherwise use "today" in WIB.
   const base = dateStr ? new Date(dateStr) : new Date();
-  const start = new Date(
-    Date.UTC(base.getUTCFullYear(), base.getUTCMonth(), base.getUTCDate(), 0, 0, 0),
-  );
+  const wib = new Date(base.getTime() + WIB_OFFSET_MS);
+  const y = wib.getUTCFullYear();
+  const m = wib.getUTCMonth();
+  const d = wib.getUTCDate();
+  // WIB midnight expressed in UTC = that wall-clock instant minus 7h.
+  const start = new Date(Date.UTC(y, m, d, 0, 0, 0) - WIB_OFFSET_MS);
   const end = new Date(start.getTime() + 24 * 60 * 60 * 1000 - 1);
   return { start, end };
 }
@@ -40,14 +56,16 @@ export async function listSchedule(query: ListScheduleQuery) {
 
   if (query.date_from || query.date_to) {
     where.service_date = {};
+    // Interpret both ends as WIB calendar days so a late-evening Jakarta line
+    // isn't pushed into the wrong day by UTC parsing.
     if (query.date_from)
-      (where.service_date as Prisma.DateTimeFilter).gte = new Date(
+      (where.service_date as Prisma.DateTimeFilter).gte = dayBounds(
         query.date_from,
-      );
+      ).start;
     if (query.date_to)
-      (where.service_date as Prisma.DateTimeFilter).lte = new Date(
+      (where.service_date as Prisma.DateTimeFilter).lte = dayBounds(
         query.date_to,
-      );
+      ).end;
   }
   if (query.driver_id) where.driver_id = query.driver_id;
   if (query.car_id) where.car_id = query.car_id;
@@ -75,7 +93,7 @@ export async function listSchedule(query: ListScheduleQuery) {
   }
 
   const skip = (query.page - 1) * query.page_size;
-  const [items, total, agg] = await Promise.all([
+  const [rawItems, total, agg] = await Promise.all([
     prisma.orderServiceItem.findMany({
       where,
       include: lineInclude,
@@ -89,6 +107,12 @@ export async function listSchedule(query: ListScheduleQuery) {
       _sum: { total_price: true, ops_cost: true, margin_amount: true },
     }),
   ]);
+
+  // Attach the derived #A1/#A2 confirmation badge state to each line.
+  const items = rawItems.map((it) => ({
+    ...it,
+    confirmation_state: deriveState(it),
+  }));
 
   return {
     items,
@@ -197,7 +221,14 @@ export async function assignScheduleLine(
     await rollupOrderFinance(tx, line.order_id);
     return u;
   }, { timeout: 20000, maxWait: 10000 });
-  return updated;
+
+  // #A1/#A2: same-day auto-send. Best-effort, never blocks the assign response.
+  // Only fires when an internal driver+car are both set on the line.
+  if (!updated.is_external && updated.driver_id && updated.car_id) {
+    void maybeAutoSendOnAssign(id);
+  }
+
+  return { ...updated, confirmation_state: deriveState(updated) };
 }
 
 /** Recompute the order's rolled-up totals + margin from its day-lines. */
@@ -306,5 +337,158 @@ export async function driverAvailability(query: DriverAvailabilityQuery) {
         })),
       };
     }),
+  };
+}
+
+/**
+ * #12 Stock / availability monitor for a WIB calendar date.
+ * Rules (locked with TEN):
+ *  - total = ALL internal Driver/Car owned.
+ *  - down  = units off the road today (Driver.status OFF / Car.status MAINTENANCE).
+ *  - used  = distinct internal units on lines that day with line_status in
+ *            (SCHEDULED, IN_PROGRESS). DONE/CANCELLED do NOT occupy a unit.
+ *  - free  = total - used - down (a unit counted once; down takes precedence).
+ * Only INTERNAL stock is counted (external vendors = unlimited 3rd-party supply).
+ */
+export async function scheduleStock(query: { date?: string }) {
+  const { start, end } = dayBounds(query.date);
+  const ACTIVE: ScheduleStatus[] = ['SCHEDULED', 'IN_PROGRESS'];
+
+  const [drivers, cars, lines] = await Promise.all([
+    prisma.driver.findMany({
+      where: { type: 'INTERNAL' },
+      select: { id: true, name: true, phone: true, status: true },
+      orderBy: { name: 'asc' },
+    }),
+    prisma.car.findMany({
+      where: { type: 'INTERNAL' },
+      select: {
+        id: true,
+        model: true,
+        plate_number: true,
+        unit_code: true,
+        status: true,
+      },
+      orderBy: { model: 'asc' },
+    }),
+    prisma.orderServiceItem.findMany({
+      where: {
+        is_external: false,
+        line_status: { in: ACTIVE },
+        service_date: { gte: start, lte: end },
+      },
+      select: {
+        id: true,
+        driver_id: true,
+        car_id: true,
+        line_status: true,
+        pickup_location: true,
+        dropoff_location: true,
+        order: { select: { id: true, order_code: true, customer_name: true } },
+      },
+    }),
+  ]);
+
+  type Booking = {
+    line_id: string;
+    order_id?: string;
+    order_code?: string | null;
+    customer_name?: string;
+    route: string;
+    status: ScheduleStatus;
+  };
+  const bookingOf = (l: (typeof lines)[number]): Booking => ({
+    line_id: l.id,
+    order_id: l.order?.id,
+    order_code: l.order?.order_code,
+    customer_name: l.order?.customer_name,
+    route: `${l.pickup_location} -> ${l.dropoff_location}`,
+    status: l.line_status,
+  });
+
+  const driverBookings = new Map<string, Booking[]>();
+  const carBookings = new Map<string, Booking[]>();
+  for (const l of lines) {
+    if (l.driver_id) {
+      if (!driverBookings.has(l.driver_id)) driverBookings.set(l.driver_id, []);
+      driverBookings.get(l.driver_id)!.push(bookingOf(l));
+    }
+    if (l.car_id) {
+      if (!carBookings.has(l.car_id)) carBookings.set(l.car_id, []);
+      carBookings.get(l.car_id)!.push(bookingOf(l));
+    }
+  }
+
+  // Drivers
+  const driverDown: typeof drivers = [];
+  const driverUsed: { id: string; name: string; phone: string; bookings: Booking[] }[] = [];
+  const driverFree: { id: string; name: string; phone: string }[] = [];
+  for (const d of drivers) {
+    if (d.status === 'OFF') {
+      driverDown.push(d);
+    } else if (driverBookings.has(d.id)) {
+      driverUsed.push({ id: d.id, name: d.name, phone: d.phone, bookings: driverBookings.get(d.id)! });
+    } else {
+      driverFree.push({ id: d.id, name: d.name, phone: d.phone });
+    }
+  }
+
+  // Cars
+  const carDown: typeof cars = [];
+  const carUsed: {
+    id: string;
+    model: string;
+    plate_number: string;
+    unit_code: string | null;
+    bookings: Booking[];
+  }[] = [];
+  const carFree: { id: string; model: string; plate_number: string; unit_code: string | null }[] = [];
+  for (const c of cars) {
+    if (c.status === 'MAINTENANCE') {
+      carDown.push(c);
+    } else if (carBookings.has(c.id)) {
+      carUsed.push({
+        id: c.id,
+        model: c.model,
+        plate_number: c.plate_number,
+        unit_code: c.unit_code,
+        bookings: carBookings.get(c.id)!,
+      });
+    } else {
+      carFree.push({
+        id: c.id,
+        model: c.model,
+        plate_number: c.plate_number,
+        unit_code: c.unit_code,
+      });
+    }
+  }
+
+  return {
+    date: start.toISOString(),
+    date_wib: new Date(start.getTime() + WIB_OFFSET_MS).toISOString().slice(0, 10),
+    drivers: {
+      total: drivers.length,
+      down: driverDown.length,
+      used: driverUsed.length,
+      free: driverFree.length,
+      down_list: driverDown.map((d) => ({ id: d.id, name: d.name })),
+      used_list: driverUsed,
+      free_list: driverFree,
+    },
+    cars: {
+      total: cars.length,
+      down: carDown.length,
+      used: carUsed.length,
+      free: carFree.length,
+      down_list: carDown.map((c) => ({
+        id: c.id,
+        model: c.model,
+        plate_number: c.plate_number,
+        unit_code: c.unit_code,
+      })),
+      used_list: carUsed,
+      free_list: carFree,
+    },
   };
 }

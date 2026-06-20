@@ -184,10 +184,22 @@ model Car {
   status          CarStatus          @default(AVAILABLE)
   type            DriverType         @default(INTERNAL)
   origin_location String?
+  photo_url       String?
+  photos          String[]           @default([])
   trips           Trip[]
   schedule_lines  OrderServiceItem[]
 
   @@map("cars")
+}
+
+/// Global atomic counters (e.g. the running customer code C{n}).
+/// Per-customer document sequences live on the Customer row, not here.
+model Counter {
+  scope      String   @id
+  value      Int      @default(0)
+  updated_at DateTime @updatedAt
+
+  @@map("counters")
 }
 
 model Order {
@@ -212,6 +224,8 @@ model Order {
   driver_message_sent_at DateTime?
   customer_id            String?
   customer               Customer?            @relation(fields: [customer_id], references: [id], onDelete: SetNull)
+  customer_seq           Int?
+  paid_to_date           Decimal              @default(0) @db.Decimal(12, 2)
   is_external            Boolean              @default(false)
   external_vendor_id     String?
   external_vendor        ExternalVendor?      @relation(fields: [external_vendor_id], references: [id], onDelete: SetNull)
@@ -257,20 +271,28 @@ model Order {
 
 model Customer {
   id             String    @id @default(uuid())
+  code           String    @unique
   name           String
   phone          String?   @unique
   email          String?
   tags           String[]  @default([])
   total_orders   Int       @default(0)
   total_spent    Decimal   @default(0) @db.Decimal(14, 2)
+  total_billed   Decimal   @default(0) @db.Decimal(14, 2)
+  total_paid     Decimal   @default(0) @db.Decimal(14, 2)
+  order_seq      Int       @default(0)
+  invoice_seq    Int       @default(0)
+  kwitansi_seq   Int       @default(0)
   first_order_at DateTime?
   last_order_at  DateTime?
   notes          String?
   orders         Order[]
+  receipts       Receipt[]
   created_at     DateTime  @default(now())
   updated_at     DateTime  @updatedAt
 
   @@index([phone])
+  @@index([code])
   @@index([total_orders])
   @@map("customers")
 }
@@ -362,6 +384,16 @@ model OrderServiceItem {
 
   payable Payable?
 
+  // --- #A1/#A2 trip-confirmation messaging (additive, 2026-06-20) ---
+  // confirmation_* = message sent to the CUSTOMER ("Data tim bertugas").
+  // driver_reminder_* = message sent to the assigned DRIVER ("Reminder Jadwal").
+  // *_snapshot stores { driver_id, car_id } captured at send time so we can
+  // detect a later reassignment and flip the UI to "perlu kirim ulang".
+  confirmation_sent_at      DateTime?
+  confirmation_sent_snapshot Json?
+  driver_reminder_sent_at    DateTime?
+  driver_reminder_snapshot   Json?
+
   created_at DateTime @default(now())
 
   @@index([order_id])
@@ -409,9 +441,10 @@ model Payable {
   // base + extras = TOTAL owed.
   total_amount  Decimal   @default(0) @db.Decimal(12, 2)
 
-  keterangan     String?
-  paid_at        DateTime?
-  payment_method PaymentMethod?
+  keterangan        String?
+  paid_at           DateTime?
+  payment_method    PaymentMethod?
+  payment_proof_url String?
 
   extras PayableExtra[]
 
@@ -471,32 +504,59 @@ model TripLog {
 }
 
 model Invoice {
-  id             String               @id @default(uuid())
-  order_id       String
-  order          Order                @relation(fields: [order_id], references: [id])
-  invoice_number String               @unique
-  invoice_type   InvoiceType          @default(FULL)
-  payment_method PaymentMethod        @default(CASH)
-  issue_date     DateTime             @default(now())
-  due_date       DateTime?
-  paid_at        DateTime?
-  amount         Decimal              @db.Decimal(12, 2)
-  note           String?
-  file_url       String?
-  receipt_url    String?
-  status         InvoiceStatus        @default(ISSUED)
-  revision       Int                  @default(0)
-  parent_id      String?
-  parent         Invoice?             @relation("InvoiceRevisions", fields: [parent_id], references: [id])
-  revisions      Invoice[]            @relation("InvoiceRevisions")
-  delivery_logs  InvoiceDeliveryLog[]
-  created_at     DateTime             @default(now())
-  updated_at     DateTime             @updatedAt
+  id                String               @id @default(uuid())
+  order_id          String
+  order             Order                @relation(fields: [order_id], references: [id])
+  invoice_number    String               @unique
+  invoice_type      InvoiceType          @default(FULL)
+  payment_method    PaymentMethod        @default(CASH)
+  issue_date        DateTime             @default(now())
+  due_date          DateTime?
+  paid_at           DateTime?
+  amount            Decimal              @db.Decimal(12, 2)
+  note              String?
+  file_url          String?
+  receipt_url       String?
+  payment_proof_url String?
+  customer_seq      Int?
+  status            InvoiceStatus        @default(ISSUED)
+  revision          Int                  @default(0)
+  parent_id         String?
+  parent            Invoice?             @relation("InvoiceRevisions", fields: [parent_id], references: [id])
+  revisions         Invoice[]            @relation("InvoiceRevisions")
+  delivery_logs     InvoiceDeliveryLog[]
+  receipts          Receipt[]
+  created_at        DateTime             @default(now())
+  updated_at        DateTime             @updatedAt
 
   @@index([order_id])
   @@index([parent_id])
   @@index([status])
   @@map("invoices")
+}
+
+/// Kwitansi / receipt. One invoice can have many receipts (e.g. partial
+/// payments). Each receipt takes the customer's next running kwitansi number.
+model Receipt {
+  id                String        @id @default(uuid())
+  receipt_number    String        @unique
+  invoice_id        String
+  invoice           Invoice       @relation(fields: [invoice_id], references: [id], onDelete: Cascade)
+  customer_id       String
+  customer          Customer      @relation(fields: [customer_id], references: [id])
+  customer_seq      Int
+  payment_date      DateTime      @default(now())
+  amount            Decimal       @db.Decimal(12, 2)
+  payment_method    PaymentMethod @default(CASH)
+  payment_proof_url String?
+  file_url          String?
+  note              String?
+  created_at        DateTime      @default(now())
+  updated_at        DateTime      @updatedAt
+
+  @@index([invoice_id])
+  @@index([customer_id])
+  @@map("receipts")
 }
 
 model InvoiceDeliveryLog {

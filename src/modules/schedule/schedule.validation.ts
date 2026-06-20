@@ -41,3 +41,9 @@ export const driverAvailabilityQuerySchema = z.object({
 export type DriverAvailabilityQuery = z.infer<
   typeof driverAvailabilityQuerySchema
 >;
+
+// #12 stock monitor: driver + car used/free/down/total for a WIB date.
+export const scheduleStockQuerySchema = z.object({
+  date: z.string().optional(), // YYYY-MM-DD (WIB); defaults to today
+});
+export type ScheduleStockQuery = z.infer<typeof scheduleStockQuerySchema>;

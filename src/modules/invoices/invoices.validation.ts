@@ -5,6 +5,9 @@ export const generateInvoiceSchema = z.object({
   payment_method: z.enum(["CASH", "BANK_TRANSFER", "QRIS", "OTHER"]),
   amount: z.number().positive("Amount must be a positive number"),
   note: z.string().optional(),
+  // #10: optional issue date (defaults to now). Allows issuing/back-dating an
+  // invoice for an order from a previous day.
+  issue_date: z.string().datetime().optional(),
 });
 
 export const reviseInvoiceSchema = z.object({
@@ -16,6 +19,10 @@ export const reviseInvoiceSchema = z.object({
 export const markInvoicePaidSchema = z.object({
   payment_method: z.enum(["CASH", "BANK_TRANSFER", "QRIS", "OTHER"]).optional(),
   paid_at: z.string().optional(),
+  // Sprint 2: actual money received, which may differ from the invoice amount
+  // (overpayment). Defaults to the invoice amount when omitted. Coerced because
+  // multipart form fields arrive as strings.
+  amount_received: z.coerce.number().positive().optional(),
 });
 
 export type GenerateInvoiceInput = z.infer<typeof generateInvoiceSchema>;

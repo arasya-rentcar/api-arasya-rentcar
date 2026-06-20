@@ -3,11 +3,13 @@ import {
   listScheduleQuerySchema,
   assignScheduleLineSchema,
   driverAvailabilityQuerySchema,
+  scheduleStockQuerySchema,
 } from './schedule.validation';
 import {
   listSchedule,
   assignScheduleLine,
   driverAvailability,
+  scheduleStock,
 } from './schedule.service';
 
 export async function listScheduleController(
@@ -46,6 +48,20 @@ export async function driverAvailabilityController(
   try {
     const query = driverAvailabilityQuerySchema.parse(req.query);
     const data = await driverAvailability(query);
+    res.json({ status: 'success', data });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function scheduleStockController(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const query = scheduleStockQuerySchema.parse(req.query);
+    const data = await scheduleStock(query);
     res.json({ status: 'success', data });
   } catch (err) {
     next(err);

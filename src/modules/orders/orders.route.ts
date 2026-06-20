@@ -1,8 +1,15 @@
 import { Router } from "express";
+import multer from "multer";
 import {
   verifyTokenMiddleware,
   requireRole,
 } from "../../middleware/auth.middleware";
+
+// Sprint 3: in-memory upload for payment proof (validated in the service layer).
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 },
+});
 import {
   createOrderController,
   listOrdersController,
@@ -19,6 +26,7 @@ import {
   sendInvoiceWhatsappController,
   markInvoicePaidController,
   getOrderStatementController,
+  getPaymentProofController,
 } from "./orders.controller";
 
 const router = Router();
@@ -40,7 +48,17 @@ router.get("/:id/statement", getOrderStatementController);
 // POST variant carries an optional { invoice_ids: string[] } selection.
 router.post("/:id/statement", getOrderStatementController);
 router.post("/:id/invoice/:invoiceId/revise", reviseInvoiceController);
-router.post("/:id/invoice/:invoiceId/mark-paid", markInvoicePaidController);
+// mark-paid requires a payment proof file (field name: "proof").
+router.post(
+  "/:id/invoice/:invoiceId/mark-paid",
+  upload.single("proof"),
+  markInvoicePaidController,
+);
+// Fetch a short-lived signed URL to view the payment proof.
+router.get(
+  "/:id/invoice/:invoiceId/payment-proof",
+  getPaymentProofController,
+);
 router.post(
   "/:id/invoice/:invoiceId/send-whatsapp",
   sendInvoiceWhatsappController,
