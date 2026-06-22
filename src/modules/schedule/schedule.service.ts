@@ -3,6 +3,12 @@ import { AppError } from '../../utils/AppError';
 import { computeLineMargin, MARGIN_FORMULA_VERSION } from '../../utils/margin';
 import { syncPayableForLine } from '../payables/payables.service';
 import {
+  deriveAndSetOrderStatus,
+  syncDriverStatus,
+  syncCarStatus,
+  tripStatusForLine,
+} from './order-derive.service';
+import {
   deriveState,
   maybeAutoSendOnAssign,
 } from '../confirmation/confirmation.service';
@@ -202,7 +208,19 @@ export async function assignScheduleLine(
     if (input.driver_id !== undefined) data.driver_id = input.driver_id;
     if (input.car_id !== undefined) data.car_id = input.car_id;
   }
-  if (input.line_status !== undefined) data.line_status = input.line_status;
+  if (input.line_status !== undefined) {
+    data.line_status = input.line_status;
+    // Keep the fine-grained per-line trip_status in step with the coarse
+    // line_status when the caller flips status without an explicit journey
+    // value (e.g. bulk assign / cancel). Explicit trip advances happen via the
+    // dedicated advance endpoint and are left untouched ({} = no change).
+    const ts = tripStatusForLine(input.line_status);
+    if (ts.trip_status !== undefined) {
+      data.trip_status = ts.trip_status;
+      // Stamp completion time when the line is closed out via status flip.
+      if (input.line_status === 'DONE') data.trip_finished_at = new Date();
+    }
+  }
   if (input.service_date !== undefined)
     data.service_date = input.service_date ? new Date(input.service_date) : null;
   if (input.start_at !== undefined)
@@ -210,6 +228,11 @@ export async function assignScheduleLine(
   if (input.end_at !== undefined)
     data.end_at = input.end_at ? new Date(input.end_at) : null;
   if (input.notes !== undefined) data.notes = input.notes;
+
+  // Capture the line's resource links BEFORE the update so a reassignment can
+  // also release the previously-linked driver/car if they are now idle.
+  const prevDriverId = line.driver_id;
+  const prevCarId = line.car_id;
 
   const updated = await prisma.$transaction(async (tx) => {
     const u = await tx.orderServiceItem.update({
@@ -219,6 +242,20 @@ export async function assignScheduleLine(
     });
     await syncPayableForLine(tx, id);
     await rollupOrderFinance(tx, line.order_id);
+
+    // Batch 2: keep order status + driver/car resource status derived from the
+    // lines, all inside this same transaction so nothing can drift.
+    await deriveAndSetOrderStatus(tx, line.order_id);
+
+    const driversToSync = new Set<string>();
+    const carsToSync = new Set<string>();
+    if (prevDriverId) driversToSync.add(prevDriverId);
+    if (u.driver_id) driversToSync.add(u.driver_id);
+    if (prevCarId) carsToSync.add(prevCarId);
+    if (u.car_id) carsToSync.add(u.car_id);
+    for (const d of driversToSync) await syncDriverStatus(tx, d);
+    for (const c of carsToSync) await syncCarStatus(tx, c);
+
     return u;
   }, { timeout: 20000, maxWait: 10000 });
 
