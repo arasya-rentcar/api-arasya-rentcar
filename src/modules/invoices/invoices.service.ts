@@ -27,6 +27,37 @@ import {
   SendReceiptWhatsappInput,
 } from "./invoices.validation";
 
+// Format an adjustment's date as e.g. "Senin, 22 Juni 2026" (Asia/Jakarta).
+function fmtAdjustmentDate(d: Date | string | null | undefined): string | null {
+  if (!d) return null;
+  const date = new Date(d);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toLocaleDateString("id-ID", {
+    timeZone: "Asia/Jakarta",
+    weekday: "long",
+    day: "numeric",
+    month: "long",
+    year: "numeric",
+  });
+}
+
+// Turn a billable adjustment into a PDF line item, appending the date to the
+// description (e.g. "overtime 2 jam - Senin, 22 Juni 2026").
+function adjustmentToLineItem(a: {
+  description: string;
+  amount: unknown;
+  quantity?: number | null;
+  created_at?: Date | string | null;
+}) {
+  const dateStr = fmtAdjustmentDate(a.created_at);
+  return {
+    description: dateStr ? `${a.description} - ${dateStr}` : a.description,
+    quantity: a.quantity ?? 1,
+    unitPrice: Number(a.amount),
+    totalPrice: Number(a.amount) * (a.quantity ?? 1),
+  };
+}
+
 // Build the descriptive note lines shown under the table (pickup / dropoff /
 // what's included), mirroring the official invoice/kuitansi templates.
 function buildNoteLines(order: {
@@ -201,12 +232,7 @@ export async function generateInvoice(
   // For COMBINED, render the billable adjustments as an "Additional Charges"
   // section in the same PDF as the rental service lines.
   const additionalItems = isCombined
-    ? billableAdjustments.map((a) => ({
-        description: a.description,
-        quantity: a.quantity ?? 1,
-        unitPrice: Number(a.amount),
-        totalPrice: Number(a.amount) * (a.quantity ?? 1),
-      }))
+    ? billableAdjustments.map(adjustmentToLineItem)
     : undefined;
 
   // The PDF line items depend on the invoice type:
@@ -224,12 +250,7 @@ export async function generateInvoice(
     unitPrice: Number(item.unit_price),
     totalPrice: Number(item.total_price),
   }));
-  const additionalLineItems = billableAdjustments.map((a) => ({
-    description: a.description,
-    quantity: a.quantity ?? 1,
-    unitPrice: Number(a.amount),
-    totalPrice: Number(a.amount) * (a.quantity ?? 1),
-  }));
+  const additionalLineItems = billableAdjustments.map(adjustmentToLineItem);
   const pdfItems =
     input.invoice_type === "ADDITIONAL" ? additionalLineItems : rentalLineItems;
 
@@ -405,12 +426,7 @@ export async function markInvoicePaid(
   );
   const receiptAdditionalItems =
     invoice.invoice_type === "COMBINED"
-      ? receiptBillableAdjustments.map((a) => ({
-          description: a.description,
-          quantity: a.quantity ?? 1,
-          unitPrice: Number(a.amount),
-          totalPrice: Number(a.amount) * (a.quantity ?? 1),
-        }))
+      ? receiptBillableAdjustments.map(adjustmentToLineItem)
       : undefined;
   // The kwitansi line items mirror the invoice: an ADDITIONAL receipt lists ONLY
   // the additional charges; every other type lists the rental service days.
@@ -427,12 +443,7 @@ export async function markInvoicePaid(
   }));
   const receiptItems =
     invoice.invoice_type === "ADDITIONAL"
-      ? receiptBillableAdjustments.map((a) => ({
-          description: a.description,
-          quantity: a.quantity ?? 1,
-          unitPrice: Number(a.amount),
-          totalPrice: Number(a.amount) * (a.quantity ?? 1),
-        }))
+      ? receiptBillableAdjustments.map(adjustmentToLineItem)
       : receiptRentalItems;
 
   // Sum of prior invoices (excluding this one) for the receipt summary.
@@ -653,12 +664,7 @@ export async function generateOrderStatement(
   // Billable additional charges (overtime/parking/etc.).
   const additionalItems = order.adjustments
     .filter((a) => a.is_billable)
-    .map((a) => ({
-      description: a.description,
-      quantity: a.quantity,
-      unitPrice: Number(a.amount),
-      totalPrice: Number(a.amount) * (a.quantity ?? 1),
-    }));
+    .map(adjustmentToLineItem);
 
   // Every payment actually received (PAID invoices only).
   const typeLabelId: Record<string, string> = {
@@ -791,12 +797,9 @@ export async function reviseInvoice(
   const reviseBillableAdjustments = invoice.order.adjustments.filter(
     (a) => a.is_billable,
   );
-  const reviseAdjustmentItems = reviseBillableAdjustments.map((a) => ({
-    description: a.description,
-    quantity: a.quantity ?? 1,
-    unitPrice: Number(a.amount),
-    totalPrice: Number(a.amount) * (a.quantity ?? 1),
-  }));
+  const reviseAdjustmentItems = reviseBillableAdjustments.map(
+    adjustmentToLineItem,
+  );
   const reviseRentalItems = invoice.order.service_items.map((item) => ({
     serviceDate: item.service_date,
     description: item.description,
