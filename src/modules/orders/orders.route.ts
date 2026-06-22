@@ -24,6 +24,7 @@ import {
   getInvoiceByOrderController,
   reviseInvoiceController,
   sendInvoiceWhatsappController,
+  sendReceiptWhatsappController,
   markInvoicePaidController,
   getOrderStatementController,
   getPaymentProofController,

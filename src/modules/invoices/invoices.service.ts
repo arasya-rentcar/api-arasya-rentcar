@@ -5,6 +5,8 @@ import {
   buildDpInvoiceCaption,
   buildSettlementInvoiceCaption,
   buildAdditionalInvoiceCaption,
+  buildRentalReceiptCaption,
+  buildAdditionalReceiptCaption,
   formatTripDuration,
   greetingFor,
   isSameDay,
@@ -22,6 +24,7 @@ import {
   GenerateInvoiceInput,
   ReviseInvoiceInput,
   SendInvoiceWhatsappInput,
+  SendReceiptWhatsappInput,
 } from "./invoices.validation";
 
 // Build the descriptive note lines shown under the table (pickup / dropoff /
@@ -966,6 +969,7 @@ export async function sendInvoiceWhatsapp(
     data: {
       invoice_id: invoice.id,
       order_id: invoice.order_id,
+      document_type: "INVOICE",
       target_name: targetName,
       target_phone: targetPhone,
       message_text: messageText,
@@ -1029,5 +1033,143 @@ export async function sendInvoiceWhatsapp(
       data: { status: "FAILED", error_message: message },
     });
     throw new AppError(`WhatsApp invoice send failed: ${message}`, 502);
+  }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Send the KWITANSI (receipt) PDF to the customer over WhatsApp.
+// Mirrors sendInvoiceWhatsapp but resolves the receipt PDF (invoice.receipt_url
+// or the latest Receipt.file_url) and uses the receipt caption. Only valid once
+// the invoice is PAID and a receipt PDF exists.
+// ───────────────────────────────────────────────────────────────────────────
+export async function sendReceiptWhatsapp(
+  invoiceId: string,
+  input: SendReceiptWhatsappInput,
+  sentByUserId?: string,
+) {
+  const invoice = await prisma.invoice.findUnique({
+    where: { id: invoiceId },
+    include: {
+      receipts: { orderBy: { created_at: "desc" } },
+      order: {
+        include: {
+          customers: { orderBy: { created_at: "asc" } },
+          service_items: { orderBy: { sort_order: "asc" } },
+        },
+      },
+    },
+  });
+  if (!invoice) throw new AppError("Invoice not found", 404);
+  if (invoice.status !== "PAID")
+    throw new AppError(
+      "Receipt can only be sent after the invoice is paid.",
+      409,
+    );
+
+  // Prefer the dedicated Receipt row's PDF; fall back to invoice.receipt_url.
+  const latestReceipt = invoice.receipts[0];
+  const receiptPdfUrl = latestReceipt?.file_url || invoice.receipt_url;
+  if (!receiptPdfUrl)
+    throw new AppError(
+      "Kwitansi PDF is missing. The receipt may not have been generated yet.",
+      409,
+    );
+  const receiptNumber = latestReceipt?.receipt_number || invoice.invoice_number;
+
+  const targetPhone = normalizePhone(input.target_phone);
+  if (!targetPhone) throw new AppError("Valid target phone is required", 400);
+  const targetName =
+    input.target_name ||
+    invoice.order.customers.find((c) => c.phone)?.name ||
+    invoice.order.customer_name;
+
+  // Receipt caption: ADDITIONAL invoices use the additional-receipt wording,
+  // everything else uses the rental receipt. "sameDay" tweaks the handover line.
+  const now = new Date();
+  const serviceDates = invoice.order.service_items
+    .map((i) => i.service_date)
+    .filter((d): d is Date => !!d);
+  const firstServiceDate =
+    [...serviceDates].sort((a, b) => a.getTime() - b.getTime())[0] ||
+    invoice.order.service_start_at ||
+    invoice.order.order_date ||
+    null;
+  const sameDay = isSameDay(firstServiceDate, now);
+  const baseCaption =
+    invoice.invoice_type === "ADDITIONAL"
+      ? buildAdditionalReceiptCaption()
+      : buildRentalReceiptCaption({ sameDay });
+  const messageText = input.message_note
+    ? `Catatan: ${input.message_note}\n\n${baseCaption}`
+    : baseCaption;
+
+  const log = await prisma.invoiceDeliveryLog.create({
+    data: {
+      invoice_id: invoice.id,
+      order_id: invoice.order_id,
+      document_type: "RECEIPT",
+      target_name: targetName,
+      target_phone: targetPhone,
+      message_text: messageText,
+      file_url: receiptPdfUrl,
+      invoice_number_snapshot: receiptNumber,
+      amount_snapshot: invoice.amount,
+      status_snapshot: invoice.status,
+      status: "PENDING",
+      sent_by_user_id: sentByUserId,
+    },
+  });
+
+  try {
+    const token = botToken();
+    if (!token) throw new Error("WA bot internal token is not configured");
+    const res = await fetch(`${botBaseUrl()}/internal/invoices/send`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        invoice_id: invoice.id,
+        delivery_log_id: log.id,
+        invoice_number: receiptNumber,
+        target_name: targetName,
+        target_phone: targetPhone,
+        amount: Number(invoice.amount),
+        pdf_url: receiptPdfUrl,
+        message_text: messageText,
+        filename: `Kwitansi-${receiptNumber}.pdf`,
+      }),
+    });
+    const text = await res.text();
+    let payload: any = null;
+    try {
+      payload = text ? JSON.parse(text) : null;
+    } catch {
+      payload = { raw: text };
+    }
+    if (!res.ok)
+      throw new Error(
+        payload?.message ||
+          payload?.error ||
+          payload?.raw ||
+          `WA bot HTTP ${res.status}`,
+      );
+    return prisma.invoiceDeliveryLog.update({
+      where: { id: log.id },
+      data: {
+        status: "SENT",
+        provider_message_id: payload?.message_id || payload?.id || null,
+        sent_at: new Date(),
+        error_message: null,
+      },
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await prisma.invoiceDeliveryLog.update({
+      where: { id: log.id },
+      data: { status: "FAILED", error_message: message },
+    });
+    throw new AppError(`WhatsApp receipt send failed: ${message}`, 502);
   }
 }

@@ -118,6 +118,13 @@ enum InvoiceDeliveryStatus {
   FAILED
 }
 
+/// Which document a delivery log carried: the bill (INVOICE) or the
+/// kwitansi/receipt (RECEIPT). Lets us send + audit both separately.
+enum InvoiceDeliveryDocument {
+  INVOICE
+  RECEIPT
+}
+
 enum OrderAdjustmentType {
   ROUTE_CHANGE
   TIME_CHANGE
@@ -535,7 +542,8 @@ model InvoiceDeliveryLog {
   invoice                 Invoice                @relation(fields: [invoice_id], references: [id], onDelete: Cascade)
   order_id                String
   order                   Order                  @relation(fields: [order_id], references: [id], onDelete: Cascade)
-  channel                 InvoiceDeliveryChannel @default(WHATSAPP)
+  channel                 InvoiceDeliveryChannel  @default(WHATSAPP)
+  document_type           InvoiceDeliveryDocument @default(INVOICE)
   target_name             String?
   target_phone            String
   message_text            String?

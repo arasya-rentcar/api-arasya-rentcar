@@ -38,3 +38,16 @@ export const sendInvoiceWhatsappSchema = z.object({
 export type SendInvoiceWhatsappInput = z.infer<
   typeof sendInvoiceWhatsappSchema
 >;
+
+// Send the kwitansi/receipt PDF to the customer over WhatsApp. Same shape as
+// the invoice send (recipient + optional admin note); the receipt PDF + caption
+// are resolved server-side from the (PAID) invoice.
+export const sendReceiptWhatsappSchema = z.object({
+  target_name: z.string().optional(),
+  target_phone: z.string().min(1, "Target phone is required"),
+  message_note: z.string().optional(),
+});
+
+export type SendReceiptWhatsappInput = z.infer<
+  typeof sendReceiptWhatsappSchema
+>;

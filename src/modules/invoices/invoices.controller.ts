@@ -3,6 +3,7 @@ import {
   generateInvoiceSchema,
   reviseInvoiceSchema,
   sendInvoiceWhatsappSchema,
+  sendReceiptWhatsappSchema,
   markInvoicePaidSchema,
 } from "./invoices.validation";
 import {
@@ -10,6 +11,7 @@ import {
   getInvoicesByOrder,
   reviseInvoice,
   sendInvoiceWhatsapp,
+  sendReceiptWhatsapp,
   markInvoicePaid,
   generateOrderStatement,
   getPaymentProofUrl,
@@ -126,6 +128,24 @@ export async function sendInvoiceWhatsappController(
   try {
     const input = sendInvoiceWhatsappSchema.parse(req.body);
     const log = await sendInvoiceWhatsapp(
+      req.params.invoiceId,
+      input,
+      req.user?.user_id,
+    );
+    res.status(201).json({ status: "success", data: log });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function sendReceiptWhatsappController(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const input = sendReceiptWhatsappSchema.parse(req.body);
+    const log = await sendReceiptWhatsapp(
       req.params.invoiceId,
       input,
       req.user?.user_id,
