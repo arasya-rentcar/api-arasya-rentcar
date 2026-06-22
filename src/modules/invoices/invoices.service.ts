@@ -1297,3 +1297,82 @@ export async function sendReceiptWhatsapp(
     throw new AppError(`WhatsApp receipt send failed: ${message}`, 502);
   }
 }
+
+// ── Server-side invoices list (replaces the old client-side flatMap) ────────
+// The dashboard /invoices page used to pull the ENTIRE /orders list and build
+// the invoice rows in the browser. This paginates + filters in the DB and
+// returns each invoice already shaped with the order context the UI needs.
+export interface SearchInvoicesParams {
+  search?: string;
+  status?: string; // DRAFT|ISSUED|REVISED|PAID|CANCELLED
+  payment_status?: string; // order-level bucket: UNPAID|DP_PAID|PAID
+  page?: number;
+  page_size?: number;
+}
+
+export async function searchInvoices(params: SearchInvoicesParams) {
+  const page = Math.max(1, Number(params.page) || 1);
+  const pageSize = Math.min(100, Math.max(1, Number(params.page_size) || 10));
+
+  const and: Record<string, unknown>[] = [];
+
+  if (params.search?.trim()) {
+    const q = params.search.trim();
+    and.push({
+      OR: [
+        { invoice_number: { contains: q, mode: "insensitive" } },
+        { order: { customer_name: { contains: q, mode: "insensitive" } } },
+        { order: { order_code: { contains: q, mode: "insensitive" } } },
+        {
+          order: {
+            customers: {
+              some: { name: { contains: q, mode: "insensitive" } },
+            },
+          },
+        },
+      ],
+    });
+  }
+  if (params.status && params.status !== "ALL") {
+    and.push({ status: params.status });
+  }
+  if (params.payment_status && params.payment_status !== "ALL") {
+    and.push({ order: { payment_status: params.payment_status } });
+  }
+
+  const where = and.length ? { AND: and } : {};
+
+  const [total, rows] = await Promise.all([
+    prisma.invoice.count({ where }),
+    prisma.invoice.findMany({
+      where,
+      orderBy: { created_at: "desc" },
+      skip: (page - 1) * pageSize,
+      take: pageSize,
+      include: {
+        order: {
+          select: {
+            id: true,
+            order_code: true,
+            customer_name: true,
+            customer_phone: true,
+            payment_status: true,
+            customers: { orderBy: { created_at: "asc" } },
+          },
+        },
+        receipts: { orderBy: { created_at: "desc" } },
+        delivery_logs: { orderBy: { created_at: "desc" } },
+      },
+    }),
+  ]);
+
+  return {
+    data: rows,
+    pagination: {
+      page,
+      page_size: pageSize,
+      total,
+      page_count: Math.max(1, Math.ceil(total / pageSize)),
+    },
+  };
+}

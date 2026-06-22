@@ -15,7 +15,30 @@ import {
   markInvoicePaid,
   generateOrderStatement,
   getPaymentProofUrl,
+  searchInvoices,
 } from "./invoices.service";
+
+// Server-paginated invoices list for the dashboard /invoices page.
+export async function searchInvoicesController(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const { search, status, payment_status, page, page_size } = req.query;
+    const result = await searchInvoices({
+      search: typeof search === "string" ? search : undefined,
+      status: typeof status === "string" ? status : undefined,
+      payment_status:
+        typeof payment_status === "string" ? payment_status : undefined,
+      page: page ? Number(page) : undefined,
+      page_size: page_size ? Number(page_size) : undefined,
+    });
+    res.json({ status: "success", ...result });
+  } catch (err) {
+    next(err);
+  }
+}
 
 export async function generateInvoiceController(
   req: Request,
