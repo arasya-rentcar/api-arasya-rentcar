@@ -15,6 +15,7 @@ import {
   getOrderById,
   updateOrder,
   assignOrder,
+  reassignOrder,
   createOrderAdjustment,
   createOrderChangeLog,
   upsertOrderFinance,
@@ -178,6 +179,20 @@ export async function assignOrderController(
     const input = assignOrderSchema.parse(req.body);
     const trip = await assignOrder(req.params.id, input);
     res.status(201).json({ status: "success", data: trip });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function reassignOrderController(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const input = assignOrderSchema.parse(req.body);
+    const order = await reassignOrder(req.params.id, input);
+    res.status(200).json({ status: "success", data: order });
   } catch (err) {
     next(err);
   }

@@ -764,6 +764,92 @@ export async function assignOrder(orderId: string, input: AssignOrderInput) {
   return updated;
 }
 
+/**
+ * Bulk RE-assign: overwrite the driver+car on every internal line that has NOT
+ * started yet (line_status = ASSIGNED), e.g. swapping the driver on a 5-day
+ * order after it was already assigned. Lines that are IN_PROGRESS / DONE /
+ * CANCELLED are left untouched — you can't yank a driver off a running or
+ * finished day. Old drivers/cars whose remaining lines drop to zero are
+ * released back to AVAILABLE.
+ */
+export async function reassignOrder(
+  orderId: string,
+  input: AssignOrderInput,
+) {
+  const order = await prisma.order.findUnique({ where: { id: orderId } });
+  if (!order) throw new AppError("Order not found", 404);
+
+  // Only the not-yet-started internal lines are eligible for a swap.
+  const eligibleLines = await prisma.orderServiceItem.findMany({
+    where: {
+      order_id: orderId,
+      is_external: false,
+      line_status: "ASSIGNED",
+    },
+    select: { id: true, driver_id: true, car_id: true },
+  });
+  if (eligibleLines.length === 0) {
+    throw new AppError(
+      "No assignable lines to reassign (all lines are unassigned, already started, done, or cancelled).",
+      409,
+    );
+  }
+
+  // Validate the new driver: must be AVAILABLE, unless it is already the driver
+  // on one of this order's lines (re-confirming the same driver is harmless).
+  const driver = await prisma.driver.findUnique({
+    where: { id: input.driver_id },
+  });
+  if (!driver) throw new AppError("Driver not found", 404);
+  const driverAlreadyOnOrder = eligibleLines.some(
+    (l) => l.driver_id === input.driver_id,
+  );
+  if (driver.status !== "AVAILABLE" && !driverAlreadyOnOrder) {
+    throw new AppError("Driver is not available", 409);
+  }
+
+  // Validate the new car: same rule.
+  const car = await prisma.car.findUnique({ where: { id: input.car_id } });
+  if (!car) throw new AppError("Car not found", 409);
+  const carAlreadyOnOrder = eligibleLines.some(
+    (l) => l.car_id === input.car_id,
+  );
+  if (car.status !== "AVAILABLE" && !carAlreadyOnOrder) {
+    throw new AppError("Car is not available", 409);
+  }
+
+  // Drivers/cars being replaced (so we can re-sync their status afterwards).
+  const oldDriverIds = new Set(
+    eligibleLines.map((l) => l.driver_id).filter((d): d is string => !!d),
+  );
+  const oldCarIds = new Set(
+    eligibleLines.map((l) => l.car_id).filter((c): c is string => !!c),
+  );
+
+  const updated = await prisma.$transaction(async (tx) => {
+    await tx.orderServiceItem.updateMany({
+      where: {
+        order_id: orderId,
+        is_external: false,
+        line_status: "ASSIGNED",
+      },
+      data: {
+        driver_id: input.driver_id,
+        car_id: input.car_id,
+      },
+    });
+    await deriveAndSetOrderStatus(tx, orderId);
+    // Release the old resources first, then mark the new ones busy.
+    for (const id of oldDriverIds) await syncDriverStatus(tx, id);
+    for (const id of oldCarIds) await syncCarStatus(tx, id);
+    await syncDriverStatus(tx, input.driver_id);
+    await syncCarStatus(tx, input.car_id);
+    return tx.order.findUnique({ where: { id: orderId } });
+  });
+
+  return updated;
+}
+
 export async function createOrderAdjustment(
   orderId: string,
   input: CreateAdjustmentInput,

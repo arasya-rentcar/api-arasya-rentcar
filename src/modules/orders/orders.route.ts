@@ -18,6 +18,7 @@ import {
   upsertOrderFinanceController,
   updateOrderController,
   assignOrderController,
+  reassignOrderController,
   createOrderAdjustmentController,
   createOrderChangeLogController,
   generateInvoiceController,
@@ -43,6 +44,7 @@ router.get("/:id", getOrderByIdController);
 router.put("/:id", updateOrderController);
 router.put("/:id/finance", upsertOrderFinanceController);
 router.post("/:id/assign", assignOrderController);
+router.post("/:id/reassign", reassignOrderController);
 router.post("/:id/adjustments", createOrderAdjustmentController);
 router.post("/:id/change-logs", createOrderChangeLogController);
 router.post("/:id/generate-invoice", generateInvoiceController);
