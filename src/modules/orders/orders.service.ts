@@ -231,8 +231,13 @@ export async function listOrders() {
           revision: true,
           parent_id: true,
           file_url: true,
+          receipt_url: true,
+          issue_date: true,
+          payment_method: true,
           created_at: true,
           delivery_logs: { orderBy: { created_at: "desc" as const } },
+          // Kwitansi rows so the Invoices menu can show receipt alongside invoice.
+          receipts: { orderBy: { created_at: "desc" as const } },
         },
         orderBy: { created_at: "desc" as const },
       },
