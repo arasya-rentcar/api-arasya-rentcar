@@ -6,7 +6,7 @@ import {
   deriveAndSetOrderStatus,
   syncDriverStatus,
   syncCarStatus,
-  tripStatusForLine,
+  tripTimestampsForLine,
 } from './order-derive.service';
 import {
   deriveState,
@@ -210,16 +210,14 @@ export async function assignScheduleLine(
   }
   if (input.line_status !== undefined) {
     data.line_status = input.line_status;
-    // Keep the fine-grained per-line trip_status in step with the coarse
-    // line_status when the caller flips status without an explicit journey
-    // value (e.g. bulk assign / cancel). Explicit trip advances happen via the
-    // dedicated advance endpoint and are left untouched ({} = no change).
-    const ts = tripStatusForLine(input.line_status);
-    if (ts.trip_status !== undefined) {
-      data.trip_status = ts.trip_status;
-      // Stamp completion time when the line is closed out via status flip.
-      if (input.line_status === 'DONE') data.trip_finished_at = new Date();
-    }
+    // The line IS the trip: derive journey timestamps from the status change.
+    const ts = tripTimestampsForLine(input.line_status, {
+      trip_started_at: line.trip_started_at,
+      trip_finished_at: line.trip_finished_at,
+    });
+    if (ts.trip_started_at !== undefined) data.trip_started_at = ts.trip_started_at;
+    if (ts.trip_finished_at !== undefined)
+      data.trip_finished_at = ts.trip_finished_at;
   }
   if (input.service_date !== undefined)
     data.service_date = input.service_date ? new Date(input.service_date) : null;

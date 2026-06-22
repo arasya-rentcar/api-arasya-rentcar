@@ -1,5 +1,11 @@
 import type { Prisma, OrderStatus, ScheduleStatus } from '@prisma/client';
 
+/** Line states that count as a started-but-not-finished trip. */
+export type LineTimestampEffect = {
+  trip_started_at?: Date | null;
+  trip_finished_at?: Date | null;
+};
+
 /**
  * Batch 2: derive the parent Order status from its day-lines, and keep
  * driver/car resource status in sync as lines move through their lifecycle.
@@ -137,22 +143,33 @@ export async function syncCarStatus(
 }
 
 /**
- * Map a coarse line_status to the matching fine-grained trip_status so the
- * per-line timeline stays consistent when the line is bulk-assigned or its
- * status is flipped without an explicit trip_status. Returns null = leave as-is.
+ * Derive the per-line journey timestamps from a line_status transition.
+ * The line IS the trip, so:
+ *  - IN_PROGRESS stamps trip_started_at (once, if not already set).
+ *  - DONE stamps trip_finished_at.
+ *  - SCHEDULED/back-to-unstarted clears both (a reset).
+ * Returns only the fields that should change ({} = leave timestamps as-is).
  */
-export function tripStatusForLine(
-  line_status: ScheduleStatus,
-): { trip_status?: 'DRIVER_ASSIGNED' | 'COMPLETED' | null } {
-  switch (line_status) {
-    case 'ASSIGNED':
-      return { trip_status: 'DRIVER_ASSIGNED' };
+export function tripTimestampsForLine(
+  next: ScheduleStatus,
+  current: { trip_started_at: Date | null; trip_finished_at: Date | null },
+  now: Date = new Date(),
+): LineTimestampEffect {
+  switch (next) {
+    case 'IN_PROGRESS':
+      return current.trip_started_at == null
+        ? { trip_started_at: now }
+        : {};
     case 'DONE':
-      return { trip_status: 'COMPLETED' };
+      return {
+        // backfill a start time if the line jumped straight to DONE
+        ...(current.trip_started_at == null ? { trip_started_at: now } : {}),
+        trip_finished_at: now,
+      };
     case 'SCHEDULED':
-    case 'CANCELLED':
-      return { trip_status: null };
+      return { trip_started_at: null, trip_finished_at: null };
     default:
+      // ASSIGNED / CANCELLED: leave existing timestamps untouched.
       return {};
   }
 }

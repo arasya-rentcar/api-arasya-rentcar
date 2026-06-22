@@ -390,11 +390,11 @@ model OrderServiceItem {
 
   payable Payable?
 
-  // --- Per-line trip journey (additive, 2026-06-22) ---
-  // Granular driver-journey state, moved off the dead order-level Trip model.
-  // line_status stays the COARSE roll-up source for derived order status;
-  // trip_status is the FINE per-line timeline (DRIVER_ASSIGNED..COMPLETED).
-  trip_status      TripStatus? // null = not yet assigned
+  // --- Per-line trip journey (merged from the old order-level Trip model) ---
+  // The line IS the trip. `line_status` (ScheduleStatus) is the single
+  // per-line state (SCHEDULED/ASSIGNED/IN_PROGRESS/DONE/CANCELLED); these
+  // timestamps record when the driver started / finished this day's service.
+  // No separate trip_status: it would duplicate line_status 1:1.
   trip_started_at  DateTime?
   trip_finished_at DateTime?
 
@@ -416,7 +416,6 @@ model OrderServiceItem {
   @@index([car_id])
   @@index([external_vendor_id])
   @@index([line_status])
-  @@index([trip_status])
   @@map("order_service_items")
 }
 
