@@ -98,6 +98,7 @@ enum OrderSource {
 
 enum ScheduleStatus {
   SCHEDULED
+  ASSIGNED
   IN_PROGRESS
   DONE
   CANCELLED
@@ -389,6 +390,14 @@ model OrderServiceItem {
 
   payable Payable?
 
+  // --- Per-line trip journey (additive, 2026-06-22) ---
+  // Granular driver-journey state, moved off the dead order-level Trip model.
+  // line_status stays the COARSE roll-up source for derived order status;
+  // trip_status is the FINE per-line timeline (DRIVER_ASSIGNED..COMPLETED).
+  trip_status      TripStatus? // null = not yet assigned
+  trip_started_at  DateTime?
+  trip_finished_at DateTime?
+
   // --- #A1/#A2 trip-confirmation messaging (additive, 2026-06-20) ---
   // confirmation_* = message sent to the CUSTOMER ("Data tim bertugas").
   // driver_reminder_* = message sent to the assigned DRIVER ("Reminder Jadwal").
@@ -407,6 +416,7 @@ model OrderServiceItem {
   @@index([car_id])
   @@index([external_vendor_id])
   @@index([line_status])
+  @@index([trip_status])
   @@map("order_service_items")
 }
 
