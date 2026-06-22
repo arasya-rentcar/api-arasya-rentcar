@@ -1260,6 +1260,12 @@ export async function cancelOrder(
       stillOwed,
       cancellationInvoiceNumber,
     } satisfies CancelOrderResult;
+  }, {
+    // Cancel runs many sequential round-trips (status derive + driver/car sync
+    // loops + invoice/order writes) against the Supabase pooler; the default 5s
+    // interactive-tx limit can be exceeded and yield P2028. Give it headroom.
+    maxWait: 15000,
+    timeout: 30000,
   });
 
   return result;
