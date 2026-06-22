@@ -31,6 +31,7 @@ import {
   getPaymentProofController,
   markOrderRefundedController,
   getRefundProofController,
+  cancelOrderController,
 } from "./orders.controller";
 
 const router = Router();
@@ -45,6 +46,7 @@ router.put("/:id", updateOrderController);
 router.put("/:id/finance", upsertOrderFinanceController);
 router.post("/:id/assign", assignOrderController);
 router.post("/:id/reassign", reassignOrderController);
+router.post("/:id/cancel", cancelOrderController);
 router.post("/:id/adjustments", createOrderAdjustmentController);
 router.post("/:id/change-logs", createOrderChangeLogController);
 router.post("/:id/generate-invoice", generateInvoiceController);

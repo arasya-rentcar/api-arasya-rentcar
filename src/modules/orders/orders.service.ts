@@ -10,6 +10,7 @@ import {
 import { upsertCustomerForOrder } from "../customers/customers.service";
 import { computeMargin, MARGIN_FORMULA_VERSION } from "../../utils/margin";
 import { nextOrderCode } from "../../utils/codes";
+import { buildCancellationFeePdf } from "../invoices/invoices.service";
 import {
   deriveAndSetOrderStatus,
   syncDriverStatus,
@@ -971,4 +972,295 @@ export async function getRefundProofUrl(orderId: string) {
     60 * 60,
   );
   return { url, expires_in: 3600 };
+}
+
+// ── Jakarta timezone helpers ──────────────────────────────────────────────
+const JAKARTA_OFFSET_MS = 7 * 60 * 60 * 1000;
+
+function jakartaDate(d: Date | number | string): string {
+  return new Date(
+    new Date(d).getTime() + JAKARTA_OFFSET_MS,
+  )
+    .toISOString()
+    .slice(0, 10);
+}
+
+/**
+ * Compute the cancellation tier + penalty per Arasya policy. Penalty base is
+ * ALWAYS final_price (confirmed with Ten): an order with no invoice yet still
+ * incurs the policy %, and the invoice total should equal final_price anyway.
+ *
+ *  Tier 1 (cancel on any day before H)        → 20% of final_price (DP forfeit)
+ *  Tier 2 (H-day, before 10:00, no driver yet) → 50% of final_price
+ *  Tier 3 (H-day ≥10:00, driver arrived, or after H) → 100% of final_price
+ */
+function computeCancellationPenalty(args: {
+  finalPrice: number;
+  firstServiceDate: Date | null;
+  anyLineStarted: boolean;
+  now: Date;
+}): { tier: 1 | 2 | 3; penalty: number; label: string } {
+  const { finalPrice, firstServiceDate, anyLineStarted, now } = args;
+  const round2 = (n: number) => Math.round(n * 100) / 100;
+  const todayJakarta = jakartaDate(now);
+  const jakartaNow = new Date(now.getTime() + JAKARTA_OFFSET_MS);
+  const jakartaHour = jakartaNow.getUTCHours();
+  const jakartaMin = jakartaNow.getUTCMinutes();
+
+  // No service date at all → treat as early cancel (Tier 1).
+  if (!firstServiceDate) {
+    return {
+      tier: 1,
+      penalty: round2(finalPrice * 0.2),
+      label: "Tier 1 (tanpa tanggal layanan) — DP 20% hangus",
+    };
+  }
+
+  const firstDayJakarta = jakartaDate(firstServiceDate);
+
+  if (todayJakarta < firstDayJakarta) {
+    // Cancel on any calendar day before the service date → forfeit DP (20%).
+    return {
+      tier: 1,
+      penalty: round2(finalPrice * 0.2),
+      label: "Tier 1 (sebelum hari H) — DP 20% hangus",
+    };
+  }
+
+  if (todayJakarta === firstDayJakarta) {
+    const before10 =
+      jakartaHour < 10 || (jakartaHour === 10 && jakartaMin === 0);
+    if (before10 && !anyLineStarted) {
+      return {
+        tier: 2,
+        penalty: round2(finalPrice * 0.5),
+        label: "Tier 2 (hari H sebelum pukul 10.00) — 50% dari total",
+      };
+    }
+    return {
+      tier: 3,
+      penalty: round2(finalPrice),
+      label:
+        "Tier 3 (hari H setelah pukul 10.00 / driver tiba) — 100% dari total",
+    };
+  }
+
+  // Cancel after the first service day has passed → 100%.
+  return {
+    tier: 3,
+    penalty: round2(finalPrice),
+    label: "Tier 3 (setelah hari H) — 100% dari total",
+  };
+}
+
+export interface CancelOrderResult {
+  tier: 1 | 2 | 3;
+  penalty: number;
+  originalFinalPrice: number;
+  paidToDate: number;
+  /** Money owed back to the customer (paid more than the penalty). */
+  refundDue: number;
+  /** Money the customer still owes toward the penalty. */
+  stillOwed: number;
+  cancellationInvoiceNumber: string | null;
+}
+
+/**
+ * Cancel a full order per Arasya cancellation policy.
+ *
+ * Non-breaking design (reviewed against existing money flows):
+ *  - sets order.final_price = penalty, so the EXISTING refund flow
+ *    (computeRefundDue = paid_to_date - final_price) and payment_status
+ *    recompute both work with zero special-casing.
+ *  - voids active invoices (status → CANCELLED) and DECREMENTS total_billed
+ *    by their sum, then issues ONE CANCELLATION_FEE invoice (with a real PDF)
+ *    and INCREMENTS total_billed by the penalty → preserves the G9 invariant
+ *    total_billed = sum(active invoices).
+ *  - cancels all active lines → order status derives to CANCELLED; releases
+ *    drivers/cars.
+ *  - recomputes payment_status against the new (penalty) total.
+ *  - does NOT move money or auto-mark refunded: refunds stay manual (bank
+ *    transfer) via the existing refund flow. Returns a summary so the UI can
+ *    show the admin what to collect/refund.
+ */
+export async function cancelOrder(
+  orderId: string,
+  reason: string,
+  actor?: string,
+): Promise<CancelOrderResult> {
+  const order = await prisma.order.findUnique({
+    where: { id: orderId },
+    include: {
+      customer: true,
+      service_items: { orderBy: { service_date: { sort: "asc", nulls: "last" } } },
+    },
+  });
+  if (!order) throw new AppError("Order not found", 404);
+  if (order.order_status === "DONE" || order.order_status === "CANCELLED") {
+    throw new AppError(
+      `Cannot cancel an order with status ${order.order_status}`,
+      409,
+    );
+  }
+
+  const now = new Date();
+  const originalFinalPrice = Number(order.final_price);
+
+  // ── Tier + penalty (base = final_price) ─────────────────────────────────
+  const activeLines = order.service_items.filter(
+    (l) => l.line_status !== "CANCELLED",
+  );
+  const firstServiceDate =
+    activeLines
+      .map((l) => l.service_date)
+      .filter((d): d is Date => !!d)
+      .sort((a, b) => a.getTime() - b.getTime())[0] ??
+    order.service_start_at ??
+    null;
+  const anyLineStarted = activeLines.some((l) => l.trip_started_at != null);
+  const { tier, penalty, label } = computeCancellationPenalty({
+    finalPrice: originalFinalPrice,
+    firstServiceDate,
+    anyLineStarted,
+    now,
+  });
+
+  // ── Render the cancellation-fee PDF + reserve its number OUTSIDE the main
+  //    tx (slow network work; mirrors generateInvoice). Skip if no customer
+  //    is linked (cannot issue a numbered invoice without a customer code).
+  let prepared:
+    | { invoiceNumber: string; invoiceSeq: number; fileUrl: string }
+    | null = null;
+  if (order.customer) {
+    const built = await buildCancellationFeePdf({
+      customer: { id: order.customer.id, code: order.customer.code },
+      order: {
+        order_code: order.order_code,
+        customer_name: order.customer_name,
+        customer_phone: order.customer_phone ?? null,
+        pickup_location: order.pickup_location,
+        dropoff_location: order.dropoff_location,
+      },
+      penalty,
+      tierLabel: label,
+      reason,
+      issueDate: now,
+    });
+    prepared = built;
+  }
+
+  // ── Mutations in one transaction ────────────────────────────────────────
+  const result = await prisma.$transaction(async (tx) => {
+    // 1) Void active invoices and decrement the customer's billed total.
+    const activeInvoices = await tx.invoice.findMany({
+      where: {
+        order_id: orderId,
+        status: { notIn: ["REVISED", "CANCELLED"] },
+      },
+      select: { id: true, amount: true },
+    });
+    const voidedSum = activeInvoices.reduce(
+      (s, inv) => s + Number(inv.amount),
+      0,
+    );
+    if (activeInvoices.length > 0) {
+      await tx.invoice.updateMany({
+        where: { id: { in: activeInvoices.map((i) => i.id) } },
+        data: { status: "CANCELLED" },
+      });
+    }
+
+    // 2) Cancel all active lines; collect drivers/cars to release.
+    const driverIds = new Set<string>();
+    const carIds = new Set<string>();
+    const cancellableIds: string[] = [];
+    for (const l of order.service_items) {
+      if (l.line_status === "DONE" || l.line_status === "CANCELLED") continue;
+      cancellableIds.push(l.id);
+      if (l.driver_id) driverIds.add(l.driver_id);
+      if (l.car_id) carIds.add(l.car_id);
+    }
+    if (cancellableIds.length > 0) {
+      await tx.orderServiceItem.updateMany({
+        where: { id: { in: cancellableIds } },
+        data: { line_status: "CANCELLED", driver_id: null, car_id: null },
+      });
+    }
+
+    // 3) Derive order status (all-cancelled → CANCELLED) + release resources.
+    await deriveAndSetOrderStatus(tx, orderId);
+    for (const dId of driverIds) await syncDriverStatus(tx, dId);
+    for (const cId of carIds) await syncCarStatus(tx, cId);
+
+    // 4) Issue the CANCELLATION_FEE invoice (penalty) with its PDF.
+    let cancellationInvoiceNumber: string | null = null;
+    if (prepared && order.customer) {
+      await tx.invoice.create({
+        data: {
+          order_id: orderId,
+          invoice_number: prepared.invoiceNumber,
+          customer_seq: prepared.invoiceSeq,
+          invoice_type: "CANCELLATION_FEE",
+          payment_method: "BANK_TRANSFER",
+          issue_date: now,
+          amount: penalty,
+          note: `${reason}\n${label}`,
+          file_url: prepared.fileUrl,
+          status: "ISSUED",
+        },
+      });
+      cancellationInvoiceNumber = prepared.invoiceNumber;
+    }
+
+    // 5) Keep total_billed = sum(active invoices): remove voided, add penalty.
+    if (order.customer) {
+      const billedDelta = penalty - voidedSum;
+      if (billedDelta !== 0) {
+        await tx.customer.update({
+          where: { id: order.customer.id },
+          data: { total_billed: { increment: billedDelta } },
+        });
+      }
+    }
+
+    // 6) The order is now worth the penalty. Set final_price = penalty so the
+    //    existing refund/payment flows compute correctly, and recompute
+    //    payment_status against the new total (money received is unchanged).
+    const paidToDate = Number(order.paid_to_date ?? 0);
+    let paymentStatus: "UNPAID" | "DP_PAID" | "PAID";
+    if (penalty > 0 && paidToDate >= penalty) paymentStatus = "PAID";
+    else if (paidToDate > 0) paymentStatus = "DP_PAID";
+    else paymentStatus = "UNPAID";
+
+    await tx.order.update({
+      where: { id: orderId },
+      data: { final_price: penalty, payment_status: paymentStatus },
+    });
+
+    // 7) Audit log (preserve the original price).
+    await tx.orderChangeLog.create({
+      data: {
+        order_id: orderId,
+        field: "order_status",
+        old_value: `${order.order_status} (final_price ${originalFinalPrice})`,
+        new_value: `CANCELLED (cancellation fee ${penalty} — ${label})`,
+        note: reason,
+        actor: actor ?? "ADMIN",
+      },
+    });
+
+    const refundDue = paidToDate > penalty ? paidToDate - penalty : 0;
+    const stillOwed = penalty > paidToDate ? penalty - paidToDate : 0;
+    return {
+      tier,
+      penalty,
+      originalFinalPrice,
+      paidToDate,
+      refundDue,
+      stillOwed,
+      cancellationInvoiceNumber,
+    } satisfies CancelOrderResult;
+  });
+
+  return result;
 }

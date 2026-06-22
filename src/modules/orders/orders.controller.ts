@@ -7,6 +7,7 @@ import {
   createChangeLogSchema,
   upsertOrderFinanceSchema,
   markOrderRefundedSchema,
+  cancelOrderSchema,
 } from "./orders.validation";
 import {
   createOrder,
@@ -21,6 +22,7 @@ import {
   upsertOrderFinance,
   markOrderRefunded,
   getRefundProofUrl,
+  cancelOrder,
 } from "./orders.service";
 import {
   generateInvoiceController,
@@ -68,6 +70,21 @@ export async function markOrderRefundedController(
         : undefined,
     });
     res.json({ status: "success", data: order });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// Full-order cancellation (applies Arasya cancellation-fee policy server-side).
+export async function cancelOrderController(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const input = cancelOrderSchema.parse(req.body ?? {});
+    const result = await cancelOrder(req.params.id, input.reason, input.actor);
+    res.json({ status: "success", data: result });
   } catch (err) {
     next(err);
   }

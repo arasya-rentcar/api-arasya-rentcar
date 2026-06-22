@@ -65,6 +65,7 @@ enum InvoiceType {
   FULL
   ADDITIONAL
   COMBINED
+  CANCELLATION_FEE
 }
 
 enum PaymentMethod {

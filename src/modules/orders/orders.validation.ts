@@ -157,6 +157,14 @@ export const markOrderRefundedSchema = z.object({
   amount: z.coerce.number().positive().optional(),
 });
 
+// Full-order cancellation. A reason is required (kept in the audit log + on the
+// cancellation-fee invoice). The penalty tier is computed server-side from the
+// service date + current time; the client never sends an amount.
+export const cancelOrderSchema = z.object({
+  reason: z.string().trim().min(1, "Cancellation reason is required"),
+  actor: z.string().optional(),
+});
+
 export type UpsertOrderFinanceInput = z.infer<typeof upsertOrderFinanceSchema>;
 export type CreateOrderInput = z.infer<typeof createOrderSchema>;
 export type UpdateOrderInput = z.infer<typeof updateOrderSchema>;
@@ -164,3 +172,4 @@ export type AssignOrderInput = z.infer<typeof assignOrderSchema>;
 export type CreateAdjustmentInput = z.infer<typeof createAdjustmentSchema>;
 export type CreateChangeLogInput = z.infer<typeof createChangeLogSchema>;
 export type MarkOrderRefundedInput = z.infer<typeof markOrderRefundedSchema>;
+export type CancelOrderInput = z.infer<typeof cancelOrderSchema>;

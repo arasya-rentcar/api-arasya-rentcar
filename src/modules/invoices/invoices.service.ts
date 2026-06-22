@@ -75,6 +75,72 @@ function buildNoteLines(order: {
   return lines;
 }
 
+/**
+ * Prepare a CANCELLATION_FEE invoice for a cancelled order: reserve the invoice
+ * number (atomic, short tx) and render the PDF. Returns everything the caller
+ * needs to create the invoice row inside its own transaction. Network/PDF work
+ * is done HERE (outside the caller's main tx) so the DB transaction stays short
+ * — mirrors the generateInvoice pattern. Does NOT mutate any state itself.
+ */
+export async function buildCancellationFeePdf(args: {
+  customer: { id: string; code: string };
+  order: {
+    order_code: string | null;
+    customer_name: string;
+    customer_phone: string | null;
+    pickup_location: string;
+    dropoff_location: string;
+  };
+  penalty: number;
+  tierLabel: string;
+  reason: string;
+  issueDate?: Date;
+}): Promise<{
+  invoiceNumber: string;
+  invoiceSeq: number;
+  fileUrl: string;
+  issueDate: Date;
+}> {
+  const issueDate = args.issueDate ?? new Date();
+  const { seq: invoiceSeq, number: invoiceNumber } = await prisma.$transaction(
+    (tx) => nextInvoiceNumber(tx, args.customer, issueDate),
+  );
+
+  const lineItem = {
+    description: `Biaya Pembatalan — ${args.tierLabel}`,
+    quantity: 1,
+    unitPrice: args.penalty,
+    totalPrice: args.penalty,
+  };
+
+  const pdfBuffer = await generateInvoicePDF({
+    invoiceNumber,
+    displayNumber: args.order.order_code ?? null,
+    issueDate,
+    customerName: args.order.customer_name,
+    customerPhone: args.order.customer_phone ?? null,
+    pickupLocation: args.order.pickup_location,
+    dropoffLocation: args.order.dropoff_location,
+    finalPrice: args.penalty,
+    // Reuse the single-amount totals layout ("Total Tambahan / TOTAL").
+    invoiceType: "Cancellation Fee",
+    invoiceKind: "ADDITIONAL",
+    paymentMethod: "Bank Transfer",
+    amountPaid: args.penalty,
+    previouslyPaid: 0,
+    documentMode: "INVOICE",
+    noteLines: [
+      `Pembatalan pesanan: ${args.reason}`,
+      args.tierLabel,
+    ],
+    items: [lineItem],
+  });
+
+  const fileName = `${invoiceNumber}.pdf`;
+  const fileUrl = await uploadInvoicePDF(pdfBuffer, fileName);
+  return { invoiceNumber, invoiceSeq, fileUrl, issueDate };
+}
+
 export async function generateInvoice(
   orderId: string,
   input: GenerateInvoiceInput,
