@@ -563,6 +563,9 @@ export async function getOrderById(id: string) {
         orderBy: { created_at: "desc" as const },
         include: {
           delivery_logs: { orderBy: { created_at: "desc" as const } },
+          // Kwitansi rows tied to this invoice (one per payment event), so the
+          // dashboard can show which receipt belongs to which invoice.
+          receipts: { orderBy: { created_at: "desc" as const } },
         },
       },
       final_finance: true,
