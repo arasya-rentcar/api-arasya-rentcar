@@ -390,6 +390,11 @@ model OrderServiceItem {
 
   payable Payable?
 
+  // Merge: a service-day line owns its expenses + matched driver reports
+  // (the line IS the trip). FKs moved off the dying order-level Trip model.
+  expenses Expense[]
+  reports  TripReport[]
+
   // --- Per-line trip journey (merged from the old order-level Trip model) ---
   // The line IS the trip. `line_status` (ScheduleStatus) is the single
   // per-line state (SCHEDULED/ASSIGNED/IN_PROGRESS/DONE/CANCELLED); these
@@ -635,13 +640,18 @@ model OrderChangeLog {
 
 model Expense {
   id         String      @id @default(uuid())
-  trip_id    String
-  trip       Trip        @relation(fields: [trip_id], references: [id])
+  // Merge: expenses now belong to a service-day line (the line IS the trip).
+  // order_service_item_id is the new home; trip_id is legacy (dropped batch 4).
+  order_service_item_id String?
+  order_service_item    OrderServiceItem? @relation(fields: [order_service_item_id], references: [id], onDelete: Cascade)
+  trip_id    String?
+  trip       Trip?       @relation(fields: [trip_id], references: [id])
   type       ExpenseType
   amount     Decimal     @db.Decimal(12, 2)
   note       String?
   created_at DateTime    @default(now())
 
+  @@index([order_service_item_id])
   @@map("expenses")
 }
 
@@ -649,6 +659,9 @@ model TripReport {
   id             String          @id @default(uuid())
   order_id       String?
   order          Order?          @relation(fields: [order_id], references: [id], onDelete: SetNull)
+  // Merge: reports attach to a specific service-day line when matched.
+  order_service_item_id String?
+  order_service_item    OrderServiceItem? @relation(fields: [order_service_item_id], references: [id], onDelete: SetNull)
   trip_id        String?
   trip           Trip?           @relation(fields: [trip_id], references: [id], onDelete: SetNull)
   order_code     String?
@@ -667,6 +680,7 @@ model TripReport {
   created_at     DateTime        @default(now())
 
   @@index([order_id])
+  @@index([order_service_item_id])
   @@index([trip_id])
   @@index([order_code])
   @@index([driver_phone])

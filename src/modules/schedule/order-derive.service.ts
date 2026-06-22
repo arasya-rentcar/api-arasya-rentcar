@@ -7,6 +7,41 @@ export type LineTimestampEffect = {
 };
 
 /**
+ * Option A active-line resolution (locked with TEN 2026-06-22).
+ * Given an order and a driver, find the ONE day-line the driver's next
+ * WhatsApp action (START / FINISH / report / expense) should apply to.
+ *
+ * Rule: the earliest non-terminal (not DONE/CANCELLED) internal line of that
+ * order assigned to this driver. Prefer an already-IN_PROGRESS line (the day
+ * they're actively running) over a not-yet-started ASSIGNED one; within a tier
+ * order by service_date then sort_order. Returns null if none.
+ *
+ * For single-day orders this is just "the line". For multi-day it correctly
+ * walks day-by-day: finish today's line -> tomorrow's becomes the active one.
+ */
+export async function resolveActiveLine(
+  tx: Prisma.TransactionClient,
+  orderId: string,
+  driverId: string,
+): Promise<{ id: string; line_status: ScheduleStatus } | null> {
+  const candidates = await tx.orderServiceItem.findMany({
+    where: {
+      order_id: orderId,
+      driver_id: driverId,
+      is_external: false,
+      line_status: { notIn: ['DONE', 'CANCELLED'] },
+    },
+    select: { id: true, line_status: true, service_date: true, sort_order: true },
+    orderBy: [{ service_date: 'asc' }, { sort_order: 'asc' }],
+  });
+  if (candidates.length === 0) return null;
+  // Prefer a line already in progress (the day actively being run).
+  const inProgress = candidates.find((c) => c.line_status === 'IN_PROGRESS');
+  const chosen = inProgress ?? candidates[0];
+  return { id: chosen.id, line_status: chosen.line_status };
+}
+
+/**
  * Batch 2: derive the parent Order status from its day-lines, and keep
  * driver/car resource status in sync as lines move through their lifecycle.
  *
