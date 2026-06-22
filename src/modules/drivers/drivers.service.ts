@@ -185,18 +185,22 @@ export async function getMyActiveTrip(userId: string) {
   const driver = await prisma.driver.findUnique({ where: { user_id: userId } });
   if (!driver) throw new AppError('Driver profile not found', 404);
 
-  const trip = await prisma.trip.findFirst({
+  // Merge: the line IS the trip. A driver's active "trip" is their earliest
+  // non-terminal service-day line, with its order/car/expenses/reports.
+  const line = await prisma.orderServiceItem.findFirst({
     where: {
       driver_id: driver.id,
-      current_status: { not: 'COMPLETED' },
+      is_external: false,
+      line_status: { notIn: ['DONE', 'CANCELLED'] },
     },
+    orderBy: [{ service_date: 'asc' }, { sort_order: 'asc' }],
     include: {
       order: true,
       car: true,
-      logs: { orderBy: { created_at: 'desc' }, take: 10 },
       expenses: { orderBy: { created_at: 'desc' } },
+      reports: { orderBy: { created_at: 'desc' }, take: 10 },
     },
   });
 
-  return trip;
+  return line;
 }

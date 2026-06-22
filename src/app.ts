@@ -12,7 +12,7 @@ import usersRoutes from './modules/users/users.route';
 import driversRoutes from './modules/drivers/drivers.route';
 import carsRoutes from './modules/cars/cars.route';
 import ordersRoutes from './modules/orders/orders.route';
-import tripsRoutes from './modules/trips/trips.route';
+import expensesRoutes from './modules/expenses/expenses.route';
 import botRoutes from './modules/bot/bot.route';
 import finalOrdersRoutes from './modules/final-orders/final-orders.route';
 import sheetImportsRoutes from './modules/sheet-imports/sheet-imports.route';
@@ -95,7 +95,8 @@ app.use('/api/v1/external-vendors', externalVendorsRoutes);
 app.use('/api/v1/schedule', scheduleRoutes);
 app.use('/api/v1/payables', payablesRoutes);
 app.use('/api/v1/analytics', analyticsRoutes);
-app.use('/api/v1/trips', tripsRoutes);
+// Merge: expenses now hang off service-day lines (the line IS the trip).
+app.use('/api/v1/lines', expensesRoutes);
 app.use('/api/v1/bot', botLimiter, botRoutes);
 
 app.use(errorMiddleware);

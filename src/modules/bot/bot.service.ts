@@ -1,6 +1,12 @@
-import { DriverType, Prisma, TripStatus } from "@prisma/client";
+import { DriverType, Prisma } from "@prisma/client";
 import prisma from "../../prisma/client";
 import { AppError } from "../../utils/AppError";
+import {
+  deriveAndSetOrderStatus,
+  syncDriverStatus,
+  syncCarStatus,
+  resolveActiveLine,
+} from "../schedule/order-derive.service";
 import {
   BotAssignInput,
   BotCreateOrderInput,
@@ -37,14 +43,17 @@ function reportTypeIsPhoto(type = ""): boolean {
 }
 
 function orderInclude() {
+  // Merge: the line IS the trip. Order detail now exposes its service-day lines
+  // (each with its own driver/car/status) instead of a single order-level trip.
   return {
     customers: true,
-    service_items: { orderBy: { sort_order: "asc" as const } },
-    trip: {
+    service_items: {
+      orderBy: { sort_order: "asc" as const },
       include: {
         driver: true,
         car: true,
-        logs: { orderBy: { created_at: "asc" as const } },
+        external_vendor: true,
+        external_car: true,
         reports: { orderBy: { created_at: "desc" as const } },
       },
     },
@@ -52,6 +61,36 @@ function orderInclude() {
     summary: true,
     invoices: { orderBy: { created_at: "desc" as const } },
   };
+}
+
+/**
+ * Option A: resolve the single service-day line a driver's WhatsApp action
+ * (start/finish/report) should hit. Prefers the driver's active line; falls
+ * back to the order's earliest non-terminal internal line (covers single-day
+ * orders where no driver phone was supplied).
+ */
+async function resolveLineForAction(
+  tx: Prisma.TransactionClient,
+  orderId: string,
+  driverPhone?: string,
+): Promise<{ id: string; line_status: string } | null> {
+  if (driverPhone) {
+    const driver = await findDriverByPhone(driverPhone);
+    if (driver) {
+      const line = await resolveActiveLine(tx, orderId, driver.id);
+      if (line) return line;
+    }
+  }
+  const line = await tx.orderServiceItem.findFirst({
+    where: {
+      order_id: orderId,
+      is_external: false,
+      line_status: { notIn: ["DONE", "CANCELLED"] },
+    },
+    orderBy: [{ service_date: "asc" }, { sort_order: "asc" }],
+    select: { id: true, line_status: true },
+  });
+  return line;
 }
 
 export async function findDriverByPhone(phone = "") {
@@ -355,38 +394,40 @@ export async function assignBotOrder(
   input: BotAssignInput,
 ) {
   const order = await resolveOrder(orderIdOrCode);
-  if (order.trip) return order.trip;
-
   const driver = await findOrCreateDriver(input);
   const car = await findOrCreateCar(input);
 
-  const activeTrip = await prisma.trip.findFirst({
-    where: { driver_id: driver.id, current_status: { not: "COMPLETED" } },
-  });
-  if (activeTrip) throw new AppError("Driver already has an active trip", 409);
-
+  // Merge: assign at the LINE level. Every internal day-line of this order that
+  // has no driver yet inherits this driver+car and flips to ASSIGNED. Order
+  // status + driver/car status are then derived from the lines. For multi-day
+  // orders with per-day drivers, the Schedule page overrides individual days.
   return prisma.$transaction(async (tx) => {
-    const trip = await tx.trip.create({
+    await tx.orderServiceItem.updateMany({
+      where: { order_id: order.id, is_external: false, driver_id: null },
       data: {
-        order_id: order.id,
         driver_id: driver.id,
         car_id: car.id,
-        current_status: "DRIVER_ASSIGNED",
+        line_status: "ASSIGNED",
       },
     });
-    await tx.tripLog.create({
-      data: { trip_id: trip.id, status: "DRIVER_ASSIGNED", actor: "ADMIN" },
+    // If no unassigned internal line existed (e.g. order had no service items),
+    // fall back to stamping the order directly so the bot flow still advances.
+    const lineCount = await tx.orderServiceItem.count({
+      where: { order_id: order.id, driver_id: driver.id, is_external: false },
     });
-    await tx.driver.update({
-      where: { id: driver.id },
-      data: { status: "ON_DUTY" },
-    });
-    await tx.car.update({ where: { id: car.id }, data: { status: "IN_USE" } });
-    await tx.order.update({
+    await deriveAndSetOrderStatus(tx, order.id);
+    if (lineCount === 0) {
+      await tx.order.update({
+        where: { id: order.id },
+        data: { order_status: "ASSIGNED" },
+      });
+    }
+    await syncDriverStatus(tx, driver.id);
+    await syncCarStatus(tx, car.id);
+    return tx.order.findUnique({
       where: { id: order.id },
-      data: { order_status: "ASSIGNED" },
+      include: orderInclude(),
     });
-    return trip;
   });
 }
 
@@ -411,37 +452,60 @@ export async function getOrderByCode(orderCode: string) {
 export async function getActiveOrderByDriverPhone(phone: string) {
   const driver = await findDriverByPhone(phone);
   if (!driver) return null;
+  // Merge: a driver's active order is one that has a non-terminal internal line
+  // assigned to them (the line IS the trip).
   return prisma.order.findFirst({
     where: {
       order_status: { in: ["ASSIGNED", "IN_PROGRESS"] },
-      trip: { driver_id: driver.id, current_status: { not: "COMPLETED" } },
+      service_items: {
+        some: {
+          driver_id: driver.id,
+          is_external: false,
+          line_status: { notIn: ["DONE", "CANCELLED"] },
+        },
+      },
     },
     orderBy: { created_at: "desc" },
     include: orderInclude(),
   });
 }
 
-async function transitionTrip(
+/**
+ * Merge: advance the driver's ACTIVE service-day line (Option A) to a coarse
+ * state, stamping journey timestamps and re-deriving order + resource status.
+ * Replaces the old order-level trip transition.
+ */
+async function transitionActiveLine(
   orderId: string,
-  status: TripStatus,
-  actor: "ADMIN" | "DRIVER" = "DRIVER",
+  next: "IN_PROGRESS" | "DONE",
+  driverPhone?: string,
 ) {
-  const order = await prisma.order.findUnique({
-    where: { id: orderId },
-    include: { trip: true },
-  });
-  if (!order?.trip) return null;
-  const now = new Date();
-  return prisma.trip.update({
-    where: { id: order.trip.id },
-    data: {
-      current_status: status,
-      started_at: ["DEPART_GARAGE", "ON_TRIP"].includes(status)
-        ? now
-        : undefined,
-      finished_at: status === "COMPLETED" ? now : undefined,
-      logs: { create: { status, actor } },
-    },
+  return prisma.$transaction(async (tx) => {
+    const line = await resolveLineForAction(tx, orderId, driverPhone);
+    if (!line) return null;
+    const now = new Date();
+    const cur = await tx.orderServiceItem.findUnique({
+      where: { id: line.id },
+      select: { trip_started_at: true, driver_id: true, car_id: true },
+    });
+    const data: Prisma.OrderServiceItemUncheckedUpdateInput = {
+      line_status: next,
+    };
+    if (next === "IN_PROGRESS" && cur?.trip_started_at == null)
+      data.trip_started_at = now;
+    if (next === "DONE") {
+      if (cur?.trip_started_at == null) data.trip_started_at = now;
+      data.trip_finished_at = now;
+    }
+    const updated = await tx.orderServiceItem.update({
+      where: { id: line.id },
+      data,
+      select: { driver_id: true, car_id: true },
+    });
+    await deriveAndSetOrderStatus(tx, orderId);
+    if (updated.driver_id) await syncDriverStatus(tx, updated.driver_id);
+    if (updated.car_id) await syncCarStatus(tx, updated.car_id);
+    return updated;
   });
 }
 
@@ -456,10 +520,11 @@ export async function startBotOrder(
         report_type: report.report_type || "START",
       })
     : null;
-  await transitionTrip(order.id, "ON_TRIP");
-  const updated = await prisma.order.update({
+  // Merge: start the driver's active day-line; order status derives to
+  // IN_PROGRESS from it. Use the report's driver phone for Option A resolution.
+  await transitionActiveLine(order.id, "IN_PROGRESS", report?.driver_phone);
+  const updated = await prisma.order.findUnique({
     where: { id: order.id },
-    data: { order_status: "IN_PROGRESS" },
     include: orderInclude(),
   });
   return { order: updated, report: createdReport };
@@ -478,7 +543,11 @@ export async function finishBotOrder(
     match_method: "finish endpoint",
     status: "MATCHED",
   });
-  await transitionTrip(order.id, "COMPLETED");
+  // Merge: finish the driver's active day-line. For multi-day orders this
+  // completes only TODAY's line; the order stays IN_PROGRESS until all lines
+  // are done (deriveAndSetOrderStatus handles that). Resource release happens
+  // when the driver's last active line closes.
+  await transitionActiveLine(order.id, "DONE", input.driver_phone);
 
   const reports = await prisma.tripReport.findMany({
     where: { order_id: order.id },
@@ -521,15 +590,21 @@ export async function finishBotOrder(
         generated_summary: input.generated_summary,
       },
     });
-    return tx.order.update({
+    // Merge: do NOT force order_status=DONE here. transitionActiveLine already
+    // finished today's line and derived the order status (a multi-day order
+    // stays IN_PROGRESS until ALL lines are done). Only update review flags.
+    await tx.order.update({
       where: { id: order.id },
       data: {
-        order_status: "DONE",
         needs_review: missingItems.length > 0,
         review_reason: missingItems.length
           ? `Missing: ${missingItems.join(", ")}`
           : null,
       },
+    });
+    await deriveAndSetOrderStatus(tx, order.id);
+    return tx.order.findUnique({
+      where: { id: order.id },
       include: orderInclude(),
     });
   });
@@ -555,13 +630,23 @@ export async function createBotReport(
   const driver = input.driver_phone
     ? await findDriverByPhone(input.driver_phone)
     : null;
-  const trip = order?.trip || null;
+  // Merge: attach the report to the driver's active service-day line (Option A)
+  // instead of an order-level trip. Best-effort; unmatched reports keep null.
+  let lineId: string | null = null;
+  if (order) {
+    const line = await resolveLineForAction(
+      prisma,
+      order.id,
+      input.driver_phone,
+    );
+    lineId = line?.id ?? null;
+  }
   const status = order ? input.status : "UNMATCHED";
 
   return prisma.tripReport.create({
     data: {
       order_id: order?.id,
-      trip_id: trip?.id,
+      order_service_item_id: lineId,
       order_code: order?.order_code || input.order_code,
       driver_id: driver?.id,
       driver_phone: input.driver_phone

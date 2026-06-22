@@ -11,6 +11,11 @@ import { upsertCustomerForOrder } from "../customers/customers.service";
 import { computeMargin, MARGIN_FORMULA_VERSION } from "../../utils/margin";
 import { nextOrderCode } from "../../utils/codes";
 import {
+  deriveAndSetOrderStatus,
+  syncDriverStatus,
+  syncCarStatus,
+} from "../schedule/order-derive.service";
+import {
   uploadFile,
   assertValidUpload,
   getSignedUrl,
@@ -216,14 +221,6 @@ export async function listOrders() {
       sheet_import_rows: {
         select: { id: true, sheet_id: true, gid: true, row_number: true },
       },
-      trip: {
-        select: {
-          id: true,
-          current_status: true,
-          driver: { select: { name: true } },
-          car: { select: { plate_number: true, model: true } },
-        },
-      },
       invoices: {
         select: {
           id: true,
@@ -240,7 +237,17 @@ export async function listOrders() {
         orderBy: { created_at: "desc" as const },
       },
       customers: { orderBy: { created_at: "asc" as const } },
-      service_items: { orderBy: { sort_order: "asc" as const } },
+      // Merge: driver/car summary comes from the service-day lines.
+      service_items: {
+        orderBy: { sort_order: "asc" as const },
+        select: {
+          id: true,
+          line_status: true,
+          service_date: true,
+          driver: { select: { id: true, name: true } },
+          car: { select: { id: true, plate_number: true, model: true } },
+        },
+      },
       adjustments: { orderBy: { created_at: "desc" as const }, take: 5 },
     },
   });
@@ -282,9 +289,23 @@ export async function searchOrders(params: SearchOrdersParams) {
         { dropoff_location: { contains: q, mode: "insensitive" } },
         { customers: { some: { name: { contains: q, mode: "insensitive" } } } },
         { customers: { some: { phone: { contains: q, mode: "insensitive" } } } },
-        { trip: { driver: { name: { contains: q, mode: "insensitive" } } } },
-        { trip: { car: { plate_number: { contains: q, mode: "insensitive" } } } },
-        { trip: { car: { model: { contains: q, mode: "insensitive" } } } },
+        {
+          service_items: {
+            some: { driver: { name: { contains: q, mode: "insensitive" } } },
+          },
+        },
+        {
+          service_items: {
+            some: {
+              car: { plate_number: { contains: q, mode: "insensitive" } },
+            },
+          },
+        },
+        {
+          service_items: {
+            some: { car: { model: { contains: q, mode: "insensitive" } } },
+          },
+        },
         {
           final_finance: {
             invoice_no_raw: { contains: q, mode: "insensitive" },
@@ -356,12 +377,15 @@ export async function searchOrders(params: SearchOrdersParams) {
         sheet_import_rows: {
           select: { id: true, sheet_id: true, gid: true, row_number: true },
         },
-        trip: {
+        // Merge: driver/car summary now comes from the service-day lines.
+        service_items: {
+          orderBy: { sort_order: "asc" as const },
           select: {
             id: true,
-            current_status: true,
-            driver: { select: { name: true } },
-            car: { select: { plate_number: true, model: true } },
+            line_status: true,
+            service_date: true,
+            driver: { select: { id: true, name: true } },
+            car: { select: { id: true, plate_number: true, model: true } },
           },
         },
         invoices: {
@@ -535,14 +559,6 @@ export async function getOrderById(id: string) {
   const order = await prisma.order.findUnique({
     where: { id },
     include: {
-      trip: {
-        include: {
-          driver: true,
-          car: true,
-          logs: { orderBy: { created_at: "asc" } },
-          expenses: { orderBy: { created_at: "desc" } },
-        },
-      },
       invoices: {
         orderBy: { created_at: "desc" as const },
         include: {
@@ -558,6 +574,7 @@ export async function getOrderById(id: string) {
         select: { id: true, name: true, phone: true, total_orders: true },
       },
       customers: { orderBy: { created_at: "asc" as const } },
+      // Merge: the line IS the trip - include driver/car/expenses/reports here.
       service_items: {
         orderBy: { sort_order: "asc" as const },
         include: {
@@ -574,6 +591,8 @@ export async function getOrderById(id: string) {
           external_car: {
             select: { id: true, model: true, plate_number: true },
           },
+          expenses: { orderBy: { created_at: "desc" as const } },
+          reports: { orderBy: { created_at: "desc" as const } },
         },
       },
       adjustments: { orderBy: { created_at: "desc" as const } },
@@ -716,79 +735,25 @@ export async function assignOrder(orderId: string, input: AssignOrderInput) {
     throw new AppError("Car is not available", 409);
   }
 
-  // Ensure driver has no active trip
-  const driverActiveTrip = await prisma.trip.findFirst({
-    where: {
-      driver_id: input.driver_id,
-      current_status: { not: "COMPLETED" },
-    },
-  });
-  if (driverActiveTrip)
-    throw new AppError("Driver already has an active trip", 409);
-
-  // Ensure car has no active trip
-  const carActiveTrip = await prisma.trip.findFirst({
-    where: {
-      car_id: input.car_id,
-      current_status: { not: "COMPLETED" },
-    },
-  });
-  if (carActiveTrip)
-    throw new AppError("Car is already in use by another trip", 409);
-
-  // Ensure order has no existing trip
-  const existingTrip = await prisma.trip.findUnique({
-    where: { order_id: orderId },
-  });
-  if (existingTrip)
-    throw new AppError("Order already has a trip assigned", 409);
-
-  // Execute in a transaction
-  const trip = await prisma.$transaction(async (tx) => {
-    const newTrip = await tx.trip.create({
-      data: {
-        order_id: orderId,
-        driver_id: input.driver_id,
-        car_id: input.car_id,
-        current_status: "DRIVER_ASSIGNED",
-      },
-    });
-
-    await tx.tripLog.create({
-      data: {
-        trip_id: newTrip.id,
-        status: "DRIVER_ASSIGNED",
-        actor: "ADMIN",
-      },
-    });
-
-    await tx.driver.update({
-      where: { id: input.driver_id },
-      data: { status: "ON_DUTY" },
-    });
-
-    await tx.car.update({
-      where: { id: input.car_id },
-      data: { status: "IN_USE" },
-    });
-
-    await tx.order.update({
-      where: { id: orderId },
-      data: { order_status: "ASSIGNED" },
-    });
-
-    // Reflect the assignment on the schedule: any internal day-line of this
-    // order that has no driver yet inherits this driver+car. (Multi-day orders
-    // with per-day drivers are managed on the Schedule page instead.)
+  // Merge: assign at the LINE level (the line IS the trip). Every internal
+  // day-line that has no driver yet inherits this driver+car and flips to
+  // ASSIGNED; order + driver/car status are then derived from the lines.
+  const updated = await prisma.$transaction(async (tx) => {
     await tx.orderServiceItem.updateMany({
       where: { order_id: orderId, is_external: false, driver_id: null },
-      data: { driver_id: input.driver_id, car_id: input.car_id },
+      data: {
+        driver_id: input.driver_id,
+        car_id: input.car_id,
+        line_status: "ASSIGNED",
+      },
     });
-
-    return newTrip;
+    await deriveAndSetOrderStatus(tx, orderId);
+    await syncDriverStatus(tx, input.driver_id);
+    await syncCarStatus(tx, input.car_id);
+    return tx.order.findUnique({ where: { id: orderId } });
   });
 
-  return trip;
+  return updated;
 }
 
 export async function createOrderAdjustment(
