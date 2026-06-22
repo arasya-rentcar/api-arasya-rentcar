@@ -518,6 +518,9 @@ export async function upsertOrderFinance(
     isExternal: order.is_external,
     total_user_amount: totalUser,
     total_ops_cost: opsCost,
+    // The admin-entered driver fee (one per order) is total_driver_amount.
+    // Internal margin now subtracts it; external ignores it (RTR covers vendor).
+    driver_fee_amount: driverTotal,
     sell_price: sellPrice,
     rtr_amount: rtr,
   });

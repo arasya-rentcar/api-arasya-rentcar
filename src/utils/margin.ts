@@ -1,19 +1,25 @@
 /**
  * Margin computation for Arasya orders.
  *
- * Rules (confirmed by TEN 2026-06-17):
- *  - INTERNAL (own driver + car): margin = TOTAL USER  −  TOTAL OPS COST
- *  - EXTERNAL (vendor-supplied):  margin = (TOTAL USER | HARGA JUAL)  −  RTR
+ * Rules:
+ *  - INTERNAL (own driver + car): margin = TOTAL USER − (TOTAL OPS COST + DRIVER FEE)
+ *      (confirmed by TEN 2026-06-22: the driver fee was being collected but never
+ *       subtracted; total_user is the ALL-IN customer total — rental + billable
+ *       additionals already raise final_price → total_user — so additionals are
+ *       counted in revenue and must NOT be added again.)
+ *  - EXTERNAL (vendor-supplied):  margin = (TOTAL USER | HARGA JUAL) − RTR
+ *      (driver fee is an internal concept; vendor cost is captured by RTR.)
  *
  * Bump MARGIN_FORMULA_VERSION whenever this logic changes so historical rows
  * remain auditable.
  */
-export const MARGIN_FORMULA_VERSION = 'v2-2026-06-17';
+export const MARGIN_FORMULA_VERSION = 'v3-2026-06-22';
 
 export interface MarginInputs {
   isExternal: boolean;
   total_user_amount?: number | null;
   total_ops_cost?: number | null;
+  driver_fee_amount?: number | null;
   sell_price?: number | null;
   rtr_amount?: number | null;
 }
@@ -29,8 +35,11 @@ export function computeMargin(input: MarginInputs): number {
         : n(input.sell_price);
     return revenue - n(input.rtr_amount);
   }
-  // Internal: total user minus total operational cost.
-  return n(input.total_user_amount) - n(input.total_ops_cost);
+  // Internal: all-in customer total minus (ops cost + driver fee).
+  return (
+    n(input.total_user_amount) -
+    (n(input.total_ops_cost) + n(input.driver_fee_amount))
+  );
 }
 
 /**

@@ -299,6 +299,11 @@ export function buildOrderAndFinance(
       isExternal,
       total_user_amount: finance.total_user_amount,
       total_ops_cost: finance.total_ops_cost,
+      // NOTE: deliberately NOT passing driver_fee_amount here. This is a
+      // historical-import fallback and it's unclear whether the sheet's
+      // TOTAL OPS COST already bundles the driver fee; subtracting the
+      // separate DRIVER column again could double-count old rows. Live
+      // orders use the v3 formula (driver fee subtracted) in upsertOrderFinance.
       sell_price: finance.sell_price,
       rtr_amount: finance.rtr_amount,
     });
