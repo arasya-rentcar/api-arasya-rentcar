@@ -209,6 +209,30 @@ export async function generateInvoice(
       }))
     : undefined;
 
+  // The PDF line items depend on the invoice type:
+  //  - ADDITIONAL bills ONLY the billable adjustments (no rental day lines).
+  //  - everything else (DP / SETTLEMENT / FULL / COMBINED) lists the rental
+  //    service days; COMBINED also appends additionalItems above.
+  const rentalLineItems = order.service_items.map((item) => ({
+    serviceDate: item.service_date,
+    description: item.description,
+    serviceKind: item.service_kind,
+    servicePackage: item.service_package,
+    pickupLocation: item.pickup_location,
+    dropoffLocation: item.dropoff_location,
+    quantity: item.quantity,
+    unitPrice: Number(item.unit_price),
+    totalPrice: Number(item.total_price),
+  }));
+  const additionalLineItems = billableAdjustments.map((a) => ({
+    description: a.description,
+    quantity: a.quantity ?? 1,
+    unitPrice: Number(a.amount),
+    totalPrice: Number(a.amount) * (a.quantity ?? 1),
+  }));
+  const pdfItems =
+    input.invoice_type === "ADDITIONAL" ? additionalLineItems : rentalLineItems;
+
   const methodLabels: Record<string, string> = {
     CASH: "Cash",
     BANK_TRANSFER: "Bank Transfer",
@@ -233,17 +257,7 @@ export async function generateInvoice(
     invoiceKind: input.invoice_type,
     dueDate,
     noteLines: buildNoteLines(order),
-    items: order.service_items.map((item) => ({
-      serviceDate: item.service_date,
-      description: item.description,
-      serviceKind: item.service_kind,
-      servicePackage: item.service_package,
-      pickupLocation: item.pickup_location,
-      dropoffLocation: item.dropoff_location,
-      quantity: item.quantity,
-      unitPrice: Number(item.unit_price),
-      totalPrice: Number(item.total_price),
-    })),
+    items: pdfItems,
     additionalItems,
   });
 
@@ -386,17 +400,40 @@ export async function markInvoicePaid(
 
   // For a COMBINED invoice the kwitansi mirrors the invoice: rental lines plus
   // an Additional Charges section.
+  const receiptBillableAdjustments = invoice.order.adjustments.filter(
+    (a) => a.is_billable,
+  );
   const receiptAdditionalItems =
     invoice.invoice_type === "COMBINED"
-      ? invoice.order.adjustments
-          .filter((a) => a.is_billable)
-          .map((a) => ({
-            description: a.description,
-            quantity: a.quantity ?? 1,
-            unitPrice: Number(a.amount),
-            totalPrice: Number(a.amount) * (a.quantity ?? 1),
-          }))
+      ? receiptBillableAdjustments.map((a) => ({
+          description: a.description,
+          quantity: a.quantity ?? 1,
+          unitPrice: Number(a.amount),
+          totalPrice: Number(a.amount) * (a.quantity ?? 1),
+        }))
       : undefined;
+  // The kwitansi line items mirror the invoice: an ADDITIONAL receipt lists ONLY
+  // the additional charges; every other type lists the rental service days.
+  const receiptRentalItems = invoice.order.service_items.map((item) => ({
+    serviceDate: item.service_date,
+    description: item.description,
+    serviceKind: item.service_kind,
+    servicePackage: item.service_package,
+    pickupLocation: item.pickup_location,
+    dropoffLocation: item.dropoff_location,
+    quantity: item.quantity,
+    unitPrice: Number(item.unit_price),
+    totalPrice: Number(item.total_price),
+  }));
+  const receiptItems =
+    invoice.invoice_type === "ADDITIONAL"
+      ? receiptBillableAdjustments.map((a) => ({
+          description: a.description,
+          quantity: a.quantity ?? 1,
+          unitPrice: Number(a.amount),
+          totalPrice: Number(a.amount) * (a.quantity ?? 1),
+        }))
+      : receiptRentalItems;
 
   // Sum of prior invoices (excluding this one) for the receipt summary.
   const priorAgg = await prisma.invoice.aggregate({
@@ -476,17 +513,7 @@ export async function markInvoicePaid(
       // Sprint 2: overpayment/refund details live ONLY in the PDF.
       refundDue,
       noteLines: buildNoteLines(invoice.order),
-      items: invoice.order.service_items.map((item) => ({
-        serviceDate: item.service_date,
-        description: item.description,
-        serviceKind: item.service_kind,
-        servicePackage: item.service_package,
-        pickupLocation: item.pickup_location,
-        dropoffLocation: item.dropoff_location,
-        quantity: item.quantity,
-        unitPrice: Number(item.unit_price),
-        totalPrice: Number(item.total_price),
-      })),
+      items: receiptItems,
       additionalItems: receiptAdditionalItems,
     });
     receiptUrl = await uploadInvoicePDF(
@@ -701,7 +728,12 @@ export async function reviseInvoice(
   const invoice = await prisma.invoice.findUnique({
     where: { id: invoiceId },
     include: {
-      order: { include: { service_items: { orderBy: { sort_order: "asc" } } } },
+      order: {
+        include: {
+          service_items: { orderBy: { sort_order: "asc" } },
+          adjustments: { orderBy: { created_at: "asc" } },
+        },
+      },
     },
   });
   if (!invoice) throw new AppError("Invoice not found", 404);
@@ -753,6 +785,36 @@ export async function reviseInvoice(
     );
   }
 
+  // Mirror the original invoice's line items: an ADDITIONAL revision lists ONLY
+  // the additional charges; COMBINED lists rental + an Additional Charges
+  // section; the rest list the rental service days.
+  const reviseBillableAdjustments = invoice.order.adjustments.filter(
+    (a) => a.is_billable,
+  );
+  const reviseAdjustmentItems = reviseBillableAdjustments.map((a) => ({
+    description: a.description,
+    quantity: a.quantity ?? 1,
+    unitPrice: Number(a.amount),
+    totalPrice: Number(a.amount) * (a.quantity ?? 1),
+  }));
+  const reviseRentalItems = invoice.order.service_items.map((item) => ({
+    serviceDate: item.service_date,
+    description: item.description,
+    serviceKind: item.service_kind,
+    servicePackage: item.service_package,
+    pickupLocation: item.pickup_location,
+    dropoffLocation: item.dropoff_location,
+    quantity: item.quantity,
+    unitPrice: Number(item.unit_price),
+    totalPrice: Number(item.total_price),
+  }));
+  const reviseItems =
+    invoice.invoice_type === "ADDITIONAL"
+      ? reviseAdjustmentItems
+      : reviseRentalItems;
+  const reviseAdditionalItems =
+    invoice.invoice_type === "COMBINED" ? reviseAdjustmentItems : undefined;
+
   const pdfBuffer = await generateInvoicePDF({
     invoiceNumber,
     issueDate,
@@ -765,16 +827,9 @@ export async function reviseInvoice(
     paymentMethod: methodLabels[paymentMethod] ?? paymentMethod,
     amountPaid: amount,
     previouslyPaid,
-    items: invoice.order.service_items.map((item) => ({
-      serviceDate: item.service_date,
-      description: item.description,
-      serviceKind: item.service_kind,
-      pickupLocation: item.pickup_location,
-      dropoffLocation: item.dropoff_location,
-      quantity: item.quantity,
-      unitPrice: Number(item.unit_price),
-      totalPrice: Number(item.total_price),
-    })),
+    invoiceKind: invoice.invoice_type,
+    items: reviseItems,
+    additionalItems: reviseAdditionalItems,
   });
 
   const fileName = `${invoiceNumber}.pdf`;
