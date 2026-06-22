@@ -66,6 +66,10 @@ router.post(
   "/:id/invoice/:invoiceId/send-whatsapp",
   sendInvoiceWhatsappController,
 );
+router.post(
+  "/:id/invoice/:invoiceId/send-receipt-whatsapp",
+  sendReceiptWhatsappController,
+);
 // Sprint 5: mark a refund settled. Refund proof file REQUIRED (field "proof").
 router.post(
   "/:id/mark-refunded",
