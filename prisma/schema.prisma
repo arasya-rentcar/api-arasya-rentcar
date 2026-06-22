@@ -44,22 +44,6 @@ enum PaymentStatus {
   PAID
 }
 
-enum TripStatus {
-  DRIVER_ASSIGNED
-  DEPART_GARAGE
-  ARRIVE_AT_CUSTOMER
-  ON_TRIP
-  DROP_CUSTOMER
-  RETURN_GARAGE
-  ARRIVE_GARAGE
-  COMPLETED
-}
-
-enum Actor {
-  ADMIN
-  DRIVER
-}
-
 enum ExpenseType {
   FUEL
   TOLL
@@ -167,7 +151,6 @@ model Driver {
   location       String?
   type           DriverType         @default(INTERNAL)
   status         DriverStatus       @default(AVAILABLE)
-  trips          Trip[]
   reports        TripReport[]
   schedule_lines OrderServiceItem[]
   payables       Payable[]
@@ -187,7 +170,6 @@ model Car {
   origin_location String?
   photo_url       String?
   photos          String[]           @default([])
-  trips           Trip[]
   schedule_lines  OrderServiceItem[]
 
   @@map("cars")
@@ -248,7 +230,6 @@ model Order {
   updated_at             DateTime             @updatedAt
   customers              OrderCustomer[]
   service_items          OrderServiceItem[]
-  trip                   Trip?
   reports                TripReport[]
   summary                OrderSummary?
   final_finance          OrderFinalFinance?
@@ -492,36 +473,6 @@ model PayableExtra {
   @@map("payable_extras")
 }
 
-model Trip {
-  id             String       @id @default(uuid())
-  order_id       String       @unique
-  order          Order        @relation(fields: [order_id], references: [id])
-  driver_id      String
-  driver         Driver       @relation(fields: [driver_id], references: [id])
-  car_id         String
-  car            Car          @relation(fields: [car_id], references: [id])
-  current_status TripStatus   @default(DRIVER_ASSIGNED)
-  started_at     DateTime?
-  finished_at    DateTime?
-  created_at     DateTime     @default(now())
-  logs           TripLog[]
-  expenses       Expense[]
-  reports        TripReport[]
-
-  @@map("trips")
-}
-
-model TripLog {
-  id         String     @id @default(uuid())
-  trip_id    String
-  trip       Trip       @relation(fields: [trip_id], references: [id])
-  status     TripStatus
-  actor      Actor
-  created_at DateTime   @default(now())
-
-  @@map("trip_logs")
-}
-
 model Invoice {
   id                String               @id @default(uuid())
   order_id          String
@@ -640,12 +591,9 @@ model OrderChangeLog {
 
 model Expense {
   id         String      @id @default(uuid())
-  // Merge: expenses now belong to a service-day line (the line IS the trip).
-  // order_service_item_id is the new home; trip_id is legacy (dropped batch 4).
+  // Merge: expenses belong to a service-day line (the line IS the trip).
   order_service_item_id String?
   order_service_item    OrderServiceItem? @relation(fields: [order_service_item_id], references: [id], onDelete: Cascade)
-  trip_id    String?
-  trip       Trip?       @relation(fields: [trip_id], references: [id])
   type       ExpenseType
   amount     Decimal     @db.Decimal(12, 2)
   note       String?
@@ -662,8 +610,6 @@ model TripReport {
   // Merge: reports attach to a specific service-day line when matched.
   order_service_item_id String?
   order_service_item    OrderServiceItem? @relation(fields: [order_service_item_id], references: [id], onDelete: SetNull)
-  trip_id        String?
-  trip           Trip?           @relation(fields: [trip_id], references: [id], onDelete: SetNull)
   order_code     String?
   driver_id      String?
   driver         Driver?         @relation(fields: [driver_id], references: [id], onDelete: SetNull)
@@ -681,7 +627,6 @@ model TripReport {
 
   @@index([order_id])
   @@index([order_service_item_id])
-  @@index([trip_id])
   @@index([order_code])
   @@index([driver_phone])
   @@index([report_type])
