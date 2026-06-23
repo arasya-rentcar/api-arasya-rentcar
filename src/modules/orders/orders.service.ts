@@ -616,16 +616,28 @@ export async function getOrderById(id: string) {
   return order;
 }
 
+// Terminal orders are READ-ONLY for structural data. DONE and CANCELLED orders
+// must not have their fields, service lines, driver assignment, or pricing
+// adjustments changed. Billing/closure (invoices, payment, receipt, refund,
+// finance settlement) is intentionally NOT guarded here because it legitimately
+// happens after a trip is DONE and on CANCELLED orders (cancellation fee /
+// refund). Callers that mutate structural data should call this first.
+function assertOrderStructurallyEditable(order: {
+  order_status: string;
+}): void {
+  if (order.order_status === "DONE" || order.order_status === "CANCELLED") {
+    throw new AppError(
+      `Cannot modify a ${order.order_status} order. Finished and cancelled orders are read-only.`,
+      409,
+    );
+  }
+}
+
 export async function updateOrder(id: string, input: UpdateOrderInput) {
   const order = await prisma.order.findUnique({ where: { id } });
   if (!order) throw new AppError("Order not found", 404);
 
-  if (order.order_status === "DONE" || order.order_status === "CANCELLED") {
-    throw new AppError(
-      `Cannot update order with status ${order.order_status}`,
-      409,
-    );
-  }
+  assertOrderStructurallyEditable(order);
 
   const { change_reason, customers, service_items, ...updateData } = input;
   const normalizedCustomers = customers
@@ -860,6 +872,7 @@ export async function createOrderAdjustment(
 ) {
   const order = await prisma.order.findUnique({ where: { id: orderId } });
   if (!order) throw new AppError("Order not found", 404);
+  assertOrderStructurallyEditable(order);
 
   return prisma.$transaction(async (tx) => {
     const adjustment = await tx.orderAdjustment.create({
