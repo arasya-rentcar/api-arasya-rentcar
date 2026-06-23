@@ -65,3 +65,13 @@ export const tripHistoryQuerySchema = z.object({
   page_size: z.coerce.number().int().positive().max(200).default(50),
 });
 export type TripHistoryQuery = z.infer<typeof tripHistoryQuerySchema>;
+
+// Week timeline: 7 WIB days of resource availability in one call. `from` is the
+// week's first day (YYYY-MM-DD, WIB); defaults to the Monday of the current WIB
+// week. `resource` chooses which fleet to expand into rows (both always have
+// capacity counts).
+export const scheduleWeekQuerySchema = z.object({
+  from: z.string().optional(),
+  resource: z.enum(['drivers', 'cars']).default('drivers'),
+});
+export type ScheduleWeekQuery = z.infer<typeof scheduleWeekQuerySchema>;

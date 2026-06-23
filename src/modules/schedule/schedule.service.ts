@@ -17,6 +17,7 @@ import {
   AssignScheduleLineInput,
   DriverAvailabilityQuery,
   TripHistoryQuery,
+  ScheduleWeekQuery,
 } from './schedule.validation';
 import type { Prisma, ScheduleStatus } from '@prisma/client';
 
@@ -526,6 +527,182 @@ export async function scheduleStock(query: { date?: string }) {
       used_list: carUsed,
       free_list: carFree,
     },
+  };
+}
+
+/** WIB calendar date (YYYY-MM-DD) for a given instant. */
+function wibDateStr(d: Date): string {
+  return new Date(d.getTime() + WIB_OFFSET_MS).toISOString().slice(0, 10);
+}
+
+/** Monday (WIB) of the week containing the given WIB date string. */
+function wibWeekStart(dateStr: string): string {
+  const { start } = dayBounds(dateStr); // WIB midnight as UTC instant
+  // getUTCDay on the WIB-shifted instant gives the WIB weekday.
+  const wib = new Date(start.getTime() + WIB_OFFSET_MS);
+  const dow = (wib.getUTCDay() + 6) % 7; // 0 = Monday
+  const monday = new Date(start.getTime() - dow * 24 * 60 * 60 * 1000);
+  return wibDateStr(monday);
+}
+
+/**
+ * Week Timeline: 7 WIB days of fleet availability in ONE response, for the
+ * dashboard Schedule > Timeline view.
+ *
+ * Rows are the chosen resource (drivers by default, or cars); each row carries
+ * a 7-cell array aligned to the week's days. A cell is either free or holds the
+ * active bookings (SCHEDULED/IN_PROGRESS internal lines) for that resource on
+ * that WIB day. Each day also gets capacity counts (free/used/down/total for
+ * BOTH drivers and cars) so the UI can show a per-day capacity ribbon without
+ * extra calls. Two queries total (fleet + lines), bucketed in memory.
+ */
+export async function scheduleWeek(query: ScheduleWeekQuery) {
+  const weekStart = wibWeekStart(query.from ?? wibDateStr(new Date()));
+  const days = Array.from({ length: 7 }, (_, i) => {
+    const ds = wibDateStr(
+      new Date(dayBounds(weekStart).start.getTime() + i * 24 * 60 * 60 * 1000),
+    );
+    return ds;
+  });
+  const windowStart = dayBounds(days[0]).start;
+  const windowEnd = dayBounds(days[6]).end;
+  const ACTIVE: ScheduleStatus[] = ['SCHEDULED', 'IN_PROGRESS'];
+
+  const [drivers, cars, lines] = await Promise.all([
+    prisma.driver.findMany({
+      where: { type: 'INTERNAL' },
+      select: { id: true, name: true, phone: true, status: true },
+      orderBy: { name: 'asc' },
+    }),
+    prisma.car.findMany({
+      where: { type: 'INTERNAL' },
+      select: {
+        id: true,
+        model: true,
+        plate_number: true,
+        unit_code: true,
+        status: true,
+      },
+      orderBy: { model: 'asc' },
+    }),
+    prisma.orderServiceItem.findMany({
+      where: {
+        is_external: false,
+        line_status: { in: ACTIVE },
+        service_date: { gte: windowStart, lte: windowEnd },
+      },
+      select: {
+        id: true,
+        driver_id: true,
+        car_id: true,
+        line_status: true,
+        service_date: true,
+        pickup_location: true,
+        dropoff_location: true,
+        order: { select: { id: true, order_code: true, customer_name: true } },
+      },
+    }),
+  ]);
+
+  type WeekBooking = {
+    line_id: string;
+    order_id?: string;
+    order_code?: string | null;
+    customer_name?: string;
+    route: string;
+    status: ScheduleStatus;
+  };
+  const bookingOf = (l: (typeof lines)[number]): WeekBooking => ({
+    line_id: l.id,
+    order_id: l.order?.id,
+    order_code: l.order?.order_code,
+    customer_name: l.order?.customer_name,
+    route: `${l.pickup_location} -> ${l.dropoff_location}`,
+    status: l.line_status,
+  });
+
+  const dayIndex = new Map(days.map((d, i) => [d, i]));
+  // resourceDayBookings[resourceId][dayIdx] = bookings
+  const driverGrid = new Map<string, WeekBooking[][]>();
+  const carGrid = new Map<string, WeekBooking[][]>();
+  const emptyGrid = () => Array.from({ length: 7 }, () => [] as WeekBooking[]);
+
+  for (const l of lines) {
+    if (!l.service_date) continue;
+    const di = dayIndex.get(wibDateStr(l.service_date));
+    if (di == null) continue;
+    if (l.driver_id) {
+      if (!driverGrid.has(l.driver_id)) driverGrid.set(l.driver_id, emptyGrid());
+      driverGrid.get(l.driver_id)![di].push(bookingOf(l));
+    }
+    if (l.car_id) {
+      if (!carGrid.has(l.car_id)) carGrid.set(l.car_id, emptyGrid());
+      carGrid.get(l.car_id)![di].push(bookingOf(l));
+    }
+  }
+
+  const driverRows = drivers.map((d) => ({
+    id: d.id,
+    name: d.name,
+    phone: d.phone,
+    down: d.status === 'OFF',
+    cells: (driverGrid.get(d.id) ?? emptyGrid()).map((bookings) => ({
+      free: d.status !== 'OFF' && bookings.length === 0,
+      bookings,
+    })),
+  }));
+  const carRows = cars.map((c) => ({
+    id: c.id,
+    name: c.model,
+    plate_number: c.plate_number,
+    unit_code: c.unit_code,
+    down: c.status === 'MAINTENANCE',
+    cells: (carGrid.get(c.id) ?? emptyGrid()).map((bookings) => ({
+      free: c.status !== 'MAINTENANCE' && bookings.length === 0,
+      bookings,
+    })),
+  }));
+
+  // Per-day capacity ribbon (both fleets), independent of the chosen resource.
+  const capacity = days.map((_, di) => {
+    const dDown = driverRows.filter((r) => r.down).length;
+    const dUsed = driverRows.filter(
+      (r) => !r.down && r.cells[di].bookings.length > 0,
+    ).length;
+    const cDown = carRows.filter((r) => r.down).length;
+    const cUsed = carRows.filter(
+      (r) => !r.down && r.cells[di].bookings.length > 0,
+    ).length;
+    const trips = lines.filter(
+      (l) => l.service_date && wibDateStr(l.service_date) === days[di],
+    ).length;
+    return {
+      date: days[di],
+      trips,
+      drivers: {
+        total: drivers.length,
+        down: dDown,
+        used: dUsed,
+        free: drivers.length - dDown - dUsed,
+      },
+      cars: {
+        total: cars.length,
+        down: cDown,
+        used: cUsed,
+        free: cars.length - cDown - cUsed,
+      },
+    };
+  });
+
+  const today = wibDateStr(new Date());
+  return {
+    week_start: days[0],
+    week_end: days[6],
+    today,
+    resource: query.resource,
+    days,
+    capacity,
+    rows: query.resource === 'cars' ? carRows : driverRows,
   };
 }
 
