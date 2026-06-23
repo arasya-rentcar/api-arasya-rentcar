@@ -172,6 +172,7 @@ function normalizeServiceItems(input: BotCreateOrderInput) {
       end_at: item.end_at ? new Date(item.end_at) : null,
       description: item.description || null,
       service_kind: item.service_kind || null,
+      service_package: item.service_package || null,
       pickup_location: item.pickup_location,
       dropoff_location: item.dropoff_location,
       driver_origin_location: item.driver_origin_location || null,
