@@ -75,10 +75,25 @@ export function rollupOrderStatus(statuses: ScheduleStatus[]): OrderStatus {
 
   if (active.some((s) => s === 'IN_PROGRESS')) return 'IN_PROGRESS';
   if (active.some((s) => s === 'ASSIGNED')) return 'ASSIGNED';
-  // All remaining active lines finished -> order done (#1).
-  if (active.length > 0 && active.every((s) => s === 'DONE')) return 'DONE';
+  // ADMIN-FINALIZE MODEL (2026-06-23): "all active lines DONE" no longer
+  // auto-DONEs the order. Finalization is an admin financial act (ops cost /
+  // additional / driver fee must be entered first), so we CAP at IN_PROGRESS
+  // here and surface the real state via Order.awaiting_finalization. The order
+  // only reaches DONE through the admin finalize endpoint.
+  if (active.length > 0 && active.every((s) => s === 'DONE')) return 'IN_PROGRESS';
   // Otherwise still being prepared (some SCHEDULED, none assigned yet).
   return 'CREATED';
+}
+
+/**
+ * True when there is at least one active (non-cancelled) line and ALL active
+ * lines are DONE. This is the "all trips finished" signal that drives
+ * Order.awaiting_finalization (since rollupOrderStatus now caps such an order
+ * at IN_PROGRESS rather than DONE).
+ */
+export function allActiveLinesDone(statuses: ScheduleStatus[]): boolean {
+  const active = statuses.filter((s) => s !== 'CANCELLED');
+  return active.length > 0 && active.every((s) => s === 'DONE');
 }
 
 /**
@@ -96,22 +111,32 @@ export async function deriveAndSetOrderStatus(
     select: { line_status: true },
   });
 
-  const next = rollupOrderStatus(lines.map((l) => l.line_status));
+  const statuses = lines.map((l) => l.line_status);
+  const next = rollupOrderStatus(statuses);
+  const finished = allActiveLinesDone(statuses);
 
   const order = await tx.order.findUnique({
     where: { id: orderId },
-    select: { order_status: true },
+    select: { order_status: true, awaiting_finalization: true },
   });
   if (!order) return next;
 
-  // Never resurrect a manually-finalised/cancelled order from a stray line edit
-  // unless the lines themselves now say otherwise. We still allow forward and
-  // corrective transitions; we only short-circuit a no-op write.
-  if (order.order_status !== next) {
-    await tx.order.update({
-      where: { id: orderId },
-      data: { order_status: next },
-    });
+  // TERMINAL GUARD: once an order is admin-finalised (DONE) or CANCELLED, never
+  // resurrect it from a later line edit. rollupOrderStatus now caps all-done at
+  // IN_PROGRESS, so without this guard a finalised order would be dragged back
+  // to IN_PROGRESS. Leave order_status + awaiting_finalization untouched.
+  if (order.order_status === 'DONE' || order.order_status === 'CANCELLED') {
+    return order.order_status;
+  }
+
+  // awaiting_finalization: TRUE exactly when all active lines are DONE but the
+  // admin has not finalised yet. Cleared automatically if a line reopens.
+  const data: Prisma.OrderUncheckedUpdateInput = {};
+  if (order.order_status !== next) data.order_status = next;
+  if (order.awaiting_finalization !== finished)
+    data.awaiting_finalization = finished;
+  if (Object.keys(data).length > 0) {
+    await tx.order.update({ where: { id: orderId }, data });
   }
   return next;
 }

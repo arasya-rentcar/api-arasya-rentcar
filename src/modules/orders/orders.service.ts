@@ -264,7 +264,7 @@ export interface SearchOrdersParams {
   order_status?: string;
   payment_status?: string;
   source?: string;
-  bucket?: string; // ALL | ACTIVE | MISSING_INVOICE | CANCELLED | NOT_FINAL | REFUNDED
+  bucket?: string; // ALL | ACTIVE | MISSING_INVOICE | CANCELLED | NOT_FINAL | REFUNDED | AWAITING_FINAL
   has_finance?: string; // "true" | "false"
   date_field?: "order_date" | "service_start_at";
   date_from?: string;
@@ -340,6 +340,10 @@ export async function searchOrders(params: SearchOrdersParams) {
       break;
     case "REFUNDED":
       and.push({ is_refunded: true });
+      break;
+    case "AWAITING_FINAL":
+      // All service days finished by the driver, waiting on admin finalization.
+      and.push({ awaiting_finalization: true });
       break;
     default:
       break;
@@ -922,6 +926,69 @@ export async function createOrderChangeLog(
   return prisma.orderChangeLog.create({
     data: { order_id: orderId, ...input },
   });
+}
+
+/**
+ * ADMIN-ONLY order finalization (2026-06-23).
+ *
+ * Per the admin-finalize model, the bot can move individual day-lines to DONE
+ * (from the driver's dropoff report) but the ORDER never auto-completes
+ * (rollupOrderStatus caps all-done at IN_PROGRESS and sets
+ * awaiting_finalization). This endpoint is the ONLY path that sets
+ * order_status = DONE — the admin calls it after entering ops cost / additional
+ * / driver fee.
+ *
+ * Guard: every active (non-cancelled) line must already be DONE. Ops cost /
+ * additional / driver fee are SOFT (not enforced here) — the dashboard reminds
+ * the admin via a confirmation dialog when additionals exist.
+ */
+export async function finalizeOrder(orderId: string, actor?: string) {
+  const order = await prisma.order.findUnique({
+    where: { id: orderId },
+    include: { service_items: { select: { line_status: true } } },
+  });
+  if (!order) throw new AppError("Order not found", 404);
+
+  if (order.order_status === "DONE") {
+    throw new AppError("Order is already finalized", 409);
+  }
+  if (order.order_status === "CANCELLED") {
+    throw new AppError("Cannot finalize a cancelled order", 409);
+  }
+
+  const activeLines = order.service_items.filter(
+    (l) => l.line_status !== "CANCELLED",
+  );
+  if (activeLines.length === 0) {
+    throw new AppError("Order has no active service lines to finalize", 409);
+  }
+  const allDone = activeLines.every((l) => l.line_status === "DONE");
+  if (!allDone) {
+    throw new AppError(
+      "All service days must be finished by the driver before finalizing",
+      409,
+    );
+  }
+
+  return prisma.$transaction(
+    async (tx) => {
+      await tx.order.update({
+        where: { id: orderId },
+        data: { order_status: "DONE", awaiting_finalization: false },
+      });
+      await tx.orderChangeLog.create({
+        data: {
+          order_id: orderId,
+          field: "order_status",
+          new_value: "DONE",
+          actor,
+          note: "Order finalized by admin (finance reviewed)",
+        },
+      });
+      return tx.order.findUnique({ where: { id: orderId } });
+    },
+    { maxWait: 15000, timeout: 30000 },
+  );
 }
 
 // Sprint 5: how much refund the order owes the customer = money received beyond

@@ -19,6 +19,7 @@ import {
   reassignOrder,
   createOrderAdjustment,
   createOrderChangeLog,
+  finalizeOrder,
   upsertOrderFinance,
   markOrderRefunded,
   getRefundProofUrl,
@@ -238,6 +239,23 @@ export async function createOrderChangeLogController(
     const input = createChangeLogSchema.parse(req.body);
     const log = await createOrderChangeLog(req.params.id, input);
     res.status(201).json({ status: "success", data: log });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// Admin-only: finalize an order (sets order_status = DONE). Only valid once the
+// bot has moved every active day-line to DONE. Actor is the authenticated
+// admin user id from the JWT.
+export async function finalizeOrderController(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const actor = req.user?.user_id;
+    const result = await finalizeOrder(req.params.id, actor);
+    res.json({ status: "success", data: result });
   } catch (err) {
     next(err);
   }

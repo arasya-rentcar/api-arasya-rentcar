@@ -42,6 +42,16 @@ function reportTypeIsPhoto(type = ""): boolean {
   return /PHOTO|IMAGE|START|FINISH|STOP/i.test(type);
 }
 
+// Report types that mean "driver ARRIVED at the customer pickup location" ->
+// stamps actual_pickup_at. Covers the bot's pickup-arrival tags and common
+// Indonesian phrasings. Intentionally does NOT match START (depart garage),
+// DROP/FINISH (dropoff), or generic photo/document reports.
+function isPickupArrivalReport(type = ""): boolean {
+  return /ARRIVE_CUSTOMER|ARRIVE|PICKUP|PICK_UP|PICK UP|SAMPAI_JEMPUT|SAMPAI JEMPUT|TIBA_JEMPUT|DI_LOKASI_JEMPUT/i.test(
+    type,
+  );
+}
+
 function orderInclude() {
   // Merge: the line IS the trip. Order detail now exposes its service-day lines
   // (each with its own driver/car/status) instead of a single order-level trip.
@@ -487,16 +497,29 @@ async function transitionActiveLine(
     const now = new Date();
     const cur = await tx.orderServiceItem.findUnique({
       where: { id: line.id },
-      select: { trip_started_at: true, driver_id: true, car_id: true },
+      select: {
+        trip_started_at: true,
+        actual_start_at: true,
+        driver_id: true,
+        car_id: true,
+      },
     });
     const data: Prisma.OrderServiceItemUncheckedUpdateInput = {
       line_status: next,
     };
     if (next === "IN_PROGRESS" && cur?.trip_started_at == null)
       data.trip_started_at = now;
+    // actual_start_at = driver DEPARTS the garage (the #start report). Distinct
+    // from actual_pickup_at (arrive at customer). Stamp once.
+    if (next === "IN_PROGRESS" && cur?.actual_start_at == null)
+      data.actual_start_at = now;
     if (next === "DONE") {
       if (cur?.trip_started_at == null) data.trip_started_at = now;
+      // actual dropoff = trip_finished_at; finish_reported_at records that the
+      // driver reported finishing. The LINE goes DONE here, but the ORDER stays
+      // IN_PROGRESS (awaiting_finalization) per the admin-finalize model.
       data.trip_finished_at = now;
+      data.finish_reported_at = now;
     }
     const updated = await tx.orderServiceItem.update({
       where: { id: line.id },
@@ -643,6 +666,16 @@ export async function createBotReport(
     lineId = line?.id ?? null;
   }
   const status = order ? input.status : "UNMATCHED";
+
+  // actual_pickup_at = driver ARRIVES at the customer pickup location. Stamped
+  // once from an ARRIVE/PICKUP-class report onto the active line. Distinct from
+  // actual_start_at (depart garage) and trip_finished_at (dropoff).
+  if (lineId && isPickupArrivalReport(input.report_type)) {
+    await prisma.orderServiceItem.updateMany({
+      where: { id: lineId, actual_pickup_at: null },
+      data: { actual_pickup_at: new Date() },
+    });
+  }
 
   return prisma.tripReport.create({
     data: {

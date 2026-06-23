@@ -225,6 +225,11 @@ model Order {
   needs_review           Boolean              @default(false)
   review_reason          String?
   order_status           OrderStatus          @default(CREATED)
+  // True once ALL active (non-cancelled) service lines are DONE but the admin
+  // has not yet finalized the order. order_status stays IN_PROGRESS underneath;
+  // this flag is the searchable "needs finalization" signal. Cleared on
+  // finalize (order_status -> DONE).
+  awaiting_finalization  Boolean              @default(false)
   payment_status         PaymentStatus        @default(UNPAID)
   is_final               Boolean              @default(false)
   invoice_missing        Boolean              @default(false)
@@ -252,6 +257,7 @@ model Order {
   @@index([source])
   @@index([order_status])
   @@index([needs_review])
+  @@index([awaiting_finalization])
   @@index([is_final])
   @@index([invoice_missing])
   @@index([is_refunded])
@@ -391,6 +397,18 @@ model OrderServiceItem {
   // No separate trip_status: it would duplicate line_status 1:1.
   trip_started_at  DateTime?
   trip_finished_at DateTime?
+
+  // --- Distinct ACTUAL operational timestamps (stamped by the WA bot from
+  // driver reports). These are separate real-world events:
+  //   actual_start_at  = driver DEPARTS the garage (starts driving to pickup)
+  //   actual_pickup_at = driver ARRIVES at the customer pickup location
+  //   (actual dropoff reuses trip_finished_at above)
+  // finish_reported_at = when the driver reported finishing this line. The line
+  // moves to DONE from the dropoff report, but the ORDER stays IN_PROGRESS
+  // (awaiting admin finalization) regardless.
+  actual_start_at    DateTime?
+  actual_pickup_at   DateTime?
+  finish_reported_at DateTime?
 
   // --- #A1/#A2 trip-confirmation messaging (additive, 2026-06-20) ---
   // confirmation_* = message sent to the CUSTOMER ("Data tim bertugas").
