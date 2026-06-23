@@ -104,6 +104,7 @@ export async function listSchedule(query: ListScheduleQuery) {
   const [rawItems, total, agg] = await Promise.all([
     prisma.orderServiceItem.findMany({
       where,
+      relationLoadStrategy: 'join',
       include: lineInclude,
       orderBy: [{ service_date: 'asc' }, { sort_order: 'asc' }],
       skip,
@@ -612,6 +613,7 @@ export async function scheduleWeek(query: ScheduleWeekQuery) {
         line_status: { in: ACTIVE },
         service_date: { gte: windowStart, lte: windowEnd },
       },
+      relationLoadStrategy: 'join',
       select: {
         id: true,
         driver_id: true,
@@ -829,6 +831,7 @@ export async function tripHistory(query: TripHistoryQuery) {
   const [rows, total] = await Promise.all([
     prisma.orderServiceItem.findMany({
       where,
+      relationLoadStrategy: 'join',
       include: historyInclude,
       // Newest finished first: prefer actual dropoff time, fall back to date.
       orderBy: [{ trip_finished_at: 'desc' }, { service_date: 'desc' }],

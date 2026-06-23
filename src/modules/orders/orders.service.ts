@@ -572,6 +572,7 @@ export async function upsertOrderFinance(
 export async function getOrderById(id: string) {
   const order = await prisma.order.findUnique({
     where: { id },
+    relationLoadStrategy: "join",
     include: {
       invoices: {
         orderBy: { created_at: "desc" as const },
