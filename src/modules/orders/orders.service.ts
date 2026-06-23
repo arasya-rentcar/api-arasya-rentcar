@@ -207,6 +207,7 @@ export async function createOrder(input: CreateOrderInput) {
 
 export async function listOrders() {
   return prisma.order.findMany({
+    relationLoadStrategy: "join",
     orderBy: { created_at: "desc" },
     include: {
       final_finance: {
@@ -360,10 +361,11 @@ export async function searchOrders(params: SearchOrdersParams) {
     and.push({ [dateField]: { lte: new Date(`${params.date_to}T23:59:59`) } });
   if (and.length) where.AND = and;
 
-  const [total, rows, financeAgg] = await Promise.all([
+  const [total, rows, financeAgg, priceAgg] = await Promise.all([
     prisma.order.count({ where }),
     prisma.order.findMany({
       where,
+      relationLoadStrategy: "join",
       orderBy: { created_at: "desc" },
       skip: (page - 1) * pageSize,
       take: pageSize,
@@ -422,13 +424,12 @@ export async function searchOrders(params: SearchOrdersParams) {
         margin_amount: true,
       },
     }),
+    // final_price sum (fallback turnover) across filtered set — parallelized.
+    prisma.order.aggregate({
+      where,
+      _sum: { final_price: true },
+    }),
   ]);
-
-  // final_price sum (fallback turnover) across filtered set
-  const priceAgg = await prisma.order.aggregate({
-    where,
-    _sum: { final_price: true },
-  });
 
   return {
     data: rows,
