@@ -388,7 +388,7 @@ export async function createBotOrder(input: BotCreateOrderInput) {
       },
       include: orderInclude(),
     });
-  }, { timeout: 15000 });
+  }, { maxWait: 15000, timeout: 30000 });
 }
 
 async function resolveOrder(orderIdOrCode: string) {
@@ -439,7 +439,7 @@ export async function assignBotOrder(
       where: { id: order.id },
       include: orderInclude(),
     });
-  });
+  }, { maxWait: 15000, timeout: 30000 });
 }
 
 export async function markDriverMessageSent(orderIdOrCode: string) {
@@ -530,7 +530,7 @@ async function transitionActiveLine(
     if (updated.driver_id) await syncDriverStatus(tx, updated.driver_id);
     if (updated.car_id) await syncCarStatus(tx, updated.car_id);
     return updated;
-  });
+  }, { maxWait: 15000, timeout: 30000 });
 }
 
 export async function startBotOrder(
@@ -631,7 +631,7 @@ export async function finishBotOrder(
       where: { id: order.id },
       include: orderInclude(),
     });
-  });
+  }, { maxWait: 15000, timeout: 30000 });
 
   return { order: updated, report };
 }
