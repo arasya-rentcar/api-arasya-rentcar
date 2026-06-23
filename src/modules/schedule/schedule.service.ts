@@ -650,6 +650,11 @@ export async function scheduleWeek(query: ScheduleWeekQuery) {
   const carGrid = new Map<string, WeekBooking[][]>();
   const emptyGrid = () => Array.from({ length: 7 }, () => [] as WeekBooking[]);
 
+  // Unassigned lanes: a scheduled line with no driver (or no car) belongs to no
+  // resource row, so without this it would be invisible on the board. Surface it
+  // in a dedicated lane so dispatchers can see + assign pending work.
+  const driverUnassigned = emptyGrid();
+  const carUnassigned = emptyGrid();
   for (const l of lines) {
     if (!l.service_date) continue;
     const di = dayIndex.get(wibDateStr(l.service_date));
@@ -657,10 +662,14 @@ export async function scheduleWeek(query: ScheduleWeekQuery) {
     if (l.driver_id) {
       if (!driverGrid.has(l.driver_id)) driverGrid.set(l.driver_id, emptyGrid());
       driverGrid.get(l.driver_id)![di].push(bookingOf(l));
+    } else {
+      driverUnassigned[di].push(bookingOf(l));
     }
     if (l.car_id) {
       if (!carGrid.has(l.car_id)) carGrid.set(l.car_id, emptyGrid());
       carGrid.get(l.car_id)![di].push(bookingOf(l));
+    } else {
+      carUnassigned[di].push(bookingOf(l));
     }
   }
 
@@ -718,6 +727,14 @@ export async function scheduleWeek(query: ScheduleWeekQuery) {
   });
 
   const today = wibDateStr(new Date());
+  // Lane of scheduled-but-unassigned trips for the chosen resource. Only emitted
+  // when it actually has bookings, so the board stays clean when all is assigned.
+  const unassignedCells = (
+    query.resource === 'cars' ? carUnassigned : driverUnassigned
+  ).map((bookings) => ({ free: false, bookings }));
+  const unassigned = unassignedCells.some((c) => c.bookings.length > 0)
+    ? { id: '__unassigned__', name: '', cells: unassignedCells }
+    : null;
   return {
     week_start: days[0],
     week_end: days[6],
@@ -725,6 +742,7 @@ export async function scheduleWeek(query: ScheduleWeekQuery) {
     resource: query.resource,
     days,
     capacity,
+    unassigned,
     rows: query.resource === 'cars' ? carRows : driverRows,
   };
 }
