@@ -49,3 +49,19 @@ export const scheduleStockQuerySchema = z.object({
   date: z.string().optional(), // YYYY-MM-DD (WIB); defaults to today
 });
 export type ScheduleStockQuery = z.infer<typeof scheduleStockQuerySchema>;
+
+// Trip History: finished (DONE) service lines, per-line, with full detail
+// (actual timestamps, ops cost, driver fee/payable, margin, driver reports).
+// finance filter: all | finalized (parent order DONE) | awaiting (line DONE but
+// order still awaiting_finalization).
+export const tripHistoryQuerySchema = z.object({
+  date_from: z.string().optional(),
+  date_to: z.string().optional(),
+  driver_id: z.string().uuid().optional(),
+  car_id: z.string().uuid().optional(),
+  finance: z.enum(['all', 'finalized', 'awaiting']).default('all'),
+  search: z.string().optional(),
+  page: z.coerce.number().int().positive().default(1),
+  page_size: z.coerce.number().int().positive().max(200).default(50),
+});
+export type TripHistoryQuery = z.infer<typeof tripHistoryQuerySchema>;

@@ -8,6 +8,7 @@ import {
   assignScheduleLineController,
   driverAvailabilityController,
   scheduleStockController,
+  tripHistoryController,
 } from './schedule.controller';
 import {
   sendLineConfirmationController,
@@ -21,6 +22,7 @@ router.use(verifyTokenMiddleware, requireRole('ADMIN'));
 router.get('/', listScheduleController);
 router.get('/driver-availability', driverAvailabilityController);
 router.get('/stock', scheduleStockController);
+router.get('/history', tripHistoryController);
 router.put('/lines/:id', assignScheduleLineController);
 // #A1/#A2 trip-team confirmation messaging.
 router.post('/lines/:id/send-confirmation', sendLineConfirmationController);

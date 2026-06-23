@@ -4,12 +4,14 @@ import {
   assignScheduleLineSchema,
   driverAvailabilityQuerySchema,
   scheduleStockQuerySchema,
+  tripHistoryQuerySchema,
 } from './schedule.validation';
 import {
   listSchedule,
   assignScheduleLine,
   driverAvailability,
   scheduleStock,
+  tripHistory,
 } from './schedule.service';
 
 export async function listScheduleController(
@@ -63,6 +65,20 @@ export async function scheduleStockController(
     const query = scheduleStockQuerySchema.parse(req.query);
     const data = await scheduleStock(query);
     res.json({ status: 'success', data });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function tripHistoryController(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const query = tripHistoryQuerySchema.parse(req.query);
+    const data = await tripHistory(query);
+    res.json({ status: 'success', ...data });
   } catch (err) {
     next(err);
   }

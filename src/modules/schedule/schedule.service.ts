@@ -16,6 +16,7 @@ import {
   ListScheduleQuery,
   AssignScheduleLineInput,
   DriverAvailabilityQuery,
+  TripHistoryQuery,
 } from './schedule.validation';
 import type { Prisma, ScheduleStatus } from '@prisma/client';
 
@@ -524,6 +525,136 @@ export async function scheduleStock(query: { date?: string }) {
       })),
       used_list: carUsed,
       free_list: carFree,
+    },
+  };
+}
+
+/**
+ * Trip History: finished (DONE) service-day lines, newest first, with full
+ * per-line detail for the dashboard History tab.
+ *
+ * A line goes DONE the moment the driver reports dropoff, but the parent ORDER
+ * only reaches DONE once the admin finalizes (after entering ops cost / driver
+ * fee / additionals). So a DONE line can still be financially pending. We
+ * surface BOTH and tag each row:
+ *   - finance_status = 'FINALIZED' when the parent order_status === 'DONE'
+ *   - finance_status = 'AWAITING'  when the line is DONE but the order is not
+ *     yet finalized (order.awaiting_finalization or still IN_PROGRESS).
+ * The dashboard renders money fields as "Pending" for AWAITING rows.
+ *
+ * Included per line: order summary, driver/car (or external vendor/car), the
+ * actual timestamps, ops_cost, margin_amount, the Payable (driver fee, with
+ * extras), and the driver TripReports (chronological).
+ */
+export async function tripHistory(query: TripHistoryQuery) {
+  const where: Prisma.OrderServiceItemWhereInput = {
+    line_status: 'DONE',
+  };
+
+  if (query.date_from || query.date_to) {
+    where.service_date = {};
+    if (query.date_from)
+      (where.service_date as Prisma.DateTimeFilter).gte = dayBounds(
+        query.date_from,
+      ).start;
+    if (query.date_to)
+      (where.service_date as Prisma.DateTimeFilter).lte = dayBounds(
+        query.date_to,
+      ).end;
+  }
+  if (query.driver_id) where.driver_id = query.driver_id;
+  if (query.car_id) where.car_id = query.car_id;
+
+  // finance filter via the parent order's finalization state.
+  if (query.finance === 'finalized') {
+    where.order = { order_status: 'DONE' };
+  } else if (query.finance === 'awaiting') {
+    where.order = { order_status: { not: 'DONE' } };
+  }
+
+  if (query.search) {
+    where.OR = [
+      { pickup_location: { contains: query.search, mode: 'insensitive' } },
+      { dropoff_location: { contains: query.search, mode: 'insensitive' } },
+      { driver_name_raw: { contains: query.search, mode: 'insensitive' } },
+      {
+        order: {
+          customer_name: { contains: query.search, mode: 'insensitive' },
+        },
+      },
+      {
+        order: { order_code: { contains: query.search, mode: 'insensitive' } },
+      },
+    ];
+  }
+
+  const historyInclude = {
+    order: {
+      select: {
+        id: true,
+        order_code: true,
+        customer_name: true,
+        order_status: true,
+        payment_status: true,
+        awaiting_finalization: true,
+      },
+    },
+    driver: { select: { id: true, name: true, phone: true } },
+    car: { select: { id: true, model: true, plate_number: true } },
+    external_vendor: { select: { id: true, name: true, phone: true } },
+    external_car: { select: { id: true, model: true, plate_number: true } },
+    payable: {
+      include: {
+        extras: {
+          select: { id: true, label: true, amount: true },
+          orderBy: { created_at: 'asc' as const },
+        },
+      },
+    },
+    reports: {
+      select: {
+        id: true,
+        report_type: true,
+        input_type: true,
+        notes: true,
+        file_url: true,
+        file_mime: true,
+        driver_phone: true,
+        status: true,
+        created_at: true,
+      },
+      orderBy: { created_at: 'asc' as const },
+    },
+  } satisfies Prisma.OrderServiceItemInclude;
+
+  const skip = (query.page - 1) * query.page_size;
+  const [rows, total] = await Promise.all([
+    prisma.orderServiceItem.findMany({
+      where,
+      include: historyInclude,
+      // Newest finished first: prefer actual dropoff time, fall back to date.
+      orderBy: [{ trip_finished_at: 'desc' }, { service_date: 'desc' }],
+      skip,
+      take: query.page_size,
+    }),
+    prisma.orderServiceItem.count({ where }),
+  ]);
+
+  const items = rows.map((it) => {
+    const finalized = it.order?.order_status === 'DONE';
+    return {
+      ...it,
+      finance_status: finalized ? 'FINALIZED' : 'AWAITING',
+    };
+  });
+
+  return {
+    items,
+    pagination: {
+      page: query.page,
+      page_size: query.page_size,
+      total,
+      total_pages: Math.ceil(total / query.page_size),
     },
   };
 }
