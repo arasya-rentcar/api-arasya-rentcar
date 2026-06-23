@@ -150,28 +150,37 @@ export async function assignScheduleLine(
   const isExternal = input.is_external ?? line.is_external;
 
   // Validate referenced entities exist (and respect internal/external mode).
+  // These reads are independent, so run them concurrently — over the Supabase
+  // pooler each serial round-trip costs ~1s, so parallelising the existence
+  // checks shaves real latency off every assign.
   if (!isExternal) {
-    if (input.driver_id) {
-      const d = await prisma.driver.findUnique({ where: { id: input.driver_id } });
-      if (!d) throw new AppError('Driver not found', 404);
-    }
-    if (input.car_id) {
-      const c = await prisma.car.findUnique({ where: { id: input.car_id } });
-      if (!c) throw new AppError('Car not found', 404);
-    }
+    const [d, c] = await Promise.all([
+      input.driver_id
+        ? prisma.driver.findUnique({ where: { id: input.driver_id } })
+        : Promise.resolve(null),
+      input.car_id
+        ? prisma.car.findUnique({ where: { id: input.car_id } })
+        : Promise.resolve(null),
+    ]);
+    if (input.driver_id && !d) throw new AppError('Driver not found', 404);
+    if (input.car_id && !c) throw new AppError('Car not found', 404);
   } else {
-    if (input.external_vendor_id) {
-      const v = await prisma.externalVendor.findUnique({
-        where: { id: input.external_vendor_id },
-      });
-      if (!v) throw new AppError('External vendor not found', 404);
-    }
-    if (input.external_car_id) {
-      const ec = await prisma.externalCar.findUnique({
-        where: { id: input.external_car_id },
-      });
-      if (!ec) throw new AppError('External car not found', 404);
-    }
+    const [v, ec] = await Promise.all([
+      input.external_vendor_id
+        ? prisma.externalVendor.findUnique({
+            where: { id: input.external_vendor_id },
+          })
+        : Promise.resolve(null),
+      input.external_car_id
+        ? prisma.externalCar.findUnique({
+            where: { id: input.external_car_id },
+          })
+        : Promise.resolve(null),
+    ]);
+    if (input.external_vendor_id && !v)
+      throw new AppError('External vendor not found', 404);
+    if (input.external_car_id && !ec)
+      throw new AppError('External car not found', 404);
   }
 
   const revenue = Number(line.total_price ?? 0);
@@ -243,21 +252,33 @@ export async function assignScheduleLine(
     await syncPayableForLine(tx, id);
     await rollupOrderFinance(tx, line.order_id);
 
-    // Batch 2: keep order status + driver/car resource status derived from the
-    // lines, all inside this same transaction so nothing can drift.
+    // Batch 2: keep order status derived from the lines inside this same
+    // transaction so order_status / awaiting_finalization never drift.
     await deriveAndSetOrderStatus(tx, line.order_id);
-
-    const driversToSync = new Set<string>();
-    const carsToSync = new Set<string>();
-    if (prevDriverId) driversToSync.add(prevDriverId);
-    if (u.driver_id) driversToSync.add(u.driver_id);
-    if (prevCarId) carsToSync.add(prevCarId);
-    if (u.car_id) carsToSync.add(u.car_id);
-    for (const d of driversToSync) await syncDriverStatus(tx, d);
-    for (const c of carsToSync) await syncCarStatus(tx, c);
 
     return u;
   }, { timeout: 20000, maxWait: 10000 });
+
+  // Driver/car ON_DUTY/AVAILABLE status is NOT on the critical path: the
+  // schedule timeline + stock derive free/busy from the lines themselves and
+  // only read driver.status for the hard OFF / MAINTENANCE down-flag (which
+  // these syncs never touch). So defer them to fire-and-forget AFTER commit,
+  // in parallel — each was several serial pooler round-trips (~1s each) and
+  // was the bulk of the assign latency. Idempotent, so a later run is safe.
+  const driversToSync = new Set<string>();
+  const carsToSync = new Set<string>();
+  if (prevDriverId) driversToSync.add(prevDriverId);
+  if (updated.driver_id) driversToSync.add(updated.driver_id);
+  if (prevCarId) carsToSync.add(prevCarId);
+  if (updated.car_id) carsToSync.add(updated.car_id);
+  if (driversToSync.size || carsToSync.size) {
+    void Promise.all([
+      ...[...driversToSync].map((d) => syncDriverStatus(prisma, d)),
+      ...[...carsToSync].map((c) => syncCarStatus(prisma, c)),
+    ]).catch((err) =>
+      console.error('deferred resource status sync failed', { lineId: id, err }),
+    );
+  }
 
   // #A1/#A2: same-day auto-send. Best-effort, never blocks the assign response.
   // Only fires when an internal driver+car are both set on the line.
