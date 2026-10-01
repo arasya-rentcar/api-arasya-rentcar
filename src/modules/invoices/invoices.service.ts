@@ -457,7 +457,12 @@ export async function markInvoicePaid(
     },
   });
   if (!invoice) throw new AppError("Invoice not found", 404);
-  if (invoice.status === "PAID") return invoice;
+  // Already paid: return the plain invoice row (the loaded order/customer
+  // carries personal data such as the NIK and must not reach the client).
+  if (invoice.status === "PAID") {
+    const { order: _order, ...plain } = invoice;
+    return plain;
+  }
   if (["REVISED", "CANCELLED"].includes(invoice.status)) {
     throw new AppError(
       `Cannot mark a ${invoice.status} invoice as paid`,
