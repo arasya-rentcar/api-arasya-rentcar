@@ -71,7 +71,7 @@ const COMPANY = {
   signerTitle: "Finance",
   bankLine:
     "Pembayaran transfer ditujukan kepada rekening:\n" +
-    "BCA 0954840782 a/n PT Ayomi Raya Karsa atau MANDIRI 1330015925837 a/n Q Ahmada Arifin",
+    "BCA 0954840782 a/n PT Ayomi Raya Karsa",
   overtimeTitle: "*Overtime*",
   overtimeNote:
     "Pemakaian melebihi durasi sewa (12 jam/Full day) atau lewat 23.00 dikenakan biaya overtime 10% per jam",
@@ -81,12 +81,12 @@ const COMPANY = {
     "(2) Pelunasan dibayarkan di hari pertama pelayanan.\n" +
     "(3) Tambahan overtime, reimburse parkir, atau biaya lain yang terjadi (jika ada), " +
     "dibayarkan maksimal H+2 dari selesai kegiatan",
-  // Newer cancellation policy (the 21.00-cutoff version from the kuitansi files).
+  // Same tiers as computeCancellationPenalty (orders.service) and the DP caption.
   cancellation:
     "Cancellation policy:\n" +
-    "Cancel sejak DP diterima sampai H-1 sebelum jam 21.00 = DP hangus.\n" +
-    "Cancel H-1 setelah jam 21.00 sampai hari H sebelum driver tiba di lokasi = 50% dari total invoice.\n" +
-    "Cancel hari H setelah driver tiba atau cancel di hari H setelah jam 10.00 pagi = 100% dari total invoice.",
+    "Cancel sebelum hari H = 20% dari total pesanan (DP hangus).\n" +
+    "Cancel hari H s.d. pukul 10.00 WIB (perjalanan belum dimulai) = 50% dari total pesanan.\n" +
+    "Cancel setelahnya = 100% dari total pesanan.",
   thankYou: "THANK YOU FOR YOUR BUSINESS!",
 };
 

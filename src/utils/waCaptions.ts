@@ -131,23 +131,25 @@ export function isSameDay(serviceDate: Date | null, ref: Date): boolean {
   return a.year === b.year && a.month === b.month && a.day === b.day;
 }
 
+// The only official account (owner decision). Never add personal accounts.
 const BANK_BLOCK = [
   "Pembayaran dapat ditransfer ke rekening:",
-  "",
-  "*Bank Central Asia (BCA)*",
-  "*0954840782*",
+  "*BCA 0954840782*",
   "a/n PT Ayomi Raya Karsa",
-  "",
-  "*MANDIRI*",
-  "*1330015925837*",
-  "a/n Q Ahmada Arifin",
 ];
+
+const CONTACT_LINE = "Info & konfirmasi: WhatsApp 0821-2402-4281 (Arasya Rent Car)";
+
+const CANCELLATION_LINE =
+  "Ketentuan pembatalan: sebelum hari H 20%, hari H s.d. pukul 10.00 WIB (perjalanan belum dimulai) 50%, setelahnya 100% dari total pesanan.";
 
 export interface CaptionCtx {
   duration: string; // formatted trip duration
   total: number; // total biaya sewa / order total
-  dp: number;
+  dp: number; // DP: this invoice's amount; settlement: the DP already paid
   sisa: number; // settlement = total - dp
+  amount?: number; // this invoice's amount (FULL / COMBINED bill it whole)
+  full?: boolean; // FULL / COMBINED: pay the whole amount, no DP split
   additionalTotal?: number;
   greeting: string;
   dpPaidAt?: Date | null;
@@ -156,24 +158,37 @@ export interface CaptionCtx {
 
 export function buildDpInvoiceCaption(c: CaptionCtx): string {
   const handover = c.sameDay
-    ? "Setelah DP kami terima, data mobil dan supir segera kami kirimkan ya kak."
-    : "Setelah DP kami terima, data mobil dan supir segera kami kirimkan maksimal *H-1* ya kak.";
+    ? `Setelah ${c.full ? "pembayaran" : "DP"} kami terima, data mobil dan supir segera kami kirimkan ya kak.`
+    : `Setelah ${c.full ? "pembayaran" : "DP"} kami terima, data mobil dan supir segera kami kirimkan maksimal *H-1* ya kak.`;
+  const payLines = c.full
+    ? [
+        `Jika sudah sesuai, silakan transfer senilai *${formatRp(c.amount ?? c.total)}*.`,
+      ]
+    : [
+        `Jika sudah sesuai, silakan transfer DP senilai *${formatRp(c.dp)}* (minimal DP 20%) pada saat pemesanan.`,
+      ];
   return [
     `Berikut saya kirimkan invoice trip *${c.duration}*. Mohon dicek kembali ya kak 🙏🏻😃`,
     "",
     `Total biaya sewa senilai *${formatRp(c.total)}*`,
     "",
-    `Jika sudah sesuai, silakan transfer minimal *DP 20%* atau senilai *${formatRp(c.dp)}* pada saat pemesanan.`,
+    ...payLines,
     "",
     ...BANK_BLOCK,
     "",
-    "Atau Scan QR kami diatas",
-    "a/n Arasya Rental Mobil",
+    "Atau scan QRIS resmi Arasya Rent Car di atas.",
     "",
     handover,
     "",
-    `Pelunasan senilai *${formatRp(c.sisa)}* dibayarkan saat mobil kami sudah sampai di lokasi penjemputan.`,
+    ...(c.full
+      ? []
+      : [
+          `Pelunasan senilai *${formatRp(c.sisa)}* dibayarkan saat mobil kami sudah sampai di lokasi penjemputan.`,
+          "",
+        ]),
+    CANCELLATION_LINE,
     "",
+    CONTACT_LINE,
     "Terima kasih 🙏🏻😃",
   ].join("\n");
 }
@@ -192,12 +207,9 @@ export function buildSettlementInvoiceCaption(c: CaptionCtx): string {
     "",
     `Pelunasan senilai *${formatRp(c.sisa)}* dibayarkan saat mobil kami sudah sampai di lokasi penjemputan.`,
     "",
-    "Pembayaran dapat ditransfer ke rekening:",
-    "*BCA 0954840782*",
-    "a/n PT Ayomi Raya Karsa",
-    "*MANDIRI 1330015925837*",
-    "a/n Q Ahmada Arifin",
+    ...BANK_BLOCK,
     "",
+    CONTACT_LINE,
     "Terima kasih 🙏🏻😃",
   ].join("\n");
 }
@@ -210,15 +222,9 @@ export function buildAdditionalInvoiceCaption(c: CaptionCtx): string {
     "",
     `Total tagihan: *${formatRp(c.additionalTotal ?? c.total)}*`,
     "",
-    "Pembayaran dapat ditransfer ke rekening:",
-    "*BCA*",
-    "*0954840782*",
-    "a/n PT Ayomi Raya Karsa",
+    ...BANK_BLOCK,
     "",
-    "*Mandiri*",
-    "*1330015925837*",
-    "a/n Q Ahmada Arifin",
-    "",
+    CONTACT_LINE,
     "Terima kasih 🙏🏻😃",
   ].join("\n");
 }

@@ -1036,8 +1036,11 @@ export async function sendInvoiceWhatsapp(
     0,
   );
   const rentalTotal = rentalBase > 0 ? rentalBase : amount;
-  const dpAmount = Math.round(rentalTotal * 0.2);
-  const settlementAmount = rentalTotal - dpAmount;
+  // DP caption quotes the DP invoice's actual amount; a settlement's own
+  // amount is what is still due (the paid DP is read below).
+  let dpAmount = invoice.invoice_type === "DP" ? amount : Math.round(rentalTotal * 0.2);
+  let settlementAmount =
+    invoice.invoice_type === "SETTLEMENT" ? amount : Math.max(rentalTotal - dpAmount, 0);
 
   // ── Sprint 2: per-type WhatsApp caption (bold, dynamic dates/greeting/H-1) ──
   const now = new Date();
@@ -1066,6 +1069,7 @@ export async function sendInvoiceWhatsapp(
       orderBy: { paid_at: "asc" },
     });
     dpPaidAt = dpInvoice?.paid_at ?? dpInvoice?.issue_date ?? null;
+    dpAmount = dpInvoice ? Number(dpInvoice.amount) : Math.max(rentalTotal - amount, 0);
   }
 
   const captionCtx = {
@@ -1073,6 +1077,8 @@ export async function sendInvoiceWhatsapp(
     total: rentalTotal,
     dp: dpAmount,
     sisa: settlementAmount,
+    amount,
+    full: invoice.invoice_type === "FULL" || invoice.invoice_type === "COMBINED",
     additionalTotal: amount,
     greeting,
     dpPaidAt,
