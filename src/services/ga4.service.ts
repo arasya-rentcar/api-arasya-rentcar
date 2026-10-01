@@ -15,6 +15,15 @@ export async function reportLeadPurchase(orderId: string): Promise<void> {
     include: { order: { select: { order_code: true, final_price: true } } },
   });
   if (!lead || !lead.order || lead.purchase_reported_at || !lead.ga_client_id) return;
+  // Claim the report first so two payments recorded at once cannot both send
+  // it; released again if Google does not accept it.
+  const claim = await prisma.webLead.updateMany({
+    where: { id: lead.id, purchase_reported_at: null },
+    data: { purchase_reported_at: new Date() },
+  });
+  if (claim.count === 0) return;
+  const release = () =>
+    prisma.webLead.update({ where: { id: lead.id }, data: { purchase_reported_at: null } });
 
   const params: Record<string, unknown> = {
     transaction_id: lead.order.order_code || lead.lead_code,
@@ -26,21 +35,24 @@ export async function reportLeadPurchase(orderId: string): Promise<void> {
   if (lead.ga_session_id) params.session_id = lead.ga_session_id;
 
   const url = `https://www.google-analytics.com/mp/collect?measurement_id=${encodeURIComponent(env.GA4_MEASUREMENT_ID)}&api_secret=${encodeURIComponent(env.GA4_API_SECRET)}`;
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      client_id: lead.ga_client_id,
-      events: [{ name: "purchase", params }],
-    }),
-  });
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        client_id: lead.ga_client_id,
+        events: [{ name: "purchase", params }],
+      }),
+    });
+  } catch (err) {
+    await release();
+    throw err;
+  }
   if (!res.ok) {
+    await release();
     logger.warn({ status: res.status, lead: lead.lead_code }, "GA4 purchase not accepted");
     return;
   }
-  await prisma.webLead.update({
-    where: { id: lead.id },
-    data: { purchase_reported_at: new Date() },
-  });
   logger.info({ lead: lead.lead_code, value: params.value }, "GA4 purchase reported");
 }

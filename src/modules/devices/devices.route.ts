@@ -1,5 +1,6 @@
 import { Router, Request, Response, NextFunction } from "express";
 import { z } from "zod";
+import { Prisma } from "@prisma/client";
 import prisma from "../../prisma/client";
 import { verifyTokenMiddleware } from "../../middleware/auth.middleware";
 
@@ -17,11 +18,16 @@ router.post("/", async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { token, platform } = registerSchema.parse(req.body);
     // A device that switches account moves to the new user.
-    await prisma.deviceToken.upsert({
-      where: { token },
-      create: { token, platform, user_id: req.user!.user_id },
-      update: { platform, user_id: req.user!.user_id, last_seen_at: new Date() },
-    });
+    const upsert = () =>
+      prisma.deviceToken.upsert({
+        where: { token },
+        create: { token, platform, user_id: req.user!.user_id },
+        update: { platform, user_id: req.user!.user_id, last_seen_at: new Date() },
+      });
+    // Two registrations of the same token at once: the loser retries as an update.
+    await upsert().catch((err) =>
+      err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002" ? upsert() : Promise.reject(err),
+    );
     res.status(204).end();
   } catch (err) {
     next(err);

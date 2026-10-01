@@ -43,13 +43,16 @@ router.get("/me", async (req, res, next) => {
 });
 router.get("/trips", h((req, id) => listTrips(id, tripsQuerySchema.parse(req.query).scope)));
 router.get("/trips/:id", h((req, id) => getTrip(id, req.params.id)));
-const at = (req: Request) => actionSchema.parse(req.body ?? {}).occurred_at;
-router.post("/trips/:id/accept", h((req, id) => acceptTrip(id, req.params.id, at(req))));
-router.post("/trips/:id/start", h((req, id) => startTrip(id, req.params.id, at(req))));
-router.post("/trips/:id/arrive", h((req, id) => arriveTrip(id, req.params.id, at(req))));
+const opts = (req: Request) => {
+  const b = actionSchema.parse(req.body ?? {});
+  return { occurredAt: b.occurred_at, clientRef: b.client_ref };
+};
+router.post("/trips/:id/accept", h((req, id) => acceptTrip(id, req.params.id, opts(req).occurredAt)));
+router.post("/trips/:id/start", h((req, id) => startTrip(id, req.params.id, opts(req))));
+router.post("/trips/:id/arrive", h((req, id) => arriveTrip(id, req.params.id, opts(req))));
 router.post("/trips/:id/finish", h((req, id) => {
-  const body = finishSchema.parse(req.body ?? {});
-  return finishTrip(id, req.params.id, body.notes, body.occurred_at);
+  const b = finishSchema.parse(req.body ?? {});
+  return finishTrip(id, req.params.id, { notes: b.notes, occurredAt: b.occurred_at, clientRef: b.client_ref });
 }));
 router.post(
   "/trips/:id/reports",

@@ -8,11 +8,15 @@ export const tripsQuerySchema = z.object({
 // are sent later; this keeps the recorded time true to what happened.
 const occurredAt = z.string().datetime({ offset: true }).optional();
 
-export const actionSchema = z.object({ occurred_at: occurredAt });
+// Idempotency key from the phone: resending the same action is a no-op.
+const clientRef = z.string().uuid().optional();
+
+export const actionSchema = z.object({ occurred_at: occurredAt, client_ref: clientRef });
 
 export const finishSchema = z.object({
   notes: z.string().trim().max(1000).optional(),
   occurred_at: occurredAt,
+  client_ref: clientRef,
 });
 
 export const reportSchema = z.object({

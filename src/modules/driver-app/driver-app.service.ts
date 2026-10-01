@@ -168,29 +168,31 @@ export function eventTime(occurredAt?: string): Date {
 export async function acceptTrip(driverId: string, lineId: string, occurredAt?: string) {
   const line = await ownLine(driverId, lineId);
   if (line.line_status === "CANCELLED") throw new AppError("Trip was cancelled", 409);
-  if (!line.driver_accepted_at) {
-    await prisma.orderServiceItem.update({
-      where: { id: lineId },
-      data: { driver_accepted_at: eventTime(occurredAt) },
-    });
-  }
+  await applyOnce(line, driverId, {
+    guard: { driver_accepted_at: null, line_status: { not: "CANCELLED" } },
+    data: { driver_accepted_at: eventTime(occurredAt) },
+  });
   return toTrip(await ownLine(driverId, lineId));
 }
 
 /** Depart the garage: IN_PROGRESS + journey timestamps, like the bot's #start. */
-export async function startTrip(driverId: string, lineId: string, occurredAt?: string) {
+export async function startTrip(driverId: string, lineId: string, opts: ActionOpts = {}) {
   const line = await ownLine(driverId, lineId);
   if (TERMINAL.includes(line.line_status))
     throw new AppError(`Trip is already ${line.line_status === "DONE" ? "finished" : "cancelled"}`, 409);
-  if (line.line_status !== "IN_PROGRESS") {
-    const now = eventTime(occurredAt);
-    await transition(lineId, line.order_id, {
+  const now = eventTime(opts.occurredAt);
+  const applied = await applyOnce(line, driverId, {
+    guard: { line_status: { in: ["SCHEDULED", "ASSIGNED"] } },
+    data: {
       line_status: "IN_PROGRESS",
       driver_accepted_at: line.driver_accepted_at ?? now,
       ...(line.trip_started_at ? {} : { trip_started_at: now }),
       ...(line.actual_start_at ? {} : { actual_start_at: now }),
-    });
-    await systemReport(line, driverId, "START", "Berangkat (aplikasi driver)", now);
+    },
+    derive: true,
+    report: { type: "START", notes: "Berangkat (aplikasi driver)", at: now, clientRef: opts.clientRef },
+  });
+  if (applied) {
     await refreshOrderSummary(line.order_id);
     void pushToAdmins({
       title: `Driver berangkat · ${line.order.order_code ?? ""}`.trim(),
@@ -202,18 +204,21 @@ export async function startTrip(driverId: string, lineId: string, occurredAt?: s
 }
 
 /** Arrived at the pickup point. */
-export async function arriveTrip(driverId: string, lineId: string, occurredAt?: string) {
+export async function arriveTrip(driverId: string, lineId: string, opts: ActionOpts = {}) {
   const line = await ownLine(driverId, lineId);
   if (TERMINAL.includes(line.line_status))
     throw new AppError(`Trip is already ${line.line_status === "DONE" ? "finished" : "cancelled"}`, 409);
-  if (!line.actual_pickup_at) {
-    const now = eventTime(occurredAt);
-    await prisma.orderServiceItem.update({
-      where: { id: lineId },
-      data: { actual_pickup_at: now, driver_accepted_at: line.driver_accepted_at ?? now },
-    });
-    await systemReport(line, driverId, "ARRIVE_CUSTOMER", "Tiba di lokasi jemput (aplikasi driver)", now);
-  }
+  const now = eventTime(opts.occurredAt);
+  await applyOnce(line, driverId, {
+    guard: { actual_pickup_at: null, line_status: { notIn: TERMINAL } },
+    data: { actual_pickup_at: now, driver_accepted_at: line.driver_accepted_at ?? now },
+    report: {
+      type: "ARRIVE_CUSTOMER",
+      notes: "Tiba di lokasi jemput (aplikasi driver)",
+      at: now,
+      clientRef: opts.clientRef,
+    },
+  });
   return toTrip(await ownLine(driverId, lineId));
 }
 
@@ -221,22 +226,30 @@ export async function arriveTrip(driverId: string, lineId: string, occurredAt?: 
 export async function finishTrip(
   driverId: string,
   lineId: string,
-  notes?: string,
-  occurredAt?: string,
+  opts: ActionOpts & { notes?: string } = {},
 ) {
   const line = await ownLine(driverId, lineId);
   if (line.line_status === "CANCELLED") throw new AppError("Trip was cancelled", 409);
-  if (line.line_status !== "DONE") {
-    const now = eventTime(occurredAt);
-    await transition(lineId, line.order_id, {
+  const now = eventTime(opts.occurredAt);
+  const applied = await applyOnce(line, driverId, {
+    guard: { line_status: { in: ["SCHEDULED", "ASSIGNED", "IN_PROGRESS"] } },
+    data: {
       line_status: "DONE",
       driver_accepted_at: line.driver_accepted_at ?? now,
       ...(line.trip_started_at ? {} : { trip_started_at: now }),
       trip_finished_at: now,
       // When the finish reached the server (may be later than the drop-off).
       finish_reported_at: new Date(),
-    });
-    await systemReport(line, driverId, "FINISH", notes?.trim() || "Selesai (aplikasi driver)", now);
+    },
+    derive: true,
+    report: {
+      type: "FINISH",
+      notes: opts.notes?.trim() || "Selesai (aplikasi driver)",
+      at: now,
+      clientRef: opts.clientRef,
+    },
+  });
+  if (applied) {
     await refreshOrderSummary(line.order_id);
     void pushToAdmins({
       title: `Trip selesai · ${line.order.order_code ?? ""}`.trim(),
@@ -247,45 +260,77 @@ export async function finishTrip(
   return toTrip(await ownLine(driverId, lineId));
 }
 
-async function transition(
-  lineId: string,
-  orderId: string,
-  data: Prisma.OrderServiceItemUncheckedUpdateInput,
-) {
-  await prisma.$transaction(async (tx) => {
-    const updated = await tx.orderServiceItem.update({
-      where: { id: lineId },
-      data,
-      select: { driver_id: true, car_id: true },
-    });
-    await deriveAndSetOrderStatus(tx, orderId);
-    if (updated.driver_id) await syncDriverStatus(tx, updated.driver_id);
-    if (updated.car_id) await syncCarStatus(tx, updated.car_id);
-  }, { maxWait: 15000, timeout: 30000 });
+export interface ActionOpts {
+  occurredAt?: string;
+  /** Idempotency key from the phone (the queued item's id). */
+  clientRef?: string;
 }
 
-async function systemReport(
+function isUniqueViolation(err: unknown): boolean {
+  return err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002";
+}
+
+/**
+ * Apply a trip action exactly once, even when the phone resends it (lost
+ * response, background + foreground sync) or two copies arrive at the same
+ * moment:
+ *  - an action whose client_ref is already stored is a no-op;
+ *  - the line update is conditional (`guard`), so a concurrent duplicate
+ *    matches no row once the first one commits;
+ *  - the action's report row carries the client_ref (unique), and is written
+ *    in the same transaction, so it cannot be recorded twice either.
+ * Returns true only for the request that actually applied the change.
+ */
+async function applyOnce(
   line: LineWithTrip,
   driverId: string,
-  type: string,
-  notes: string,
-  at: Date,
-) {
-  await prisma.tripReport.create({
-    data: {
-      order_id: line.order_id,
-      order_service_item_id: line.id,
-      order_code: line.order.order_code,
-      driver_id: driverId,
-      report_type: type,
-      input_type: "TEXT",
-      notes,
-      match_method: "driver app",
-      source: "API",
-      status: "MATCHED",
-      created_at: at,
-    },
-  });
+  step: {
+    guard: Prisma.OrderServiceItemWhereInput;
+    data: Prisma.OrderServiceItemUncheckedUpdateManyInput;
+    derive?: boolean;
+    report?: { type: string; notes: string; at: Date; clientRef?: string };
+  },
+): Promise<boolean> {
+  const clientRef = step.report?.clientRef;
+  if (clientRef && (await prisma.tripReport.findUnique({ where: { client_ref: clientRef } }))) {
+    return false;
+  }
+  try {
+    return await prisma.$transaction(async (tx) => {
+      const { count } = await tx.orderServiceItem.updateMany({
+        where: { id: line.id, driver_id: driverId, ...step.guard },
+        data: step.data,
+      });
+      if (count === 0) return false;
+      if (step.report) {
+        await tx.tripReport.create({
+          data: {
+            order_id: line.order_id,
+            order_service_item_id: line.id,
+            order_code: line.order.order_code,
+            driver_id: driverId,
+            report_type: step.report.type,
+            input_type: "TEXT",
+            notes: step.report.notes,
+            match_method: "driver app",
+            source: "API",
+            status: "MATCHED",
+            created_at: step.report.at,
+            client_ref: clientRef ?? null,
+          },
+        });
+      }
+      if (step.derive) {
+        await deriveAndSetOrderStatus(tx, line.order_id);
+        if (line.driver_id) await syncDriverStatus(tx, line.driver_id);
+        if (line.car_id) await syncCarStatus(tx, line.car_id);
+      }
+      return true;
+    }, { maxWait: 15000, timeout: 30000 });
+  } catch (err) {
+    if (isUniqueViolation(err)) return false; // the same action won a race
+    throw err;
+  }
 }
 
 /**
@@ -325,7 +370,9 @@ export async function addReport(
   const amount = (costType || isOdometer) && input.amount ? input.amount : null;
 
   const at = eventTime(input.occurred_at);
-  const report = await prisma.$transaction(async (tx) => {
+  let report;
+  try {
+    report = await prisma.$transaction(async (tx) => {
     const r = await tx.tripReport.create({
       data: {
         order_id: line.order_id,
@@ -357,7 +404,14 @@ export async function addReport(
       });
     }
     return r;
-  });
+    });
+  } catch (err) {
+    // Two copies of the same upload at once: the other one was stored.
+    if (!isUniqueViolation(err)) throw err;
+    const stored = await prisma.tripReport.findUnique({ where: { client_ref: input.client_ref } });
+    if (!stored) throw err;
+    return toReport(stored);
+  }
   await refreshOrderSummary(line.order_id);
   return toReport(report);
 }
