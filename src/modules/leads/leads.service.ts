@@ -30,6 +30,70 @@ export async function createPublicLead(input: PublicLeadInput) {
   }
 }
 
+// ── Requested unit vs own fleet (the rest is fulfilled via partner/rekanan) ──
+// Brand names and filler words say nothing about which car it is.
+const UNIT_NOISE = new Set([
+  "toyota", "suzuki", "mitsubishi", "daihatsu", "isuzu", "honda", "nissan",
+  "hyundai", "wuling", "mercedes", "benz", "hybrid", "modellista", "new",
+  "all", "grand", "the", "mobil", "unit", "type", "tipe", "seat", "seater",
+  "kursi", "pax", "orang", "penumpang", "dengan", "driver", "supir", "sopir",
+  "manual", "matic", "automatic", "bensin", "diesel", "atau", "and", "dan",
+]);
+// Known model words: when the request names one, only these decide the match.
+const UNIT_MODELS = new Set([
+  "avanza", "xenia", "veloz", "ertiga", "xpander", "terios", "rush", "innova",
+  "reborn", "venturer", "zenix", "fortuner", "pajero", "hiace", "commuter",
+  "premio", "alphard", "vellfire", "elf", "giga", "calya", "sigra", "brio",
+  "mobilio", "livina", "camry", "starex", "staria",
+]);
+
+function words(v: string): string[] {
+  return v.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+}
+
+/** The words that identify the car in each alternative of a requested unit. */
+function unitKeys(unit: string): string[][] {
+  return unit
+    .split(/\/|,|\bor\b|\batau\b/i)
+    .map((alt) => {
+      const w = words(alt);
+      const models = w.filter((x) => UNIT_MODELS.has(x));
+      return models.length
+        ? models
+        : w.filter((x) => x.length >= 3 && !UNIT_NOISE.has(x) && !/^\d+$/.test(x));
+    })
+    .filter((k) => k.length > 0);
+}
+
+type FleetCar = { id: string; model: string; plate_number: string };
+
+/** All own (internal) cars that can be rented, read once per request. */
+function ownFleet(): Promise<FleetCar[]> {
+  return prisma.car.findMany({
+    where: { type: "INTERNAL", status: { not: "MAINTENANCE" } },
+    select: { id: true, model: true, plate_number: true },
+    orderBy: { model: "asc" },
+  });
+}
+
+/**
+ * unit_in_fleet: null when the lead names no unit, true when an own car's
+ * model carries every identifying word of the request (e.g. "Toyota Innova
+ * Reborn" matches "Innova Reborn 2.4 G", not "Innova Zenix"), else false,
+ * meaning the trip goes to a partner (rekanan) vendor.
+ */
+function fleetMatch(unit: string | null, fleet: FleetCar[]) {
+  const keys = unit ? unitKeys(unit) : [];
+  if (!keys.length) return { unit_in_fleet: null, matching_cars: [] as FleetCar[] };
+  const matching_cars = fleet
+    .filter((car) => {
+      const have = new Set(words(car.model));
+      return keys.some((k) => k.every((w) => have.has(w)));
+    })
+    .slice(0, 5);
+  return { unit_in_fleet: matching_cars.length > 0, matching_cars };
+}
+
 export async function listLeads(query: ListLeadsQuery) {
   const where: Prisma.WebLeadWhereInput = {
     ...(query.status ? { status: query.status } : {}),
@@ -44,7 +108,7 @@ export async function listLeads(query: ListLeadsQuery) {
         }
       : {}),
   };
-  const [data, total, counts] = await Promise.all([
+  const [data, total, counts, fleet] = await Promise.all([
     prisma.webLead.findMany({
       where,
       orderBy: { created_at: "desc" },
@@ -64,9 +128,10 @@ export async function listLeads(query: ListLeadsQuery) {
     }),
     prisma.webLead.count({ where }),
     prisma.webLead.groupBy({ by: ["status"], _count: { _all: true } }),
+    ownFleet(),
   ]);
   return {
-    data,
+    data: data.map((lead) => ({ ...lead, ...fleetMatch(lead.unit, fleet) })),
     meta: {
       page: query.page,
       limit: query.limit,
@@ -77,7 +142,7 @@ export async function listLeads(query: ListLeadsQuery) {
   };
 }
 
-export async function getLead(id: string) {
+async function findLead(id: string) {
   const lead = await prisma.webLead.findUnique({
     where: { id },
     include: { order: { select: { id: true, order_code: true } } },
@@ -86,8 +151,13 @@ export async function getLead(id: string) {
   return lead;
 }
 
+export async function getLead(id: string) {
+  const [lead, fleet] = await Promise.all([findLead(id), ownFleet()]);
+  return { ...lead, ...fleetMatch(lead.unit, fleet) };
+}
+
 export async function ignoreLead(id: string, reason?: string) {
-  const lead = await getLead(id);
+  const lead = await findLead(id);
   if (lead.status === "CONVERTED")
     throw new AppError("Lead is already linked to an order", 409);
   return prisma.webLead.update({
@@ -97,7 +167,7 @@ export async function ignoreLead(id: string, reason?: string) {
 }
 
 export async function reopenLead(id: string) {
-  const lead = await getLead(id);
+  const lead = await findLead(id);
   if (lead.status !== "IGNORED") return lead;
   return prisma.webLead.update({
     where: { id },
