@@ -23,10 +23,11 @@ export const authLimiter = rateLimit({
   },
 });
 
-// Public lead intake (website booking form): a person sends a few at most.
+// Public lead intake (website booking form): a person sends a few at most,
+// but many visitors can share one carrier-NAT IP.
 export const publicLeadLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  limit: 10,
+  limit: 30,
   standardHeaders: 'draft-7',
   legacyHeaders: false,
   message: { status: 'error', message: 'Too many requests, please try again later.' },

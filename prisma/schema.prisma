@@ -787,6 +787,8 @@ model WebLead {
   unit                 String?
   passenger_count      Int?
   duration             String?
+  /// Website's duration choice: 12h | allin | oneway | return | multi.
+  duration_key         String?
   notes                String?
   page_path            String?
   language             String?
