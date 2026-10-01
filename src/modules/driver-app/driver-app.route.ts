@@ -1,7 +1,7 @@
 import { Router, Request, Response, NextFunction } from "express";
 import multer from "multer";
 import { verifyTokenMiddleware, requireRole } from "../../middleware/auth.middleware";
-import { finishSchema, reportSchema, tripsQuerySchema } from "./driver-app.validation";
+import { actionSchema, finishSchema, reportSchema, tripsQuerySchema } from "./driver-app.validation";
 import {
   acceptTrip,
   addReport,
@@ -43,13 +43,14 @@ router.get("/me", async (req, res, next) => {
 });
 router.get("/trips", h((req, id) => listTrips(id, tripsQuerySchema.parse(req.query).scope)));
 router.get("/trips/:id", h((req, id) => getTrip(id, req.params.id)));
-router.post("/trips/:id/accept", h((req, id) => acceptTrip(id, req.params.id)));
-router.post("/trips/:id/start", h((req, id) => startTrip(id, req.params.id)));
-router.post("/trips/:id/arrive", h((req, id) => arriveTrip(id, req.params.id)));
-router.post(
-  "/trips/:id/finish",
-  h((req, id) => finishTrip(id, req.params.id, finishSchema.parse(req.body ?? {}).notes)),
-);
+const at = (req: Request) => actionSchema.parse(req.body ?? {}).occurred_at;
+router.post("/trips/:id/accept", h((req, id) => acceptTrip(id, req.params.id, at(req))));
+router.post("/trips/:id/start", h((req, id) => startTrip(id, req.params.id, at(req))));
+router.post("/trips/:id/arrive", h((req, id) => arriveTrip(id, req.params.id, at(req))));
+router.post("/trips/:id/finish", h((req, id) => {
+  const body = finishSchema.parse(req.body ?? {});
+  return finishTrip(id, req.params.id, body.notes, body.occurred_at);
+}));
 router.post(
   "/trips/:id/reports",
   upload.single("photo"),

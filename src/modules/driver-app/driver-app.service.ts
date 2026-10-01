@@ -153,32 +153,44 @@ function toReport(r: Prisma.TripReportGetPayload<object>) {
 
 const TERMINAL: ScheduleStatus[] = ["DONE", "CANCELLED"];
 
-export async function acceptTrip(driverId: string, lineId: string) {
+/**
+ * The time to record for an action: the phone's own timestamp (actions made
+ * offline arrive later), bounded to the last 7 days and never in the future,
+ * so a wrong phone clock cannot push records far off.
+ */
+export function eventTime(occurredAt?: string): Date {
+  const now = Date.now();
+  const t = occurredAt ? Date.parse(occurredAt) : NaN;
+  if (!Number.isFinite(t)) return new Date(now);
+  return new Date(Math.min(now, Math.max(t, now - 7 * 86400000)));
+}
+
+export async function acceptTrip(driverId: string, lineId: string, occurredAt?: string) {
   const line = await ownLine(driverId, lineId);
   if (line.line_status === "CANCELLED") throw new AppError("Trip was cancelled", 409);
   if (!line.driver_accepted_at) {
     await prisma.orderServiceItem.update({
       where: { id: lineId },
-      data: { driver_accepted_at: new Date() },
+      data: { driver_accepted_at: eventTime(occurredAt) },
     });
   }
   return toTrip(await ownLine(driverId, lineId));
 }
 
 /** Depart the garage: IN_PROGRESS + journey timestamps, like the bot's #start. */
-export async function startTrip(driverId: string, lineId: string) {
+export async function startTrip(driverId: string, lineId: string, occurredAt?: string) {
   const line = await ownLine(driverId, lineId);
   if (TERMINAL.includes(line.line_status))
     throw new AppError(`Trip is already ${line.line_status === "DONE" ? "finished" : "cancelled"}`, 409);
   if (line.line_status !== "IN_PROGRESS") {
-    const now = new Date();
+    const now = eventTime(occurredAt);
     await transition(lineId, line.order_id, {
       line_status: "IN_PROGRESS",
       driver_accepted_at: line.driver_accepted_at ?? now,
       ...(line.trip_started_at ? {} : { trip_started_at: now }),
       ...(line.actual_start_at ? {} : { actual_start_at: now }),
     });
-    await systemReport(line, driverId, "START", "Berangkat (aplikasi driver)");
+    await systemReport(line, driverId, "START", "Berangkat (aplikasi driver)", now);
     await refreshOrderSummary(line.order_id);
     void pushToAdmins({
       title: `Driver berangkat · ${line.order.order_code ?? ""}`.trim(),
@@ -190,35 +202,41 @@ export async function startTrip(driverId: string, lineId: string) {
 }
 
 /** Arrived at the pickup point. */
-export async function arriveTrip(driverId: string, lineId: string) {
+export async function arriveTrip(driverId: string, lineId: string, occurredAt?: string) {
   const line = await ownLine(driverId, lineId);
   if (TERMINAL.includes(line.line_status))
     throw new AppError(`Trip is already ${line.line_status === "DONE" ? "finished" : "cancelled"}`, 409);
   if (!line.actual_pickup_at) {
-    const now = new Date();
+    const now = eventTime(occurredAt);
     await prisma.orderServiceItem.update({
       where: { id: lineId },
       data: { actual_pickup_at: now, driver_accepted_at: line.driver_accepted_at ?? now },
     });
-    await systemReport(line, driverId, "ARRIVE_CUSTOMER", "Tiba di lokasi jemput (aplikasi driver)");
+    await systemReport(line, driverId, "ARRIVE_CUSTOMER", "Tiba di lokasi jemput (aplikasi driver)", now);
   }
   return toTrip(await ownLine(driverId, lineId));
 }
 
 /** Drop-off / done, like the bot's #finish (order then awaits finalization). */
-export async function finishTrip(driverId: string, lineId: string, notes?: string) {
+export async function finishTrip(
+  driverId: string,
+  lineId: string,
+  notes?: string,
+  occurredAt?: string,
+) {
   const line = await ownLine(driverId, lineId);
   if (line.line_status === "CANCELLED") throw new AppError("Trip was cancelled", 409);
   if (line.line_status !== "DONE") {
-    const now = new Date();
+    const now = eventTime(occurredAt);
     await transition(lineId, line.order_id, {
       line_status: "DONE",
       driver_accepted_at: line.driver_accepted_at ?? now,
       ...(line.trip_started_at ? {} : { trip_started_at: now }),
       trip_finished_at: now,
-      finish_reported_at: now,
+      // When the finish reached the server (may be later than the drop-off).
+      finish_reported_at: new Date(),
     });
-    await systemReport(line, driverId, "FINISH", notes?.trim() || "Selesai (aplikasi driver)");
+    await systemReport(line, driverId, "FINISH", notes?.trim() || "Selesai (aplikasi driver)", now);
     await refreshOrderSummary(line.order_id);
     void pushToAdmins({
       title: `Trip selesai · ${line.order.order_code ?? ""}`.trim(),
@@ -246,7 +264,13 @@ async function transition(
   }, { maxWait: 15000, timeout: 30000 });
 }
 
-async function systemReport(line: LineWithTrip, driverId: string, type: string, notes: string) {
+async function systemReport(
+  line: LineWithTrip,
+  driverId: string,
+  type: string,
+  notes: string,
+  at: Date,
+) {
   await prisma.tripReport.create({
     data: {
       order_id: line.order_id,
@@ -259,6 +283,7 @@ async function systemReport(line: LineWithTrip, driverId: string, type: string, 
       match_method: "driver app",
       source: "API",
       status: "MATCHED",
+      created_at: at,
     },
   });
 }
@@ -299,6 +324,7 @@ export async function addReport(
   const isOdometer = input.report_type.startsWith("ODOMETER");
   const amount = (costType || isOdometer) && input.amount ? input.amount : null;
 
+  const at = eventTime(input.occurred_at);
   const report = await prisma.$transaction(async (tx) => {
     const r = await tx.tripReport.create({
       data: {
@@ -316,6 +342,7 @@ export async function addReport(
         match_method: "driver app",
         source: "API",
         status: "MATCHED",
+        created_at: at,
       },
     });
     if (costType && amount) {
@@ -325,6 +352,7 @@ export async function addReport(
           type: costType,
           amount,
           note: input.notes ?? null,
+          created_at: at,
         },
       });
     }
