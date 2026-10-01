@@ -1,0 +1,41 @@
+name: Keep Supabase awake
+
+# Free Supabase projects pause after about a week without database activity.
+# This runs a trivial read every 3 days so the project stays active even when
+# the API is not running. It fails (and GitHub emails the owner) if the
+# database cannot be reached, e.g. because the project was paused anyway.
+#
+# Required repository secret: SUPABASE_KEEPALIVE_DB_URL — a Postgres
+# connection string. Use the "Session pooler" string from Supabase → Connect
+# (GitHub runners have no IPv6, so the direct db.<ref>.supabase.co host fails).
+# Best practice: a dedicated read-only login (see README / ask the admin).
+#
+# Note: this repository is public, so the log shows nothing but "ok".
+
+on:
+  schedule:
+    - cron: "17 2 */3 * *" # every 3 days, 02:17 UTC
+  workflow_dispatch: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Read from the database
+        env:
+          DB_URL: ${{ secrets.SUPABASE_KEEPALIVE_DB_URL }}
+        run: |
+          if [ -z "$DB_URL" ]; then
+            echo "::error::Repository secret SUPABASE_KEEPALIVE_DB_URL is not set"
+            exit 1
+          fi
+          for attempt in 1 2 3; do
+            if psql "$DB_URL" -v ON_ERROR_STOP=1 -qtAc "select 1" > /dev/null 2>&1; then
+              echo "ok"
+              exit 0
+            fi
+            sleep 20
+          done
+          echo "::error::Could not reach the database (paused project or wrong connection string)"
+          exit 1
