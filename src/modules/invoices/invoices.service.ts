@@ -1,3 +1,4 @@
+import { waLink, waManual } from "../../utils/waManual";
 import { reportLeadPurchase } from "../../services/ga4.service";
 import prisma from "../../prisma/client";
 import { AppError } from "../../utils/AppError";
@@ -1114,6 +1115,24 @@ export async function sendInvoiceWhatsapp(
     },
   });
 
+  // Manual mode: no bot. Hand the admin a wa.me link with the message and
+  // the PDF link; the delivery is logged as sent when the link is issued.
+  if (waManual()) {
+    const pdf = invoice.file_url;
+    const text = pdf ? `${messageText}\n\nInvoice (PDF): ${pdf}` : messageText;
+    const sent = await prisma.invoiceDeliveryLog.update({
+      where: { id: log.id },
+      data: {
+        status: "SENT",
+        message_text: text,
+        provider_message_id: "manual-wa-link",
+        sent_at: new Date(),
+        error_message: null,
+      },
+    });
+    return { ...sent, wa_url: waLink(targetPhone, text) };
+  }
+
   try {
     const token = botToken();
     if (!token) throw new Error("WA bot internal token is not configured");
@@ -1251,6 +1270,24 @@ export async function sendReceiptWhatsapp(
       sent_by_user_id: sentByUserId,
     },
   });
+
+  // Manual mode: no bot. Hand the admin a wa.me link with the message and
+  // the PDF link; the delivery is logged as sent when the link is issued.
+  if (waManual()) {
+    const pdf = receiptPdfUrl;
+    const text = pdf ? `${messageText}\n\nKuitansi (PDF): ${pdf}` : messageText;
+    const sent = await prisma.invoiceDeliveryLog.update({
+      where: { id: log.id },
+      data: {
+        status: "SENT",
+        message_text: text,
+        provider_message_id: "manual-wa-link",
+        sent_at: new Date(),
+        error_message: null,
+      },
+    });
+    return { ...sent, wa_url: waLink(targetPhone, text) };
+  }
 
   try {
     const token = botToken();

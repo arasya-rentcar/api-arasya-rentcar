@@ -1,3 +1,4 @@
+import { notifyNewTrips, notifyTripsRemoved } from '../../services/tripNotify';
 import prisma from '../../prisma/client';
 import { AppError } from '../../utils/AppError';
 import { computeLineMargin, MARGIN_FORMULA_VERSION } from '../../utils/margin';
@@ -281,6 +282,14 @@ export async function assignScheduleLine(
     );
   }
 
+  // Driver app: tell the new driver (and a replaced one) about the change.
+  if (!updated.is_external && updated.driver_id && updated.driver_id !== prevDriverId) {
+    void notifyNewTrips(updated.driver_id, [id]);
+  }
+  if (prevDriverId && prevDriverId !== updated.driver_id) {
+    void notifyTripsRemoved(prevDriverId, [id]);
+  }
+
   // #A1/#A2: same-day auto-send. Best-effort, never blocks the assign response.
   // Only fires when an internal driver+car are both set on the line.
   if (!updated.is_external && updated.driver_id && updated.car_id) {
@@ -411,7 +420,7 @@ export async function driverAvailability(query: DriverAvailabilityQuery) {
  */
 export async function scheduleStock(query: { date?: string }) {
   const { start, end } = dayBounds(query.date);
-  const ACTIVE: ScheduleStatus[] = ['SCHEDULED', 'IN_PROGRESS'];
+  const ACTIVE: ScheduleStatus[] = ['SCHEDULED', 'ASSIGNED', 'IN_PROGRESS'];
 
   const [drivers, cars, lines] = await Promise.all([
     prisma.driver.findMany({
@@ -588,7 +597,7 @@ export async function scheduleWeek(query: ScheduleWeekQuery) {
   });
   const windowStart = dayBounds(days[0]).start;
   const windowEnd = dayBounds(days[6]).end;
-  const ACTIVE: ScheduleStatus[] = ['SCHEDULED', 'IN_PROGRESS'];
+  const ACTIVE: ScheduleStatus[] = ['SCHEDULED', 'ASSIGNED', 'IN_PROGRESS'];
 
   const [drivers, cars, lines] = await Promise.all([
     prisma.driver.findMany({

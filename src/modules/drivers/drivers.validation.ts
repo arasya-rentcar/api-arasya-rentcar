@@ -18,3 +18,7 @@ export const updateDriverSchema = z.object({
 
 export type CreateDriverInput = z.infer<typeof createDriverSchema>;
 export type UpdateDriverInput = z.infer<typeof updateDriverSchema>;
+
+export const setAppPasswordSchema = z.object({
+  password: z.string().min(6, 'Password must be at least 6 characters').max(100),
+});

@@ -1,3 +1,4 @@
+import { hashPassword } from '../../utils/password';
 import prisma from '../../prisma/client';
 import { AppError } from '../../utils/AppError';
 import { CreateDriverInput, UpdateDriverInput } from './drivers.validation';
@@ -203,4 +204,14 @@ export async function getMyActiveTrip(userId: string) {
   });
 
   return line;
+}
+
+/** Set the password the driver uses (with their phone number) in the app. */
+export async function setDriverAppPassword(driverId: string, password: string) {
+  const driver = await prisma.driver.findUnique({ where: { id: driverId } });
+  if (!driver) throw new AppError('Driver not found', 404);
+  await prisma.user.update({
+    where: { id: driver.user_id },
+    data: { password: await hashPassword(password) },
+  });
 }

@@ -1,3 +1,4 @@
+import { notifyNewTrips } from "../../services/tripNotify";
 import { DriverType, Prisma } from "@prisma/client";
 import prisma from "../../prisma/client";
 import { AppError } from "../../utils/AppError";
@@ -31,11 +32,11 @@ function phoneVariants(phone = ""): string[] {
   const n = normalizePhone(phone);
   if (!n) return [];
   const local = n.startsWith("62") ? `0${n.slice(2)}` : n;
-  return Array.from(new Set([phone, n, local].filter(Boolean)));
+  return Array.from(new Set([phone, n, `+${n}`, local].filter(Boolean)));
 }
 
 function reportTypeIsDocument(type = ""): boolean {
-  return /DOCUMENT|PDF|ETOLL|ODOMETER|SUMMARY|EXPENSE/i.test(type);
+  return /DOCUMENT|PDF|ETOLL|ODOMETER|SUMMARY|EXPENSE|FUEL|TOLL|PARKING|OTHER_COST/i.test(type);
 }
 
 function reportTypeIsPhoto(type = ""): boolean {
@@ -412,7 +413,11 @@ export async function assignBotOrder(
   // has no driver yet inherits this driver+car and flips to ASSIGNED. Order
   // status + driver/car status are then derived from the lines. For multi-day
   // orders with per-day drivers, the Schedule page overrides individual days.
-  return prisma.$transaction(async (tx) => {
+  const newLines = await prisma.orderServiceItem.findMany({
+    where: { order_id: order.id, is_external: false, driver_id: null },
+    select: { id: true },
+  });
+  const result = await prisma.$transaction(async (tx) => {
     await tx.orderServiceItem.updateMany({
       where: { order_id: order.id, is_external: false, driver_id: null },
       data: {
@@ -440,6 +445,8 @@ export async function assignBotOrder(
       include: orderInclude(),
     });
   }, { maxWait: 15000, timeout: 30000 });
+  void notifyNewTrips(driver.id, newLines.map((l) => l.id));
+  return result;
 }
 
 export async function markDriverMessageSent(orderIdOrCode: string) {
@@ -573,65 +580,11 @@ export async function finishBotOrder(
   // when the driver's last active line closes.
   await transitionActiveLine(order.id, "DONE", input.driver_phone);
 
-  const reports = await prisma.tripReport.findMany({
-    where: { order_id: order.id },
+  await refreshOrderSummary(order.id, input.generated_summary);
+  const updated = await prisma.order.findUnique({
+    where: { id: order.id },
+    include: orderInclude(),
   });
-  const startReceived = reports.some((r) =>
-    /START|Pick Up/i.test(r.report_type),
-  );
-  const finishReceived = true;
-  const docsReceived = reports.filter((r) =>
-    reportTypeIsDocument(r.report_type),
-  ).length;
-  const photosCount = reports.filter((r) =>
-    reportTypeIsPhoto(r.report_type),
-  ).length;
-  const missingItems = [
-    !startReceived ? "START" : null,
-    !finishReceived ? "FINISH" : null,
-    !docsReceived ? "Expense/PDF document" : null,
-  ].filter(Boolean) as string[];
-
-  const updated = await prisma.$transaction(async (tx) => {
-    await tx.orderSummary.upsert({
-      where: { order_id: order.id },
-      update: {
-        start_received: startReceived,
-        finish_received: finishReceived,
-        docs_received: docsReceived,
-        photos_count: photosCount,
-        missing_items: missingItems,
-        generated_summary: input.generated_summary,
-        generated_at: new Date(),
-      },
-      create: {
-        order_id: order.id,
-        start_received: startReceived,
-        finish_received: finishReceived,
-        docs_received: docsReceived,
-        photos_count: photosCount,
-        missing_items: missingItems,
-        generated_summary: input.generated_summary,
-      },
-    });
-    // Merge: do NOT force order_status=DONE here. transitionActiveLine already
-    // finished today's line and derived the order status (a multi-day order
-    // stays IN_PROGRESS until ALL lines are done). Only update review flags.
-    await tx.order.update({
-      where: { id: order.id },
-      data: {
-        needs_review: missingItems.length > 0,
-        review_reason: missingItems.length
-          ? `Missing: ${missingItems.join(", ")}`
-          : null,
-      },
-    });
-    await deriveAndSetOrderStatus(tx, order.id);
-    return tx.order.findUnique({
-      where: { id: order.id },
-      include: orderInclude(),
-    });
-  }, { maxWait: 15000, timeout: 30000 });
 
   return { order: updated, report };
 }
@@ -697,4 +650,63 @@ export async function createBotReport(
       status,
     },
   });
+}
+
+/**
+ * Recompute the order's report summary (start/finish/docs/photos received)
+ * and its needs_review flag. Shared by the WhatsApp bot and the driver app.
+ */
+export async function refreshOrderSummary(orderId: string, generatedSummary?: string) {
+  const [reports, lines] = await Promise.all([
+    prisma.tripReport.findMany({ where: { order_id: orderId } }),
+    prisma.orderServiceItem.findMany({
+      where: { order_id: orderId },
+      select: { actual_start_at: true, line_status: true },
+    }),
+  ]);
+  const startReceived =
+    lines.some((l) => l.actual_start_at) ||
+    reports.some((r) => /^(START|PICK ?UP)$/i.test(r.report_type.trim()));
+  const finishReceived =
+    lines.some((l) => l.line_status === "DONE") ||
+    reports.some((r) => /^(FINISH|DROP( OFF)?)$/i.test(r.report_type.trim()));
+  const docsReceived = reports.filter((r) => reportTypeIsDocument(r.report_type)).length;
+  const photosCount = reports.filter((r) => reportTypeIsPhoto(r.report_type)).length;
+  const missingItems = [
+    !startReceived ? "START" : null,
+    !finishReceived ? "FINISH" : null,
+    !docsReceived ? "Expense/PDF document" : null,
+  ].filter(Boolean) as string[];
+
+  await prisma.$transaction(async (tx) => {
+    await tx.orderSummary.upsert({
+      where: { order_id: orderId },
+      update: {
+        start_received: startReceived,
+        finish_received: finishReceived,
+        docs_received: docsReceived,
+        photos_count: photosCount,
+        missing_items: missingItems,
+        ...(generatedSummary !== undefined ? { generated_summary: generatedSummary } : {}),
+        generated_at: new Date(),
+      },
+      create: {
+        order_id: orderId,
+        start_received: startReceived,
+        finish_received: finishReceived,
+        docs_received: docsReceived,
+        photos_count: photosCount,
+        missing_items: missingItems,
+        generated_summary: generatedSummary,
+      },
+    });
+    await tx.order.update({
+      where: { id: orderId },
+      data: {
+        needs_review: missingItems.length > 0,
+        review_reason: missingItems.length ? `Missing: ${missingItems.join(", ")}` : null,
+      },
+    });
+    await deriveAndSetOrderStatus(tx, orderId);
+  }, { maxWait: 15000, timeout: 30000 });
 }

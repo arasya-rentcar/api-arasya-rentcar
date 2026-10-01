@@ -9,6 +9,7 @@ import {
 } from "./orders.validation";
 import { upsertCustomerForOrder } from "../customers/customers.service";
 import { attachLeadToOrder } from "../leads/leads.service";
+import { notifyNewTrips, notifyTripsRemoved } from "../../services/tripNotify";
 import { computeMargin, MARGIN_FORMULA_VERSION } from "../../utils/margin";
 import { nextOrderCode } from "../../utils/codes";
 import { buildCancellationFeePdf } from "../invoices/invoices.service";
@@ -773,6 +774,10 @@ export async function assignOrder(orderId: string, input: AssignOrderInput) {
   // Merge: assign at the LINE level (the line IS the trip). Every internal
   // day-line that has no driver yet inherits this driver+car and flips to
   // ASSIGNED; order + driver/car status are then derived from the lines.
+  const newLines = await prisma.orderServiceItem.findMany({
+    where: { order_id: orderId, is_external: false, driver_id: null },
+    select: { id: true },
+  });
   const updated = await prisma.$transaction(async (tx) => {
     await tx.orderServiceItem.updateMany({
       where: { order_id: orderId, is_external: false, driver_id: null },
@@ -788,6 +793,7 @@ export async function assignOrder(orderId: string, input: AssignOrderInput) {
     return tx.order.findUnique({ where: { id: orderId } });
   });
 
+  void notifyNewTrips(input.driver_id, newLines.map((l) => l.id));
   return updated;
 }
 
@@ -874,6 +880,13 @@ export async function reassignOrder(
     return tx.order.findUnique({ where: { id: orderId } });
   });
 
+  // Driver app: new driver gets the trips, replaced drivers are told.
+  const moved = eligibleLines.filter((l) => l.driver_id !== input.driver_id);
+  void notifyNewTrips(input.driver_id, moved.map((l) => l.id));
+  for (const oldId of oldDriverIds) {
+    if (oldId === input.driver_id) continue;
+    void notifyTripsRemoved(oldId, moved.filter((l) => l.driver_id === oldId).map((l) => l.id));
+  }
   return updated;
 }
 

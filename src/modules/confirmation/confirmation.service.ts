@@ -18,6 +18,8 @@ import {
   buildDriverReminderCaption,
   buildDriverStandDownCaption,
 } from '../../utils/waCaptions';
+import { waLink, waManual } from '../../utils/waManual';
+import { pushToDriver } from '../../services/push.service';
 
 // ── wa-bot internal transport (mirrors invoices.service) ────────────────────
 function botBaseUrl(): string {
@@ -167,7 +169,14 @@ async function resolvePrevSnapshotNames(snap: Snapshot) {
 // ── Public: send CUSTOMER confirmation (or update) for a line ───────────────
 export interface SendResult {
   line_id: string;
-  customer: { sent: boolean; to?: string; message_id?: string | null; kind: 'NEW' | 'UPDATE' };
+  customer: {
+    sent: boolean;
+    to?: string;
+    message_id?: string | null;
+    kind: 'NEW' | 'UPDATE';
+    /** Manual mode: open this link to send the message from WhatsApp. */
+    wa_url?: string;
+  };
   driver?: { sent: boolean; to?: string; message_id?: string | null };
   old_driver_standdown?: { sent: boolean; to?: string };
   state: ConfirmationState;
@@ -225,7 +234,10 @@ export async function sendLineConfirmation(
         car_model: car.model,
       });
 
-  const custRes = await sendText(order.customer_phone, custText);
+  const manual = waManual();
+  const custRes = manual
+    ? { to: order.customer_phone, message_id: null }
+    : await sendText(order.customer_phone, custText);
 
   // 2) OLD driver stand-down (only on reassignment, and only if the previous
   //    driver actually differs and previously got a reminder snapshot).
@@ -235,7 +247,14 @@ export async function sendLineConfirmation(
       where: { id: oldSnap.driver_id },
       select: { name: true, phone: true },
     });
-    if (oldDriver?.phone) {
+    if (manual) {
+      void pushToDriver(oldSnap.driver_id, {
+        title: 'Tugas dialihkan',
+        body: `Trip ${fmtDay(line.service_date!)} · ${line.pickup_location} tidak lagi untuk Anda.`,
+        data: { type: 'trip_updated', line_id: lineId },
+      });
+      standdown = { sent: true };
+    } else if (oldDriver?.phone) {
       const sdText = buildDriverStandDownCaption({
         service_date: line.service_date!,
         pickup_at: line.start_at,
@@ -254,7 +273,14 @@ export async function sendLineConfirmation(
 
   // 3) NEW driver reminder
   let driverRes: SendResult['driver'];
-  if (includeDriver) {
+  if (includeDriver && manual) {
+    await pushToDriver(driver.id, {
+      title: `Pengingat trip ${fmtDay(line.service_date!)}`,
+      body: `${order.customer_name} · ${line.pickup_location} → ${line.dropoff_location}`,
+      data: { type: 'trip_reminder', line_id: lineId },
+    });
+    driverRes = { sent: true };
+  } else if (includeDriver) {
     const drvText = buildDriverReminderCaption({
       service_date: line.service_date!,
       pickup_at: line.start_at,
@@ -299,6 +325,7 @@ export async function sendLineConfirmation(
       to: custRes.to,
       message_id: custRes.message_id,
       kind: isUpdate ? 'UPDATE' : 'NEW',
+      ...(manual ? { wa_url: waLink(order.customer_phone, custText) } : {}),
     },
     driver: driverRes,
     old_driver_standdown: standdown,
@@ -345,6 +372,10 @@ export async function maybeAutoSendOnAssign(lineId: string): Promise<void> {
       confirmation_sent_snapshot: line.confirmation_sent_snapshot,
     });
     if (state === 'SENT') return; // already current
+    if (waManual()) {
+      await remindDriverOnly(lineId);
+      return;
+    }
     await sendLineConfirmation(lineId, { includeDriver: true, force: state === 'CHANGED' });
   } catch (e) {
     // Best-effort: never break assignment. The manual button can retry.
@@ -379,7 +410,7 @@ export async function runDailyConfirmationSweep(now: Date = new Date()): Promise
       is_external: false,
       driver_id: { not: null },
       car_id: { not: null },
-      line_status: { in: ['SCHEDULED', 'IN_PROGRESS'] },
+      line_status: { in: ['SCHEDULED', 'ASSIGNED', 'IN_PROGRESS'] },
       service_date: { gte: start, lte: end },
     },
     select: {
@@ -407,6 +438,14 @@ export async function runDailyConfirmationSweep(now: Date = new Date()): Promise
       continue;
     }
     try {
+      if (waManual()) {
+        // Customer confirmations wait for the admin; drivers get a push now.
+        if (await remindDriverOnly(l.id)) {
+          sent++;
+          results.push({ line_id: l.id, ok: true });
+        } else skipped++;
+        continue;
+      }
       await sendLineConfirmation(l.id, {
         includeDriver: true,
         force: state === 'CHANGED',
@@ -427,4 +466,35 @@ export async function runDailyConfirmationSweep(now: Date = new Date()): Promise
     failed,
     results,
   };
+}
+
+function fmtDay(d: Date): string {
+  return new Date(d).toLocaleDateString('id-ID', {
+    timeZone: 'Asia/Jakarta',
+    weekday: 'short',
+    day: 'numeric',
+    month: 'short',
+  });
+}
+
+/**
+ * Manual mode: push the H-1 / same-day reminder to the assigned driver's app
+ * (once per driver+car assignment). Returns true when a reminder was sent.
+ */
+export async function remindDriverOnly(lineId: string): Promise<boolean> {
+  const line = await loadLine(lineId);
+  if (!line.driver || !line.car || !line.order || !line.service_date) return false;
+  const snap = snapshotOf(line);
+  const prev = line.driver_reminder_snapshot as Snapshot;
+  if (line.driver_reminder_sent_at && prev && !snapshotChanged(snap, prev)) return false;
+  await pushToDriver(line.driver.id, {
+    title: `Pengingat trip ${fmtDay(line.service_date)}`,
+    body: `${line.order.customer_name} · ${line.pickup_location} → ${line.dropoff_location}`,
+    data: { type: 'trip_reminder', line_id: lineId },
+  });
+  await prisma.orderServiceItem.update({
+    where: { id: lineId },
+    data: { driver_reminder_sent_at: new Date(), driver_reminder_snapshot: snap },
+  });
+  return true;
 }

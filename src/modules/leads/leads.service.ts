@@ -1,4 +1,5 @@
 import { Prisma } from "@prisma/client";
+import { pushToAdmins } from "../../services/push.service";
 import prisma from "../../prisma/client";
 import { AppError } from "../../utils/AppError";
 import type { ListLeadsQuery, PublicLeadInput } from "./leads.validation";
@@ -10,7 +11,14 @@ import type { ListLeadsQuery, PublicLeadInput } from "./leads.validation";
 export async function createPublicLead(input: PublicLeadInput) {
   const { website: _honeypot, ...data } = input;
   try {
-    await prisma.webLead.create({ data });
+    const lead = await prisma.webLead.create({ data });
+    void pushToAdmins({
+      title: `Lead website baru: ${lead.name}`,
+      body: [lead.trip_date, lead.pickup_location, lead.destination && `→ ${lead.destination}`, lead.unit]
+        .filter(Boolean)
+        .join(" · "),
+      data: { type: "lead_new", lead_id: lead.id },
+    });
   } catch (err) {
     if (
       err instanceof Prisma.PrismaClientKnownRequestError &&

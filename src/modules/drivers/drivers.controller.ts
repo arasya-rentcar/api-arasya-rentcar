@@ -1,5 +1,5 @@
 import { Request, Response, NextFunction } from 'express';
-import { createDriverSchema, updateDriverSchema } from './drivers.validation';
+import { createDriverSchema, updateDriverSchema, setAppPasswordSchema } from './drivers.validation';
 import {
   createDriver,
   listDrivers,
@@ -8,6 +8,7 @@ import {
   getVendorDetail,
   updateDriver,
   getMyActiveTrip,
+  setDriverAppPassword,
 } from './drivers.service';
 
 export async function createDriverController(req: Request, res: Response, next: NextFunction): Promise<void> {
@@ -70,6 +71,20 @@ export async function getMyTripController(req: Request, res: Response, next: Nex
   try {
     const trip = await getMyActiveTrip(req.user!.user_id);
     res.json({ status: 'success', data: trip });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function setDriverAppPasswordController(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const { password } = setAppPasswordSchema.parse(req.body);
+    await setDriverAppPassword(req.params.id, password);
+    res.json({ status: 'success', data: { ok: true } });
   } catch (err) {
     next(err);
   }

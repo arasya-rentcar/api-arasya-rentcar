@@ -23,6 +23,8 @@ import scheduleRoutes from './modules/schedule/schedule.route';
 import payablesRoutes from './modules/payables/payables.route';
 import analyticsRoutes from './modules/analytics/analytics.route';
 import leadsRoutes, { publicLeadsRouter } from './modules/leads/leads.route';
+import devicesRoutes from './modules/devices/devices.route';
+import driverAppRoutes from './modules/driver-app/driver-app.route';
 
 import { errorMiddleware } from './middleware/error.middleware';
 
@@ -103,6 +105,8 @@ app.use('/api/v1/schedule', scheduleRoutes);
 app.use('/api/v1/payables', payablesRoutes);
 app.use('/api/v1/analytics', analyticsRoutes);
 app.use('/api/v1/leads', leadsRoutes);
+app.use('/api/v1/devices', devicesRoutes);
+app.use('/api/v1/driver', driverAppRoutes);
 // Merge: expenses now hang off service-day lines (the line IS the trip).
 app.use('/api/v1/lines', expensesRoutes);
 app.use('/api/v1/bot', botLimiter, botRoutes);
