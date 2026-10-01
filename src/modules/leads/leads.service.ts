@@ -1,5 +1,6 @@
 import { Prisma } from "@prisma/client";
 import { pushToAdmins } from "../../services/push.service";
+import { reportLeadPurchase } from "../../services/ga4.service";
 import prisma from "../../prisma/client";
 import { AppError } from "../../utils/AppError";
 import type { ListLeadsQuery, PublicLeadInput } from "./leads.validation";
@@ -129,5 +130,10 @@ export async function attachLeadToOrder(
 export async function linkLeadToOrder(leadId: string, orderId: string) {
   const order = await prisma.order.findUnique({ where: { id: orderId } });
   if (!order) throw new AppError("Order not found", 404);
-  return prisma.$transaction((tx) => attachLeadToOrder(tx, leadId, orderId));
+  const lead = await prisma.$transaction((tx) => attachLeadToOrder(tx, leadId, orderId));
+  // An order that was already paid reports its GA4 purchase now.
+  reportLeadPurchase(orderId).catch((err) =>
+    console.error("GA4 purchase report failed:", err),
+  );
+  return lead;
 }

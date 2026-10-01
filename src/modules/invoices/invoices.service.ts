@@ -402,10 +402,15 @@ export async function updateInvoiceStatus(
   const invoice = await prisma.invoice.findUnique({ where: { id: invoiceId } });
   if (!invoice) throw new AppError("Invoice not found", 404);
 
-  return prisma.invoice.update({
+  const updated = await prisma.invoice.update({
     where: { id: invoiceId },
     data: { status },
   });
+  if (status === "PAID")
+    reportLeadPurchase(invoice.order_id).catch((err) =>
+      console.error("GA4 purchase report failed:", err),
+    );
+  return updated;
 }
 
 // Sprint 3: return a short-lived signed URL for an invoice's payment proof.
@@ -913,7 +918,7 @@ export async function reviseInvoice(
   const fileName = `${invoiceNumber}.pdf`;
   const fileUrl = await uploadInvoicePDF(pdfBuffer, fileName);
 
-  return prisma.$transaction(async (tx) => {
+  const revised = await prisma.$transaction(async (tx) => {
     await tx.invoice.update({
       where: { id: invoice.id },
       data: { status: "REVISED" },
@@ -961,6 +966,11 @@ export async function reviseInvoice(
     });
     return revised;
   });
+  // A revision can move payment_status to DP_PAID/PAID (website lead → GA4).
+  reportLeadPurchase(invoice.order_id).catch((err) =>
+    console.error("GA4 purchase report failed:", err),
+  );
+  return revised;
 }
 
 function normalizePhone(phone = ""): string {

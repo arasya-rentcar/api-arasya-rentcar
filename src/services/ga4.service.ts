@@ -12,9 +12,24 @@ export async function reportLeadPurchase(orderId: string): Promise<void> {
   if (!env.GA4_MEASUREMENT_ID || !env.GA4_API_SECRET) return;
   const lead = await prisma.webLead.findUnique({
     where: { order_id: orderId },
-    include: { order: { select: { order_code: true, final_price: true } } },
+    include: {
+      order: {
+        select: {
+          order_code: true,
+          final_price: true,
+          payment_status: true,
+          invoices: { where: { status: "PAID" }, select: { id: true }, take: 1 },
+        },
+      },
+    },
   });
   if (!lead || !lead.order || lead.purchase_reported_at || !lead.ga_client_id) return;
+  // Called on every payment and on linking a lead: only a paid order counts.
+  const paid =
+    lead.order.invoices.length > 0 ||
+    lead.order.payment_status === "DP_PAID" ||
+    lead.order.payment_status === "PAID";
+  if (!paid) return;
   // Claim the report first so two payments recorded at once cannot both send
   // it; released again if Google does not accept it.
   const claim = await prisma.webLead.updateMany({
