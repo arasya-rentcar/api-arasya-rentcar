@@ -69,25 +69,27 @@ export const botAssignSchema = z.object({
   car_plate: z.string().optional(),
 });
 
+// Report/finish payloads come from the (retiring) wa-bot, which sends null for
+// missing values; accept null and let the service treat it as "not given".
 export const botReportSchema = z.object({
-  order_code: z.string().optional(),
-  driver_phone: z.string().optional(),
+  order_code: z.string().nullish(),
+  driver_phone: z.string().nullish(),
   report_type: z.string().min(1),
   input_type: z
     .enum(["TEXT", "IMAGE", "PDF", "DOCUMENT", "MIXED"])
     .default("TEXT"),
-  notes: z.string().optional(),
-  extracted_text: z.string().optional(),
-  file_url: z.string().optional(),
-  file_mime: z.string().optional(),
-  match_method: z.string().optional(),
+  notes: z.string().nullish(),
+  extracted_text: z.string().nullish(),
+  file_url: z.string().nullish(),
+  file_mime: z.string().nullish(),
+  match_method: z.string().nullish(),
   status: z.enum(["MATCHED", "UNMATCHED", "NEEDS_REVIEW"]).default("MATCHED"),
 });
 
 export const botFinishSchema = z.object({
-  driver_phone: z.string().optional(),
-  notes: z.string().optional(),
-  generated_summary: z.string().optional(),
+  driver_phone: z.string().nullish(),
+  notes: z.string().nullish(),
+  generated_summary: z.string().nullish(),
 });
 
 export type BotCreateOrderInput = z.infer<typeof botCreateOrderSchema>;
