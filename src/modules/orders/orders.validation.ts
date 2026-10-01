@@ -56,6 +56,8 @@ export const createOrderSchema = z
     is_external: z.boolean().optional(),
     external_vendor_id: z.string().uuid().optional(),
     external_car_id: z.string().uuid().optional(),
+    // Website lead this order was made from (Lead Website inbox).
+    web_lead_id: z.string().uuid().optional(),
   })
   .refine(
     (v) =>

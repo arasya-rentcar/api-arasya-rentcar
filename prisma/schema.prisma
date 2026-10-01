@@ -253,6 +253,7 @@ model Order {
   adjustments            OrderAdjustment[]
   change_logs            OrderChangeLog[]
   payables               Payable[]
+  web_lead               WebLead?
 
   @@index([order_code])
   @@index([source])
@@ -416,7 +417,7 @@ model OrderServiceItem {
   // driver_reminder_* = message sent to the assigned DRIVER ("Reminder Jadwal").
   // *_snapshot stores { driver_id, car_id } captured at send time so we can
   // detect a later reassignment and flip the UI to "perlu kirim ulang".
-  confirmation_sent_at      DateTime?
+  confirmation_sent_at       DateTime?
   confirmation_sent_snapshot Json?
   driver_reminder_sent_at    DateTime?
   driver_reminder_snapshot   Json?
@@ -557,11 +558,11 @@ model Receipt {
 }
 
 model InvoiceDeliveryLog {
-  id                      String                 @id @default(uuid())
+  id                      String                  @id @default(uuid())
   invoice_id              String
-  invoice                 Invoice                @relation(fields: [invoice_id], references: [id], onDelete: Cascade)
+  invoice                 Invoice                 @relation(fields: [invoice_id], references: [id], onDelete: Cascade)
   order_id                String
-  order                   Order                  @relation(fields: [order_id], references: [id], onDelete: Cascade)
+  order                   Order                   @relation(fields: [order_id], references: [id], onDelete: Cascade)
   channel                 InvoiceDeliveryChannel  @default(WHATSAPP)
   document_type           InvoiceDeliveryDocument @default(INVOICE)
   target_name             String?
@@ -569,15 +570,15 @@ model InvoiceDeliveryLog {
   message_text            String?
   file_url                String
   invoice_number_snapshot String
-  amount_snapshot         Decimal                @db.Decimal(12, 2)
+  amount_snapshot         Decimal                 @db.Decimal(12, 2)
   status_snapshot         InvoiceStatus
-  status                  InvoiceDeliveryStatus  @default(PENDING)
+  status                  InvoiceDeliveryStatus   @default(PENDING)
   provider_message_id     String?
   error_message           String?
   sent_by_user_id         String?
   sent_at                 DateTime?
-  created_at              DateTime               @default(now())
-  updated_at              DateTime               @updatedAt
+  created_at              DateTime                @default(now())
+  updated_at              DateTime                @updatedAt
 
   @@index([invoice_id])
   @@index([order_id])
@@ -618,40 +619,40 @@ model OrderChangeLog {
 }
 
 model Expense {
-  id         String      @id @default(uuid())
+  id                    String            @id @default(uuid())
   // Merge: expenses belong to a service-day line (the line IS the trip).
   order_service_item_id String?
   order_service_item    OrderServiceItem? @relation(fields: [order_service_item_id], references: [id], onDelete: Cascade)
-  type       ExpenseType
-  amount     Decimal     @db.Decimal(12, 2)
-  note       String?
-  created_at DateTime    @default(now())
+  type                  ExpenseType
+  amount                Decimal           @db.Decimal(12, 2)
+  note                  String?
+  created_at            DateTime          @default(now())
 
   @@index([order_service_item_id])
   @@map("expenses")
 }
 
 model TripReport {
-  id             String          @id @default(uuid())
-  order_id       String?
-  order          Order?          @relation(fields: [order_id], references: [id], onDelete: SetNull)
+  id                    String            @id @default(uuid())
+  order_id              String?
+  order                 Order?            @relation(fields: [order_id], references: [id], onDelete: SetNull)
   // Merge: reports attach to a specific service-day line when matched.
   order_service_item_id String?
   order_service_item    OrderServiceItem? @relation(fields: [order_service_item_id], references: [id], onDelete: SetNull)
-  order_code     String?
-  driver_id      String?
-  driver         Driver?         @relation(fields: [driver_id], references: [id], onDelete: SetNull)
-  driver_phone   String?
-  report_type    String
-  input_type     ReportInputType @default(TEXT)
-  notes          String?
-  extracted_text String?
-  file_url       String?
-  file_mime      String?
-  match_method   String?
-  source         ReportSource    @default(WHATSAPP)
-  status         ReportStatus    @default(MATCHED)
-  created_at     DateTime        @default(now())
+  order_code            String?
+  driver_id             String?
+  driver                Driver?           @relation(fields: [driver_id], references: [id], onDelete: SetNull)
+  driver_phone          String?
+  report_type           String
+  input_type            ReportInputType   @default(TEXT)
+  notes                 String?
+  extracted_text        String?
+  file_url              String?
+  file_mime             String?
+  match_method          String?
+  source                ReportSource      @default(WHATSAPP)
+  status                ReportStatus      @default(MATCHED)
+  created_at            DateTime          @default(now())
 
   @@index([order_id])
   @@index([order_service_item_id])
@@ -753,4 +754,45 @@ model SheetImportRow {
   @@index([status])
   @@index([order_id])
   @@map("sheet_import_rows")
+}
+
+/// Booking requests sent from the public website's booking form. The visitor
+/// is sent on to WhatsApp with the same lead_code (ARS-XXXXX); the admin then
+/// turns the lead into an order (or ignores it). Once the order's first
+/// invoice is paid, a GA4 "purchase" is reported for the visitor who sent it.
+enum WebLeadStatus {
+  NEW
+  CONVERTED
+  IGNORED
+}
+
+model WebLead {
+  id                   String        @id @default(uuid())
+  lead_code            String        @unique
+  status               WebLeadStatus @default(NEW)
+  name                 String
+  trip_date            String?
+  pickup_time          String?
+  pickup_location      String
+  destination          String?
+  unit                 String?
+  passenger_count      Int?
+  duration             String?
+  notes                String?
+  page_path            String?
+  language             String?
+  campaign             String?
+  gclid                String?
+  ga_client_id         String?
+  ga_session_id        String?
+  ignore_reason        String?
+  order_id             String?       @unique
+  order                Order?        @relation(fields: [order_id], references: [id], onDelete: SetNull)
+  purchase_reported_at DateTime?
+  created_at           DateTime      @default(now())
+  updated_at           DateTime      @updatedAt
+
+  @@index([status])
+  @@index([created_at])
+  @@map("web_leads")
 }

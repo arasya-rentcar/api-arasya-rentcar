@@ -1,3 +1,4 @@
+import { reportLeadPurchase } from "../../services/ga4.service";
 import prisma from "../../prisma/client";
 import { AppError } from "../../utils/AppError";
 import { nextInvoiceNumber, nextReceiptNumber } from "../../utils/codes";
@@ -623,7 +624,7 @@ export async function markInvoicePaid(
     receiptSeq = gen.seq;
   }
 
-  return prisma.$transaction(async (tx) => {
+  const paid = await prisma.$transaction(async (tx) => {
     const updated = await tx.invoice.update({
       where: { id: invoiceId },
       data: {
@@ -676,6 +677,13 @@ export async function markInvoicePaid(
 
     return updated;
   });
+
+  // Website lead → GA4 "purchase" (first payment only; never blocks the admin).
+  reportLeadPurchase(invoice.order_id).catch((err) =>
+    console.error("GA4 purchase report failed:", err),
+  );
+
+  return paid;
 }
 
 // Build a single combined STATEMENT PDF for the whole order: all service-day

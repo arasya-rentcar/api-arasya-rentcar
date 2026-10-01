@@ -22,6 +22,7 @@ import externalVendorsRoutes from './modules/external-vendors/external-vendors.r
 import scheduleRoutes from './modules/schedule/schedule.route';
 import payablesRoutes from './modules/payables/payables.route';
 import analyticsRoutes from './modules/analytics/analytics.route';
+import leadsRoutes, { publicLeadsRouter } from './modules/leads/leads.route';
 
 import { errorMiddleware } from './middleware/error.middleware';
 
@@ -32,6 +33,10 @@ app.set('trust proxy', env.TRUST_PROXY);
 
 // Security headers.
 app.use(helmet());
+
+// Public, unauthenticated: the website's booking form. Registered before the
+// dashboard CORS policy because it has its own allowed origins.
+app.use('/api/v1/public/leads', publicLeadsRouter);
 
 const allowedOrigins = (process.env.CORS_ORIGINS || '')
   .split(',')
@@ -97,6 +102,7 @@ app.use('/api/v1/external-vendors', externalVendorsRoutes);
 app.use('/api/v1/schedule', scheduleRoutes);
 app.use('/api/v1/payables', payablesRoutes);
 app.use('/api/v1/analytics', analyticsRoutes);
+app.use('/api/v1/leads', leadsRoutes);
 // Merge: expenses now hang off service-day lines (the line IS the trip).
 app.use('/api/v1/lines', expensesRoutes);
 app.use('/api/v1/bot', botLimiter, botRoutes);

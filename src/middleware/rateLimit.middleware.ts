@@ -23,6 +23,15 @@ export const authLimiter = rateLimit({
   },
 });
 
+// Public lead intake (website booking form): a person sends a few at most.
+export const publicLeadLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 10,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { status: 'error', message: 'Too many requests, please try again later.' },
+});
+
 // Bot limiter: moderate; bot is a single trusted client but bursty.
 export const botLimiter = rateLimit({
   windowMs: 60 * 1000, // 1 minute

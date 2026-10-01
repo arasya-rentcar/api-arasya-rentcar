@@ -27,6 +27,16 @@ const envSchema = z.object({
     .string()
     .regex(/^([01]?\d|2[0-3]):[0-5]\d$/, 'CONFIRMATION_SWEEP_TIME must be HH:MM')
     .default('17:00'),
+  // Website booking-form leads: origins allowed to POST /api/v1/public/leads.
+  PUBLIC_LEAD_ORIGINS: z
+    .string()
+    .default(
+      'https://arasya-web.vercel.app,https://arasyarentcar.com,https://www.arasyarentcar.com,http://localhost:4321',
+    ),
+  // GA4 Measurement Protocol: report a "purchase" when a website lead's order
+  // gets its first payment. Both empty = reporting off.
+  GA4_MEASUREMENT_ID: z.string().default(''),
+  GA4_API_SECRET: z.string().default(''),
   CONFIRMATION_SWEEP_ENABLED: z
     .enum(['true', 'false'])
     .default('true')

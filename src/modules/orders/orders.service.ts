@@ -8,6 +8,7 @@ import {
   CreateChangeLogInput,
 } from "./orders.validation";
 import { upsertCustomerForOrder } from "../customers/customers.service";
+import { attachLeadToOrder } from "../leads/leads.service";
 import { computeMargin, MARGIN_FORMULA_VERSION } from "../../utils/margin";
 import { nextOrderCode } from "../../utils/codes";
 import { buildCancellationFeePdf } from "../invoices/invoices.service";
@@ -199,6 +200,10 @@ export async function createOrder(input: CreateOrderInput) {
         where: { id: input.external_vendor_id },
         data: { order_count: { increment: 1 } },
       });
+    }
+
+    if (input.web_lead_id) {
+      await attachLeadToOrder(tx, input.web_lead_id, order.id);
     }
 
     return order;
