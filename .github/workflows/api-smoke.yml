@@ -1,0 +1,35 @@
+name: API smoke test
+
+# Manual check that the live API is up and running the current routes.
+# Read-only: only unauthenticated requests whose expected answer is an
+# error (401) or an empty 204, so nothing is created.
+
+on:
+  workflow_dispatch:
+    inputs:
+      base:
+        description: API base URL
+        default: https://api.haikuy.com
+        required: true
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check endpoints
+        env:
+          BASE: ${{ inputs.base }}
+        run: |
+          fail=0
+          check() { # method path expected-status [body]
+            code=$(curl -s -o /dev/null -w "%{http_code}" -X "$1" "$BASE$2" -H 'Content-Type: application/json' ${4:+-d "$4"} --max-time 20)
+            if [ "$code" = "$3" ]; then echo "ok   $1 $2 -> $code"; else echo "FAIL $1 $2 -> $code (expected $3)"; fail=1; fi
+          }
+          check GET  /health                     200
+          check GET  /api/v1/orders              401
+          check GET  /api/v1/leads               401
+          check GET  /api/v1/driver/me           401
+          check POST /api/v1/devices             401 '{}'
+          check POST /api/v1/public/leads        204 '{"lead_code":"invalid"}'
+          exit $fail
