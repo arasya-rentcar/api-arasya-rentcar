@@ -23,6 +23,12 @@ export const assignScheduleLineSchema = z
     car_id: z.string().uuid().nullable().optional(),
     external_vendor_id: z.string().uuid().nullable().optional(),
     external_car_id: z.string().uuid().nullable().optional(),
+    // EXTERNAL lines only: the partner's driver + plate for this day (the
+    // vendor driver does not use the app). Ignored on internal lines; cleared
+    // when a line switches back to internal. Empty string clears.
+    driver_name_raw: z.string().max(120).nullable().optional(),
+    driver_phone_raw: z.string().max(40).nullable().optional(),
+    plate_raw: z.string().max(30).nullable().optional(),
     line_status: z
       .enum(['SCHEDULED', 'ASSIGNED', 'IN_PROGRESS', 'DONE', 'CANCELLED'])
       .optional(),

@@ -87,6 +87,7 @@ export async function listSchedule(query: ListScheduleQuery) {
     where.OR = [
       { description: { contains: query.search, mode: 'insensitive' } },
       { driver_name_raw: { contains: query.search, mode: 'insensitive' } },
+      { driver_phone_raw: { contains: query.search, mode: 'insensitive' } },
       { plate_raw: { contains: query.search, mode: 'insensitive' } },
       { pickup_location: { contains: query.search, mode: 'insensitive' } },
       { dropoff_location: { contains: query.search, mode: 'insensitive' } },
@@ -215,9 +216,23 @@ export async function assignScheduleLine(
       data.external_vendor_id = input.external_vendor_id;
     if (input.external_car_id !== undefined)
       data.external_car_id = input.external_car_id;
+    // Partner driver / plate for this day ('' → null).
+    if (input.driver_name_raw !== undefined)
+      data.driver_name_raw = input.driver_name_raw?.trim() || null;
+    if (input.driver_phone_raw !== undefined)
+      data.driver_phone_raw = input.driver_phone_raw?.trim() || null;
+    if (input.plate_raw !== undefined)
+      data.plate_raw = input.plate_raw?.trim().toUpperCase() || null;
   } else {
     data.external_vendor_id = null;
     data.external_car_id = null;
+    // Switching external → internal: the partner's driver/plate no longer
+    // apply. (Internal lines keep any sheet-import raw values untouched.)
+    if (line.is_external) {
+      data.driver_name_raw = null;
+      data.driver_phone_raw = null;
+      data.plate_raw = null;
+    }
     if (input.driver_id !== undefined) data.driver_id = input.driver_id;
     if (input.car_id !== undefined) data.car_id = input.car_id;
   }
