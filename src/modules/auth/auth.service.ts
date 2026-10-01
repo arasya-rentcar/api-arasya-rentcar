@@ -19,13 +19,13 @@ export async function login(input: LoginInput) {
   }
 
   if (!user) {
-    throw new AppError('Invalid email or password', 401);
+    throw new AppError('Nomor HP/email atau kata sandi salah', 401);
   }
 
   const isValid = await comparePassword(input.password, user.password);
 
   if (!isValid) {
-    throw new AppError('Invalid email or password', 401);
+    throw new AppError('Nomor HP/email atau kata sandi salah', 401);
   }
 
   // Drivers stay signed in on their phone; admins keep JWT_EXPIRES_IN.
