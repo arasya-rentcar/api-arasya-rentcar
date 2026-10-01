@@ -6,10 +6,11 @@ export interface JwtPayload {
   role: 'ADMIN' | 'DRIVER';
 }
 
-export function signToken(payload: JwtPayload): string {
-  return jwt.sign(payload, env.JWT_SECRET, {
-    expiresIn: env.JWT_EXPIRES_IN as jwt.SignOptions['expiresIn'],
-  });
+export function signToken(
+  payload: JwtPayload,
+  expiresIn: jwt.SignOptions['expiresIn'] = env.JWT_EXPIRES_IN as jwt.SignOptions['expiresIn'],
+): string {
+  return jwt.sign(payload, env.JWT_SECRET, { expiresIn });
 }
 
 export function verifyToken(token: string): JwtPayload {

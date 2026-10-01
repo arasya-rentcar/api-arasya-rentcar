@@ -1,5 +1,6 @@
 import { Request, Response, NextFunction } from 'express';
 import { ZodError } from 'zod';
+import { MulterError } from 'multer';
 import { AppError } from '../utils/AppError';
 import { logger } from '../config/logger';
 
@@ -17,6 +18,14 @@ export function errorMiddleware(
         field: e.path.join('.'),
         message: e.message,
       })),
+    });
+    return;
+  }
+
+  if (err instanceof MulterError) {
+    res.status(err.code === 'LIMIT_FILE_SIZE' ? 413 : 400).json({
+      status: 'error',
+      message: err.code === 'LIMIT_FILE_SIZE' ? 'File terlalu besar' : err.message,
     });
     return;
   }

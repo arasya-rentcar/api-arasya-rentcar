@@ -38,6 +38,10 @@ export async function driverForUser(userId: string) {
   return driver;
 }
 
+// Rows written by the trip actions themselves (app applyOnce or the bot), not
+// sent by the driver; the app may hide them in the report list.
+const SYSTEM_REPORTS = ["START", "ARRIVE_CUSTOMER", "FINISH", "DROP"];
+
 const tripInclude = {
   car: { select: { plate_number: true, model: true } },
   order: {
@@ -51,7 +55,8 @@ const tripInclude = {
       customers: { select: { name: true, phone: true, is_primary: true } },
     },
   },
-  _count: { select: { reports: true } },
+  // Only what the driver sent (photos, receipts, notes), not the system rows.
+  _count: { select: { reports: { where: { report_type: { notIn: SYSTEM_REPORTS } } } } },
 } satisfies Prisma.OrderServiceItemInclude;
 
 type LineWithTrip = Prisma.OrderServiceItemGetPayload<{ include: typeof tripInclude }>;
@@ -148,6 +153,7 @@ function toReport(r: Prisma.TripReportGetPayload<object>) {
     file_url: r.file_url,
     amount: r.amount == null ? null : Number(r.amount),
     created_at: r.created_at,
+    is_system: SYSTEM_REPORTS.includes(r.report_type),
   };
 }
 
