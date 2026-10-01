@@ -124,11 +124,27 @@ export async function createOrder(input: CreateOrderInput) {
     });
 
     // Auto-generate the running order code (per-customer seq, booking date).
-    const { seq: orderSeq, code: orderCode } = await nextOrderCode(
+    // The per-customer seq is always taken, so invoice/kwitansi numbering keeps
+    // working; an order made from a website lead is coded with the lead's
+    // ARS-XXXXX instead, the code the customer already saw on the website.
+    const { seq: orderSeq, code: generatedCode } = await nextOrderCode(
       tx,
       { id: customer.id, code: customer.code },
       orderDate,
     );
+    let orderCode = generatedCode;
+    if (input.web_lead_id) {
+      const lead = await tx.webLead.findUnique({
+        where: { id: input.web_lead_id },
+        select: { lead_code: true },
+      });
+      if (!lead) throw new AppError("Lead not found", 404);
+      const taken = await tx.order.findUnique({
+        where: { order_code: lead.lead_code },
+        select: { id: true },
+      });
+      if (!taken) orderCode = lead.lead_code;
+    }
 
     const order = await tx.order.create({
       data: {
@@ -298,6 +314,8 @@ export async function searchOrders(params: SearchOrdersParams) {
         { customer_name: { contains: q, mode: "insensitive" } },
         { customer_phone: { contains: q, mode: "insensitive" } },
         { order_code: { contains: q, mode: "insensitive" } },
+        { web_lead: { lead_code: { contains: q, mode: "insensitive" } } },
+        { notes: { contains: q, mode: "insensitive" } },
         { pickup_location: { contains: q, mode: "insensitive" } },
         { dropoff_location: { contains: q, mode: "insensitive" } },
         { customers: { some: { name: { contains: q, mode: "insensitive" } } } },
@@ -418,6 +436,7 @@ export async function searchOrders(params: SearchOrdersParams) {
           orderBy: { created_at: "desc" as const },
         },
         customers: { orderBy: { created_at: "asc" as const } },
+        web_lead: { select: WEB_LEAD_SUMMARY },
       },
     }),
     // Summary totals across the WHOLE filtered set (not just current page)
@@ -575,6 +594,22 @@ export async function upsertOrderFinance(
   return getOrderById(id);
 }
 
+/** The website lead an order came from, as shown on the order. */
+const WEB_LEAD_SUMMARY = {
+  id: true,
+  lead_code: true,
+  campaign: true,
+  gclid: true,
+  page_path: true,
+  language: true,
+  unit: true,
+  passenger_count: true,
+  duration: true,
+  duration_key: true,
+  notes: true,
+  created_at: true,
+} as const;
+
 export async function getOrderById(id: string) {
   const order = await prisma.order.findUnique({
     where: { id },
@@ -621,6 +656,7 @@ export async function getOrderById(id: string) {
       },
       adjustments: { orderBy: { created_at: "desc" as const } },
       change_logs: { orderBy: { created_at: "desc" as const } },
+      web_lead: { select: WEB_LEAD_SUMMARY },
     },
   });
 
