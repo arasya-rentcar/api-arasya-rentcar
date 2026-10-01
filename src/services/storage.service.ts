@@ -116,3 +116,21 @@ export async function getSignedUrl(
   }
   return data.signedUrl;
 }
+
+/**
+ * Remove an object from a bucket. Best-effort: storage errors are logged and
+ * swallowed (the DB row is the source of truth; an orphan file is harmless).
+ */
+export async function removeFile(bucket: string, path: string): Promise<boolean> {
+  try {
+    const { error } = await supabase.storage.from(bucket).remove([path]);
+    if (error) {
+      console.error("[storage] remove failed", { bucket, path, error: error.message });
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.error("[storage] remove failed", { bucket, path, error: (err as Error).message });
+    return false;
+  }
+}
