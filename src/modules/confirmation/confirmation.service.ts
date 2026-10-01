@@ -10,6 +10,15 @@
  * internal `/internal/messages/send` endpoint (text only — no PDF). Double-send is prevented via per-line
  * confirmation_sent_at + confirmation_sent_snapshot (driver+car captured at
  * send time); a later reassignment is detected by comparing the snapshot.
+ *
+ * EXTERNAL (partner/rekanan) lines are supported too once the partner's
+ * driver name (driver_name_raw) and a plate (plate_raw, or the chosen external
+ * car's plate) are set: the customer gets the vendor driver + external car,
+ * and the vendor driver gets the reminder by wa.me link / bot text only (no
+ * push — vendor drivers do not use the driver app). Their snapshot is
+ * { vendor_id, external_car_id, driver_name_raw, driver_phone_raw, plate_raw }.
+ * The H-1 sweep and the same-day auto-send still skip external lines; the
+ * admin sends those from the schedule with the manual button.
  */
 import prisma from '../../prisma/client';
 import { AppError } from '../../utils/AppError';
@@ -70,6 +79,8 @@ async function sendText(targetPhone: string, messageText: string) {
 const lineInclude = {
   driver: true,
   car: true,
+  external_vendor: true,
+  external_car: true,
   order: {
     select: {
       id: true,
@@ -82,36 +93,61 @@ const lineInclude = {
   },
 } as const;
 
-type Snapshot = { driver_id: string | null; car_id: string | null } | null;
+/**
+ * Assignment captured at send time. Internal lines: { driver_id, car_id }
+ * (unchanged shape, so existing snapshots stay valid). External lines:
+ * { vendor_id, external_car_id, driver_name_raw, driver_phone_raw, plate_raw }.
+ */
+type SnapshotValue = Record<string, string | null>;
+type Snapshot = SnapshotValue | null;
 
-function snapshotOf(line: { driver_id: string | null; car_id: string | null }): {
+/** The line fields that decide its confirmation state. */
+export interface ConfirmationLineFields {
+  is_external?: boolean;
   driver_id: string | null;
   car_id: string | null;
-} {
+  external_vendor_id?: string | null;
+  external_car_id?: string | null;
+  driver_name_raw?: string | null;
+  driver_phone_raw?: string | null;
+  plate_raw?: string | null;
+}
+
+function snapshotOf(line: ConfirmationLineFields): SnapshotValue {
+  if (line.is_external) {
+    return {
+      vendor_id: line.external_vendor_id ?? null,
+      external_car_id: line.external_car_id ?? null,
+      driver_name_raw: line.driver_name_raw ?? null,
+      driver_phone_raw: line.driver_phone_raw ?? null,
+      plate_raw: line.plate_raw ?? null,
+    };
+  }
   return { driver_id: line.driver_id ?? null, car_id: line.car_id ?? null };
 }
 
-function snapshotChanged(
-  current: { driver_id: string | null; car_id: string | null },
-  snap: Snapshot,
-): boolean {
+function snapshotChanged(current: SnapshotValue, snap: Snapshot): boolean {
   if (!snap) return false;
-  return current.driver_id !== snap.driver_id || current.car_id !== snap.car_id;
+  // Compare across both shapes: an internal ↔ external switch is a change.
+  const keys = new Set([...Object.keys(current), ...Object.keys(snap)]);
+  for (const k of keys) {
+    if ((current[k] ?? null) !== (snap[k] ?? null)) return true;
+  }
+  return false;
 }
 
 /** Derived confirmation state for the dashboard badge. */
 export type ConfirmationState = 'NOT_SENT' | 'SENT' | 'CHANGED';
 
-export function deriveState(line: {
-  driver_id: string | null;
-  car_id: string | null;
-  confirmation_sent_at: Date | null;
-  confirmation_sent_snapshot: unknown;
-}): ConfirmationState {
+export function deriveState(
+  line: ConfirmationLineFields & {
+    confirmation_sent_at: Date | null;
+    confirmation_sent_snapshot: unknown;
+  },
+): ConfirmationState {
   if (!line.confirmation_sent_at) return 'NOT_SENT';
   const snap = line.confirmation_sent_snapshot as Snapshot;
-  if (snapshotChanged({ driver_id: line.driver_id, car_id: line.car_id }, snap))
-    return 'CHANGED';
+  if (snapshotChanged(snapshotOf(line), snap)) return 'CHANGED';
   return 'SENT';
 }
 
@@ -124,28 +160,90 @@ async function loadLine(lineId: string) {
   return line;
 }
 
-function assertAssignedInternal(line: {
-  is_external: boolean;
+type LoadedLine = Awaited<ReturnType<typeof loadLine>>;
+
+/** Who and what is serving the line, for internal and partner lines alike. */
+interface TripTeam {
+  external: boolean;
+  /** Internal driver id (push / stand-down); null for partner drivers. */
   driver_id: string | null;
-  car_id: string | null;
-  service_date: Date | null;
-}) {
-  if (line.is_external)
-    throw new AppError(
-      'Trip-team confirmation is only for internal (own fleet) lines',
-      400,
-    );
-  if (!line.driver_id || !line.car_id)
-    throw new AppError(
-      'Assign a driver and a car before sending the confirmation',
-      400,
-    );
+  driver_name: string;
+  /** Shown to the customer and used as the reminder target. */
+  driver_phone: string | null;
+  car_plate: string;
+  car_model: string;
+}
+
+/**
+ * Ensure the line has a complete team (internal: driver + car; external:
+ * vendor + partner driver name + a plate) and return it.
+ */
+function assertTeamAssigned(line: LoadedLine): TripTeam {
   if (!line.service_date)
-    throw new AppError('Line has no service date', 400);
+    throw new AppError(
+      'Tanggal layanan belum diisi (line has no service date)',
+      400,
+    );
+  if (!line.is_external) {
+    if (!line.driver || !line.car)
+      throw new AppError(
+        'Pilih driver dan mobil sebelum mengirim konfirmasi (assign a driver and a car before sending the confirmation)',
+        400,
+      );
+    return {
+      external: false,
+      driver_id: line.driver.id,
+      driver_name: line.driver.name,
+      driver_phone: line.driver.phone,
+      car_plate: line.car.plate_number,
+      car_model: line.car.model,
+    };
+  }
+  if (!line.external_vendor)
+    throw new AppError(
+      'Pilih rekanan (vendor) untuk trip ini dulu (choose the partner vendor first)',
+      400,
+    );
+  const driverName = line.driver_name_raw?.trim();
+  if (!driverName)
+    throw new AppError(
+      'Isi nama driver rekanan sebelum mengirim konfirmasi (enter the partner driver name before sending the confirmation)',
+      400,
+    );
+  const plate = line.plate_raw?.trim() || line.external_car?.plate_number?.trim();
+  if (!plate)
+    throw new AppError(
+      'Isi nopol unit rekanan atau pilih mobil rekanan yang punya nopol (enter the partner car plate, or choose a partner car that has one)',
+      400,
+    );
+  return {
+    external: true,
+    driver_id: null,
+    driver_name: driverName,
+    driver_phone:
+      line.driver_phone_raw?.trim() || line.external_vendor.phone?.trim() || null,
+    car_plate: plate,
+    car_model: line.external_car?.model ?? '-',
+  };
 }
 
 async function resolvePrevSnapshotNames(snap: Snapshot) {
   if (!snap) return {};
+  if ('vendor_id' in snap) {
+    // Partner snapshot: names are stored raw; the plate may come from the car.
+    const prevCar = snap.external_car_id
+      ? await prisma.externalCar.findUnique({
+          where: { id: snap.external_car_id },
+          select: { plate_number: true, model: true },
+        })
+      : null;
+    return {
+      prev_driver_name: snap.driver_name_raw ?? null,
+      prev_driver_phone: snap.driver_phone_raw ?? null,
+      prev_car_plate: snap.plate_raw ?? prevCar?.plate_number ?? null,
+      prev_car_model: prevCar?.model ?? null,
+    };
+  }
   const [prevDriver, prevCar] = await Promise.all([
     snap.driver_id
       ? prisma.driver.findUnique({
@@ -199,7 +297,7 @@ export async function sendLineConfirmation(
 ): Promise<SendResult> {
   const includeDriver = opts.includeDriver !== false;
   const line = await loadLine(lineId);
-  assertAssignedInternal(line);
+  const team = assertTeamAssigned(line);
 
   const prevState = deriveState(line);
   if (prevState === 'SENT' && !opts.force) {
@@ -213,29 +311,24 @@ export async function sendLineConfirmation(
   const oldSnap = line.confirmation_sent_snapshot as Snapshot;
   const prev = isUpdate ? await resolvePrevSnapshotNames(oldSnap) : {};
 
-  const driver = line.driver!;
-  const car = line.car!;
   const order = line.order!;
+  const teamCtx = {
+    service_date: line.service_date!,
+    driver_name: team.driver_name,
+    driver_phone: team.driver_phone ?? '-',
+    car_plate: team.car_plate,
+    car_model: team.car_model,
+  };
 
   // 1) CUSTOMER message
   const custText = isUpdate
     ? buildTripTeamUpdateCustomerCaption({
-        service_date: line.service_date!,
-        driver_name: driver.name,
-        driver_phone: driver.phone,
-        car_plate: car.plate_number,
-        car_model: car.model,
+        ...teamCtx,
         prev_driver_name: (prev as any).prev_driver_name,
         prev_car_plate: (prev as any).prev_car_plate,
         prev_car_model: (prev as any).prev_car_model,
       })
-    : buildTripTeamCustomerCaption({
-        service_date: line.service_date!,
-        driver_name: driver.name,
-        driver_phone: driver.phone,
-        car_plate: car.plate_number,
-        car_model: car.model,
-      });
+    : buildTripTeamCustomerCaption(teamCtx);
 
   const manual = waManual();
   const custRes = manual
@@ -245,7 +338,7 @@ export async function sendLineConfirmation(
   // 2) OLD driver stand-down (only on reassignment, and only if the previous
   //    driver actually differs and previously got a reminder snapshot).
   let standdown: SendResult['old_driver_standdown'];
-  if (isUpdate && oldSnap?.driver_id && oldSnap.driver_id !== driver.id) {
+  if (isUpdate && oldSnap?.driver_id && oldSnap.driver_id !== team.driver_id) {
     const oldDriver = await prisma.driver.findUnique({
       where: { id: oldSnap.driver_id },
       select: { name: true, phone: true },
@@ -279,7 +372,39 @@ export async function sendLineConfirmation(
     }
   }
 
-  // 3) NEW driver reminder (push + wa.me link in manual mode)
+  // 2b) Previous PARTNER driver replaced (different phone): stand-down text
+  //     only — vendor drivers have no app, so no push.
+  const prevPartnerPhone = isUpdate ? oldSnap?.driver_phone_raw : null;
+  if (
+    !standdown &&
+    prevPartnerPhone &&
+    (!team.external || prevPartnerPhone !== team.driver_phone)
+  ) {
+    const sdText = buildDriverStandDownCaption({
+      service_date: line.service_date!,
+      pickup_at: line.start_at,
+      driver_name: oldSnap?.driver_name_raw ?? '',
+      pickup_location: line.pickup_location,
+      dropoff_location: line.dropoff_location,
+    });
+    if (manual) {
+      standdown = {
+        sent: true,
+        to: prevPartnerPhone,
+        wa_url: waLink(prevPartnerPhone, sdText),
+      };
+    } else {
+      try {
+        const r = await sendText(prevPartnerPhone, sdText);
+        standdown = { sent: true, to: r.to };
+      } catch {
+        standdown = { sent: false };
+      }
+    }
+  }
+
+  // 3) NEW driver reminder (push + wa.me link in manual mode; partner
+  //    drivers get the link / bot text only)
   let driverRes: SendResult['driver'];
   if (includeDriver) {
     const drvText = buildDriverReminderCaption({
@@ -291,25 +416,33 @@ export async function sendLineConfirmation(
       dropoff_location: line.dropoff_location,
       service_type: order.service_type,
       passenger_count: order.passenger_count,
-      car_plate: car.plate_number,
-      car_model: car.model,
+      car_plate: team.car_plate,
+      car_model: team.car_model,
       notes: line.notes,
       order_code: order.order_code,
     });
+    const target = team.driver_phone;
     if (manual) {
-      await pushToDriver(driver.id, {
-        title: `Pengingat trip ${fmtDay(line.service_date!)}`,
-        body: `${order.customer_name} · ${line.pickup_location} → ${line.dropoff_location}`,
-        data: { type: 'trip_reminder', line_id: lineId },
-      });
-      driverRes = { sent: true, to: driver.phone, wa_url: waLink(driver.phone, drvText) };
-    } else {
+      if (team.driver_id) {
+        await pushToDriver(team.driver_id, {
+          title: `Pengingat trip ${fmtDay(line.service_date!)}`,
+          body: `${order.customer_name} · ${line.pickup_location} → ${line.dropoff_location}`,
+          data: { type: 'trip_reminder', line_id: lineId },
+        });
+      }
+      driverRes = target
+        ? { sent: true, to: target, wa_url: waLink(target, drvText) }
+        : // Partner without any phone (driver or vendor): nothing to open.
+          { sent: false };
+    } else if (target) {
       try {
-        const r = await sendText(driver.phone, drvText);
+        const r = await sendText(target, drvText);
         driverRes = { sent: true, to: r.to, message_id: r.message_id };
       } catch (e) {
         driverRes = { sent: false };
       }
+    } else {
+      driverRes = { sent: false };
     }
   }
 
