@@ -6,10 +6,21 @@ import {
   CreateVendorCarInput,
   UpdateVendorCarInput,
   ListVendorsQuery,
+  PARTNER_FIELDS,
 } from './external-vendors.validation';
 import type { Prisma } from '@prisma/client';
 
 const TAB_PAGE_SIZE = 10;
+
+/** Partner profile columns present in `input` ('' → null, absent → untouched). */
+function partnerData(input: CreateVendorInput | UpdateVendorInput) {
+  const data: Partial<Record<(typeof PARTNER_FIELDS)[number], string | null>> = {};
+  for (const k of PARTNER_FIELDS) {
+    const v = input[k];
+    if (v !== undefined) data[k] = (v ?? '').trim() || null;
+  }
+  return data;
+}
 
 type Db = Prisma.TransactionClient | typeof prisma;
 
@@ -73,6 +84,7 @@ export async function createVendor(input: CreateVendorInput) {
       name: input.name,
       phone: input.phone || null,
       notes: input.notes || null,
+      ...partnerData(input),
     },
   });
 }
@@ -89,6 +101,8 @@ export async function listVendors(query: ListVendorsQuery) {
     where.OR = [
       { name: { contains: q, mode: 'insensitive' } },
       { phone: { contains: q, mode: 'insensitive' } },
+      { pic_name: { contains: q, mode: 'insensitive' } },
+      { area: { contains: q, mode: 'insensitive' } },
     ];
   }
 
@@ -187,6 +201,7 @@ export async function updateVendor(id: string, input: UpdateVendorInput) {
       ...(input.name !== undefined ? { name: input.name } : {}),
       ...(input.phone !== undefined ? { phone: input.phone || null } : {}),
       ...(input.notes !== undefined ? { notes: input.notes || null } : {}),
+      ...partnerData(input),
     },
   });
 }
