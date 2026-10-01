@@ -26,6 +26,7 @@ export const reportSchema = z.object({
     .max(1000)
     .optional()
     .transform((v) => v || undefined),
+  // Rupiah for FUEL/TOLL/PARKING/OTHER_COST, km for ODOMETER_START/END.
   amount: z.coerce.number().int().min(0).max(100_000_000).optional(),
 });
 export type ReportInput = z.infer<typeof reportSchema>;

@@ -295,7 +295,9 @@ export async function addReport(
     fileMime = file.mimetype;
   }
   const costType = COST_TYPES[input.report_type];
-  const amount = costType && input.amount ? input.amount : null;
+  // amount = rupiah for cost receipts, or the km reading for odometer photos.
+  const isOdometer = input.report_type.startsWith("ODOMETER");
+  const amount = (costType || isOdometer) && input.amount ? input.amount : null;
 
   const report = await prisma.$transaction(async (tx) => {
     const r = await tx.tripReport.create({
