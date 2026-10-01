@@ -1,11 +1,12 @@
 /**
- * WhatsApp delivery mode. "bot" (default) sends through the wa-bot service as
- * before. "manual" (WA_DELIVERY=manual) works without the bot: customer
- * messages come back as a wa.me link the admin opens and sends from the
- * dashboard, and driver messages go to the driver app as push notifications.
+ * WhatsApp delivery mode. "manual" (default) works without the wa-bot: customer
+ * and driver messages come back as wa.me links the admin opens and sends from
+ * the dashboard, and drivers also get a push in the driver app. "bot"
+ * (WA_DELIVERY=bot) sends through the wa-bot service as before; kept only for
+ * the transition while the bot is retired.
  */
 export function waManual(): boolean {
-  return (process.env.WA_DELIVERY || "").trim().toLowerCase() === "manual";
+  return (process.env.WA_DELIVERY || "").trim().toLowerCase() !== "bot";
 }
 
 /** wa.me link with the message prefilled (Indonesian numbers: 08… → 628…). */

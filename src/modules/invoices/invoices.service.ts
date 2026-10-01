@@ -1153,6 +1153,7 @@ export async function sendInvoiceWhatsapp(
         message_text: messageText,
         filename: `Invoice-${invoice.invoice_number}.pdf`,
       }),
+      signal: AbortSignal.timeout(30000),
     });
     const text = await res.text();
     let payload: any = null;
@@ -1309,6 +1310,7 @@ export async function sendReceiptWhatsapp(
         message_text: messageText,
         filename: `Kwitansi-${receiptNumber}.pdf`,
       }),
+      signal: AbortSignal.timeout(30000),
     });
     const text = await res.text();
     let payload: any = null;
