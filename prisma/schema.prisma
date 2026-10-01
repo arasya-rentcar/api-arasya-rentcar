@@ -274,26 +274,35 @@ model Order {
 }
 
 model Customer {
-  id             String    @id @default(uuid())
-  code           String    @unique
+  id             String             @id @default(uuid())
+  code           String             @unique
   name           String
-  phone          String?   @unique
+  phone          String?            @unique
   email          String?
-  tags           String[]  @default([])
-  total_orders   Int       @default(0)
-  total_spent    Decimal   @default(0) @db.Decimal(14, 2)
-  total_billed   Decimal   @default(0) @db.Decimal(14, 2)
-  total_paid     Decimal   @default(0) @db.Decimal(14, 2)
-  order_seq      Int       @default(0)
-  invoice_seq    Int       @default(0)
-  kwitansi_seq   Int       @default(0)
+  tags           String[]           @default([])
+  total_orders   Int                @default(0)
+  total_spent    Decimal            @default(0) @db.Decimal(14, 2)
+  total_billed   Decimal            @default(0) @db.Decimal(14, 2)
+  total_paid     Decimal            @default(0) @db.Decimal(14, 2)
+  order_seq      Int                @default(0)
+  invoice_seq    Int                @default(0)
+  kwitansi_seq   Int                @default(0)
   first_order_at DateTime?
   last_order_at  DateTime?
   notes          String?
+  // Identity (repeat customers are not asked again). id_number = NIK (16
+  // digits). Personal data (UU PDP): full NIK only on the detail endpoint;
+  // lists return a masked value.
+  id_number      String?
+  address        String?
+  company_name   String?
+  id_verified_at DateTime?
+  id_verified_by String?
   orders         Order[]
   receipts       Receipt[]
-  created_at     DateTime  @default(now())
-  updated_at     DateTime  @updatedAt
+  documents      CustomerDocument[]
+  created_at     DateTime           @default(now())
+  updated_at     DateTime           @updatedAt
 
   @@index([phone])
   @@index([code])
@@ -301,11 +310,36 @@ model Customer {
   @@map("customers")
 }
 
+/// Identity document (KTP/SIM/NPWP/...) stored in the PRIVATE payment-proofs
+/// bucket under customer-docs/<customerId>/. file_path is a storage path, never
+/// a public URL; clients read it only through a short-lived signed URL.
+model CustomerDocument {
+  id          String   @id @default(uuid())
+  customer_id String
+  customer    Customer @relation(fields: [customer_id], references: [id], onDelete: Cascade)
+  kind        String
+  file_path   String
+  mime        String
+  size        Int
+  note        String?
+  uploaded_by String?
+  created_at  DateTime @default(now())
+
+  @@index([customer_id])
+  @@map("customer_documents")
+}
+
 model ExternalVendor {
   id             String             @id @default(uuid())
   name           String
   phone          String?
   notes          String?
+  // Partner (rekanan) profile: contact person, payout account, service area.
+  pic_name       String?
+  bank_name      String?
+  bank_account   String?
+  bank_holder    String?
+  area           String?
   order_count    Int                @default(0)
   cars           ExternalCar[]
   orders         Order[]
@@ -378,6 +412,7 @@ model OrderServiceItem {
   external_car_id    String?
   external_car       ExternalCar?    @relation(fields: [external_car_id], references: [id], onDelete: SetNull)
   driver_name_raw    String?
+  driver_phone_raw   String?
   plate_raw          String?
 
   // --- Per-day finance (daily margin = roll-up source) ---
