@@ -337,6 +337,32 @@ export async function searchOrders(params: SearchOrdersParams) {
             some: { car: { model: { contains: q, mode: "insensitive" } } },
           },
         },
+        // Partner (rekanan) lines: driver and plate typed on the line, the
+        // vendor, and the vendor's car.
+        {
+          service_items: {
+            some: {
+              OR: [
+                { driver_name_raw: { contains: q, mode: "insensitive" } },
+                { driver_phone_raw: { contains: q, mode: "insensitive" } },
+                { plate_raw: { contains: q, mode: "insensitive" } },
+                {
+                  external_vendor: {
+                    name: { contains: q, mode: "insensitive" },
+                  },
+                },
+                {
+                  external_car: {
+                    plate_number: { contains: q, mode: "insensitive" },
+                  },
+                },
+                {
+                  external_car: { model: { contains: q, mode: "insensitive" } },
+                },
+              ],
+            },
+          },
+        },
         {
           final_finance: {
             invoice_no_raw: { contains: q, mode: "insensitive" },
