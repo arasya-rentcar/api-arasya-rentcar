@@ -2,6 +2,7 @@ import { notifyNewTrips } from "../../services/tripNotify";
 import { DriverType, Prisma, ScheduleStatus } from "@prisma/client";
 import prisma from "../../prisma/client";
 import { AppError } from "../../utils/AppError";
+import { assertOrderPaidForDriverAssignment } from "../orders/assignment-guard";
 import {
   deriveAndSetOrderStatus,
   syncDriverStatus,
@@ -404,6 +405,7 @@ export async function assignBotOrder(
   input: BotAssignInput,
 ) {
   const order = await resolveOrder(orderIdOrCode);
+  assertOrderPaidForDriverAssignment(order);
   const driver = await findOrCreateDriver(input);
   const car = await findOrCreateCar(input);
 

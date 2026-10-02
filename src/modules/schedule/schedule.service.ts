@@ -1,6 +1,7 @@
 import { notifyNewTrips, notifyTripsRemoved } from '../../services/tripNotify';
 import prisma from '../../prisma/client';
 import { AppError } from '../../utils/AppError';
+import { assertOrderPaidForDriverAssignment } from '../orders/assignment-guard';
 import { computeLineMargin, MARGIN_FORMULA_VERSION } from '../../utils/margin';
 import { staleTripCutoff } from '../../utils/wib';
 import { syncPayableForLine } from '../payables/payables.service';
@@ -154,10 +155,19 @@ export async function assignScheduleLine(
   id: string,
   input: AssignScheduleLineInput,
 ) {
-  const line = await prisma.orderServiceItem.findUnique({ where: { id } });
+  const line = await prisma.orderServiceItem.findUnique({
+    where: { id },
+    include: { order: { select: { payment_status: true } } },
+  });
   if (!line) throw new AppError('Schedule line not found', 404);
 
   const isExternal = input.is_external ?? line.is_external;
+
+  // Giving the line to a (new) internal driver needs a paid DP. Clearing the
+  // driver or re-saving the same one (editing notes/times/costs) stays allowed.
+  if (!isExternal && input.driver_id && input.driver_id !== line.driver_id) {
+    assertOrderPaidForDriverAssignment(line.order);
+  }
 
   // Validate referenced entities exist (and respect internal/external mode).
   // These reads are independent, so run them concurrently — over the Supabase

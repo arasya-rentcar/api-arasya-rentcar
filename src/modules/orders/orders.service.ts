@@ -1,5 +1,6 @@
 import prisma from "../../prisma/client";
 import { AppError } from "../../utils/AppError";
+import { assertOrderPaidForDriverAssignment } from "./assignment-guard";
 import {
   CreateOrderInput,
   UpdateOrderInput,
@@ -816,6 +817,7 @@ export async function assignOrder(orderId: string, input: AssignOrderInput) {
       409,
     );
   }
+  assertOrderPaidForDriverAssignment(order);
 
   // Validate driver
   const driver = await prisma.driver.findUnique({
@@ -888,6 +890,11 @@ export async function reassignOrder(
       "No assignable lines to reassign (all lines are unassigned, already started, done, or cancelled).",
       409,
     );
+  }
+
+  // Moving a line to a different driver needs a paid DP, like a first assign.
+  if (eligibleLines.some((l) => l.driver_id !== input.driver_id)) {
+    assertOrderPaidForDriverAssignment(order);
   }
 
   // Validate the new driver: must be AVAILABLE, unless it is already the driver
