@@ -11,6 +11,12 @@ export const listScheduleQuerySchema = z.object({
     .enum(['SCHEDULED', 'ASSIGNED', 'IN_PROGRESS', 'DONE', 'CANCELLED'])
     .optional(),
   search: z.string().optional(),
+  // "Belum ditutup": open trips (SCHEDULED/ASSIGNED/IN_PROGRESS) dated before
+  // yesterday (WIB). The driver app no longer lists most of them.
+  overdue: z
+    .enum(['true', 'false', '1', '0'])
+    .optional()
+    .transform((v) => v === 'true' || v === '1'),
   page: z.coerce.number().int().positive().default(1),
   page_size: z.coerce.number().int().positive().max(200).default(50),
 });

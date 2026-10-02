@@ -2,6 +2,7 @@ import { notifyNewTrips, notifyTripsRemoved } from '../../services/tripNotify';
 import prisma from '../../prisma/client';
 import { AppError } from '../../utils/AppError';
 import { computeLineMargin, MARGIN_FORMULA_VERSION } from '../../utils/margin';
+import { staleTripCutoff } from '../../utils/wib';
 import { syncPayableForLine } from '../payables/payables.service';
 import {
   deriveAndSetOrderStatus,
@@ -83,6 +84,12 @@ export async function listSchedule(query: ListScheduleQuery) {
   if (query.type === 'INTERNAL') where.is_external = false;
   if (query.type === 'EXTERNAL') where.is_external = true;
   if (query.status) where.line_status = query.status;
+  if (query.overdue) {
+    where.AND = [
+      { service_date: { lt: staleTripCutoff() } },
+      { line_status: { in: ['SCHEDULED', 'ASSIGNED', 'IN_PROGRESS'] } },
+    ];
+  }
   if (query.search) {
     where.OR = [
       { description: { contains: query.search, mode: 'insensitive' } },

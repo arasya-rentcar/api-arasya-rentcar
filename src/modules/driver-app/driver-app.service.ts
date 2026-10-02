@@ -15,6 +15,7 @@ import {
   type UploadedFile,
 } from "../../services/storage.service";
 import type { ReportInput } from "./driver-app.validation";
+import { staleTripCutoff } from "../../utils/wib";
 
 /**
  * Driver app: everything a driver does on their own trips (service-day lines
@@ -99,23 +100,49 @@ async function ownLine(driverId: string, lineId: string) {
   return line;
 }
 
+/**
+ * "Tugas" (active): trips from yesterday (WIB) onward that are not finished,
+ * plus any trip already IN_PROGRESS whatever its date (the driver must be able
+ * to finish it). Older open trips are left for the admin to close from the
+ * dashboard ("Belum ditutup"): listing them first made drivers press buttons on
+ * a months-old trip. Order: the trip under way first, then the nearest.
+ */
 export async function listTrips(driverId: string, scope: "active" | "history") {
-  const lines = await prisma.orderServiceItem.findMany({
-    where:
-      scope === "active"
-        ? { driver_id: driverId, is_external: false, line_status: { notIn: ["DONE", "CANCELLED"] } }
-        : {
-            driver_id: driverId,
-            is_external: false,
-            line_status: "DONE",
-            trip_finished_at: { gte: new Date(Date.now() - 60 * 86400000) },
+  if (scope === "active") {
+    const cutoff = staleTripCutoff();
+    const lines = await prisma.orderServiceItem.findMany({
+      where: {
+        driver_id: driverId,
+        is_external: false,
+        OR: [
+          { line_status: "IN_PROGRESS" },
+          {
+            line_status: { in: ["SCHEDULED", "ASSIGNED"] },
+            OR: [
+              { service_date: { gte: cutoff } },
+              { service_date: null, start_at: { gte: cutoff } },
+            ],
           },
+        ],
+      },
+      include: tripInclude,
+      orderBy: [{ service_date: "asc" }, { start_at: "asc" }, { sort_order: "asc" }],
+      take: 100,
+    });
+    const underway = lines.filter((l) => l.line_status === "IN_PROGRESS");
+    const upcoming = lines.filter((l) => l.line_status !== "IN_PROGRESS");
+    return [...underway, ...upcoming].map(toTrip);
+  }
+  const lines = await prisma.orderServiceItem.findMany({
+    where: {
+      driver_id: driverId,
+      is_external: false,
+      line_status: "DONE",
+      trip_finished_at: { gte: new Date(Date.now() - 60 * 86400000) },
+    },
     include: tripInclude,
-    orderBy:
-      scope === "active"
-        ? [{ service_date: "asc" }, { start_at: "asc" }, { sort_order: "asc" }]
-        : [{ trip_finished_at: "desc" }],
-    take: scope === "active" ? 100 : 50,
+    orderBy: [{ trip_finished_at: "desc" }],
+    take: 50,
   });
   return lines.map(toTrip);
 }

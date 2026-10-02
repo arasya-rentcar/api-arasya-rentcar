@@ -2,6 +2,29 @@ import { hashPassword } from '../../utils/password';
 import prisma from '../../prisma/client';
 import { AppError } from '../../utils/AppError';
 import { CreateDriverInput, UpdateDriverInput } from './drivers.validation';
+import { normalizePhone } from '../customers/customers.validation';
+
+/**
+ * A driver logs in to the app with their phone number, so one number must
+ * belong to one driver. Compared in canonical `08…` form (`62…`/`+62…` are the
+ * same number). Returns the canonical number to store.
+ */
+async function assertPhoneFree(phone: string, exceptDriverId?: string) {
+  const norm = normalizePhone(phone);
+  if (!norm) throw new AppError('Nomor HP tidak valid', 400);
+  const others = await prisma.driver.findMany({
+    where: exceptDriverId ? { id: { not: exceptDriverId } } : {},
+    select: { name: true, phone: true },
+  });
+  const clash = others.find((d) => normalizePhone(d.phone) === norm);
+  if (clash) {
+    throw new AppError(
+      `Nomor HP ${norm} sudah dipakai driver lain (${clash.name}). Satu nomor hanya untuk satu driver.`,
+      409,
+    );
+  }
+  return norm;
+}
 
 export async function createDriver(input: CreateDriverInput) {
   const user = await prisma.user.findUnique({ where: { id: input.user_id } });
@@ -11,12 +34,13 @@ export async function createDriver(input: CreateDriverInput) {
 
   const existing = await prisma.driver.findUnique({ where: { user_id: input.user_id } });
   if (existing) throw new AppError('Driver profile already exists for this user', 409);
+  const phone = await assertPhoneFree(input.phone);
 
   return prisma.driver.create({
     data: {
       user_id: input.user_id,
       name: input.name,
-      phone: input.phone,
+      phone,
       type: input.type,
       location: input.location || null,
     },
@@ -175,9 +199,19 @@ export async function updateDriver(id: string, input: UpdateDriverInput) {
   const driver = await prisma.driver.findUnique({ where: { id } });
   if (!driver) throw new AppError('Driver not found', 404);
 
+  const data = { ...input };
+  if (input.phone !== undefined) {
+    // Re-saving the driver's own (possibly still shared) number is allowed, so
+    // other fields stay editable; changing it to another driver's is not.
+    data.phone =
+      normalizePhone(input.phone) === normalizePhone(driver.phone)
+        ? normalizePhone(input.phone) || driver.phone
+        : await assertPhoneFree(input.phone, id);
+  }
+
   return prisma.driver.update({
     where: { id },
-    data: input,
+    data,
     include: { user: { select: { email: true } } },
   });
 }
