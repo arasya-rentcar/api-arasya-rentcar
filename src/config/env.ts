@@ -41,6 +41,12 @@ const envSchema = z.object({
     .enum(['true', 'false'])
     .default('true')
     .transform((v) => v === 'true'),
+  // Driver ON_DUTY / car IN_USE follow the WIB date of their trips: refresh
+  // them at startup and every 10 minutes. false = off.
+  RESOURCE_STATUS_REFRESH_ENABLED: z
+    .enum(['true', 'false'])
+    .default('true')
+    .transform((v) => v === 'true'),
 });
 
 const parsed = envSchema.safeParse(process.env);

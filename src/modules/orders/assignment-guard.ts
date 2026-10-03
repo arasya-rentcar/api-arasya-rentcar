@@ -16,6 +16,26 @@ export function assertOrderPaidForDriverAssignment(order: {
   );
 }
 
+// Owner rule (T5, Oct 2026): the days of a finished (finalized, DONE) or
+// cancelled order are closed: no driver/car, status, time or money change
+// through Edit Hari, "Ganti Semua" or any other day edit. What stays allowed
+// after the end lives elsewhere: trip-cost review (Biaya), driver/partner pay
+// (Utang: extras, mark paid/unpaid), invoices, payments and refunds.
+export function assertOrderOpenForDayChanges(order: {
+  order_status: string;
+}): void {
+  if (order.order_status === "DONE")
+    throw new AppError(
+      "Order ini sudah selesai (difinalisasi), jadi harinya tidak bisa diubah lagi. Biaya perjalanan dan pembayaran fee driver tetap bisa diurus di menu Biaya dan Utang.",
+      409,
+    );
+  if (order.order_status === "CANCELLED")
+    throw new AppError(
+      "Order ini sudah dibatalkan, jadi harinya tidak bisa diubah lagi. Biaya perjalanan dan pembayaran fee driver tetap bisa diurus di menu Biaya dan Utang.",
+      409,
+    );
+}
+
 // Owner rule (3 Oct 2026): the trip with the customer begins only when the
 // order is paid in full. The driver may still leave the garage and record the
 // arrival at the pickup; "Mulai perjalanan" (customer on board) is what waits.

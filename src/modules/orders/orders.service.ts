@@ -2,6 +2,7 @@ import prisma from "../../prisma/client";
 import { Prisma, type ScheduleStatus } from "@prisma/client";
 import { AppError } from "../../utils/AppError";
 import {
+  assertOrderOpenForDayChanges,
   assertOrderPaidForDriverAssignment,
   netPaid,
   paymentStatusFor,
@@ -21,11 +22,14 @@ import { defaultDriverFee } from "../../utils/driverFee";
 import { computeMargin, MARGIN_FORMULA_VERSION } from "../../utils/margin";
 import { recomputeLineMoney } from "../schedule/line-money.service";
 import { rollupOrderFinance } from "../schedule/schedule.service";
+import { assertUnitsFree } from "../schedule/availability";
 import { nextOrderCode } from "../../utils/codes";
 import { wibShortDay } from "../../utils/wib";
 import { buildCancellationFeePdf } from "../invoices/invoices.service";
 import {
   deriveAndSetOrderStatus,
+  refreshCarStatuses,
+  refreshDriverStatuses,
   syncDriverStatus,
   syncCarStatus,
 } from "../schedule/order-derive.service";
@@ -765,12 +769,10 @@ export async function getOrderById(id: string) {
 function assertOrderStructurallyEditable(order: {
   order_status: string;
 }): void {
-  if (order.order_status === "DONE" || order.order_status === "CANCELLED") {
-    throw new AppError(
-      `Cannot modify a ${order.order_status} order. Finished and cancelled orders are read-only.`,
-      409,
-    );
-  }
+  if (order.order_status === "DONE")
+    throw new AppError("Order ini sudah selesai (difinalisasi), jadi tidak bisa diubah lagi.", 409);
+  if (order.order_status === "CANCELLED")
+    throw new AppError("Order ini sudah dibatalkan, jadi tidak bisa diubah lagi.", 409);
 }
 
 // What a day in the order form carries (everything else on a day belongs to
@@ -996,6 +998,9 @@ export async function updateOrder(id: string, input: UpdateOrderInput) {
   }
   // Drivers to tell about a moved day (sent after the transaction commits).
   const movedForDriver = new Map<string, string[]>();
+  // Drivers/cars of moved days: ON_DUTY / IN_USE follow the trip date.
+  const movedDrivers = new Set<string>();
+  const movedCars = new Set<string>();
 
   const result = await prisma.$transaction(
     async (tx) => {
@@ -1036,6 +1041,7 @@ export async function updateOrder(id: string, input: UpdateOrderInput) {
               select: {
                 is_external: true,
                 driver_id: true,
+                car_id: true,
                 line_status: true,
                 payable: { select: { id: true } },
               },
@@ -1051,6 +1057,10 @@ export async function updateOrder(id: string, input: UpdateOrderInput) {
           const moneyChanged = "total_price" in u.data || "service_date" in u.data;
           if (moneyChanged && !(fresh.is_external && !fresh.payable)) {
             await recomputeLineMoney(tx, u.line.id);
+          }
+          if (u.schedule && !fresh.is_external) {
+            if (fresh.driver_id) movedDrivers.add(fresh.driver_id);
+            if (fresh.car_id) movedCars.add(fresh.car_id);
           }
           if (
             u.schedule &&
@@ -1133,6 +1143,8 @@ export async function updateOrder(id: string, input: UpdateOrderInput) {
         if (days.updates.length || days.creates.length || days.deletes.length) {
           await rollupOrderFinance(tx, id);
           await deriveAndSetOrderStatus(tx, id);
+          await refreshDriverStatuses(tx, [...movedDrivers]);
+          await refreshCarStatuses(tx, [...movedCars]);
         }
       }
 
@@ -1194,6 +1206,7 @@ export async function assignOrder(orderId: string, input: AssignOrderInput) {
   // Validate order
   const order = await prisma.order.findUnique({ where: { id: orderId } });
   if (!order) throw new AppError("Order not found", 404);
+  assertOrderOpenForDayChanges(order);
   if (order.order_status !== "CREATED") {
     throw new AppError(
       "Order must be in CREATED status to assign a driver",
@@ -1202,26 +1215,18 @@ export async function assignOrder(orderId: string, input: AssignOrderInput) {
   }
   assertOrderPaidForDriverAssignment(order);
 
-  // Validate driver
   const driver = await prisma.driver.findUnique({
     where: { id: input.driver_id },
   });
   if (!driver) throw new AppError("Driver not found", 404);
-  if (driver.status !== "AVAILABLE") {
-    throw new AppError("Driver is not available", 409);
-  }
-
-  // Validate car
   const car = await prisma.car.findUnique({ where: { id: input.car_id } });
   if (!car) throw new AppError("Car not found", 404);
-  if (car.status !== "AVAILABLE") {
-    throw new AppError("Car is not available", 409);
-  }
 
   // Merge: assign at the LINE level (the line IS the trip). Every internal
   // day-line that has no driver yet inherits this driver+car and flips to
-  // ASSIGNED; order + driver/car status are then derived from the lines.
-  // Only open days: a cancelled or finished day must not come back to life.
+  // ASSIGNED, exactly like a per-day assign; order + driver/car status are
+  // then derived from the lines. Only open days: a cancelled or finished day
+  // must not come back to life.
   const openUnassigned = {
     order_id: orderId,
     is_external: false,
@@ -1230,8 +1235,18 @@ export async function assignOrder(orderId: string, input: AssignOrderInput) {
   };
   const newLines = await prisma.orderServiceItem.findMany({
     where: openUnassigned,
-    select: { id: true, service_kind: true, driver_fee: true },
+    select: {
+      id: true,
+      service_kind: true,
+      driver_fee: true,
+      service_date: true,
+      start_at: true,
+      end_at: true,
+    },
   });
+  // Free on these days' dates and times (not by Driver/Car status: a driver
+  // booked for another date is free here).
+  await assertUnitsFree(prisma, { driver, car }, newLines);
   let got = newLines;
   const updated = await prisma.$transaction(
     async (tx) => {
@@ -1242,6 +1257,8 @@ export async function assignOrder(orderId: string, input: AssignOrderInput) {
           driver_id: input.driver_id,
           car_id: input.car_id,
           line_status: "ASSIGNED",
+          // Nobody accepted these days yet: the app asks "Terima tugas".
+          driver_accepted_at: null,
         },
       });
       const mine = new Set(
@@ -1292,15 +1309,29 @@ export async function reassignOrder(
 ) {
   const order = await prisma.order.findUnique({ where: { id: orderId } });
   if (!order) throw new AppError("Order not found", 404);
+  assertOrderOpenForDayChanges(order);
 
-  // Only the not-yet-started internal lines are eligible for a swap.
+  // Only the not-yet-started internal lines that have a driver are eligible
+  // for a swap: ASSIGNED, plus SCHEDULED days given a driver before per-day
+  // assignment made them ASSIGNED (they become ASSIGNED here).
+  const swappable: Prisma.OrderServiceItemWhereInput = {
+    order_id: orderId,
+    is_external: false,
+    OR: [
+      { line_status: "ASSIGNED" },
+      { line_status: "SCHEDULED", driver_id: { not: null } },
+    ],
+  };
   const eligibleLines = await prisma.orderServiceItem.findMany({
-    where: {
-      order_id: orderId,
-      is_external: false,
-      line_status: "ASSIGNED",
+    where: swappable,
+    select: {
+      id: true,
+      driver_id: true,
+      car_id: true,
+      service_date: true,
+      start_at: true,
+      end_at: true,
     },
-    select: { id: true, driver_id: true, car_id: true },
   });
   if (eligibleLines.length === 0) {
     throw new AppError(
@@ -1314,28 +1345,19 @@ export async function reassignOrder(
     assertOrderPaidForDriverAssignment(order);
   }
 
-  // Validate the new driver: must be AVAILABLE, unless it is already the driver
-  // on one of this order's lines (re-confirming the same driver is harmless).
   const driver = await prisma.driver.findUnique({
     where: { id: input.driver_id },
   });
   if (!driver) throw new AppError("Driver not found", 404);
-  const driverAlreadyOnOrder = eligibleLines.some(
-    (l) => l.driver_id === input.driver_id,
-  );
-  if (driver.status !== "AVAILABLE" && !driverAlreadyOnOrder) {
-    throw new AppError("Driver is not available", 409);
-  }
-
-  // Validate the new car: same rule.
   const car = await prisma.car.findUnique({ where: { id: input.car_id } });
   if (!car) throw new AppError("Car not found", 409);
-  const carAlreadyOnOrder = eligibleLines.some(
-    (l) => l.car_id === input.car_id,
-  );
-  if (car.status !== "AVAILABLE" && !carAlreadyOnOrder) {
-    throw new AppError("Car is not available", 409);
-  }
+  // The new driver / car must be free at the times of the days they take
+  // over (by date and time, not by Driver/Car status). Days that keep the
+  // same driver or car are not checked again.
+  const driverDays = eligibleLines.filter((l) => l.driver_id !== input.driver_id);
+  const carDays = eligibleLines.filter((l) => l.car_id !== input.car_id);
+  if (driverDays.length) await assertUnitsFree(prisma, { driver }, driverDays);
+  if (carDays.length) await assertUnitsFree(prisma, { car }, carDays);
 
   // A day already paid to its driver cannot move to another driver.
   const paidDays = await prisma.payable.findMany({
@@ -1363,15 +1385,26 @@ export async function reassignOrder(
   );
 
   const updated = await prisma.$transaction(async (tx) => {
+    const mine = { id: { in: eligibleLines.map((l) => l.id) } };
+    // Days the new driver already has keep their acceptance (car swap only).
+    await tx.orderServiceItem.updateMany({
+      where: { AND: [swappable, mine, { driver_id: input.driver_id }] },
+      data: { car_id: input.car_id, line_status: "ASSIGNED" },
+    });
+    // A day moving to another driver: not accepted by them yet.
     await tx.orderServiceItem.updateMany({
       where: {
-        order_id: orderId,
-        is_external: false,
-        line_status: "ASSIGNED",
+        AND: [
+          swappable,
+          mine,
+          { OR: [{ driver_id: null }, { driver_id: { not: input.driver_id } }] },
+        ],
       },
       data: {
         driver_id: input.driver_id,
         car_id: input.car_id,
+        line_status: "ASSIGNED",
+        driver_accepted_at: null,
       },
     });
     // The unpaid driver payables follow the days to the new driver.

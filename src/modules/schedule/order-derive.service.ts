@@ -1,4 +1,5 @@
 import type { Prisma, OrderStatus, ScheduleStatus } from '@prisma/client';
+import { wibStartOfDay } from '../../utils/wib';
 
 /** Line states that count as a started-but-not-finished trip. */
 export type LineTimestampEffect = {
@@ -141,65 +142,94 @@ export async function deriveAndSetOrderStatus(
   return next;
 }
 
-/** A line counts as "occupying" its driver/car while it is active. */
-const ACTIVE_LINE: ScheduleStatus[] = ['ASSIGNED', 'IN_PROGRESS'];
 
 /**
- * Sync a driver's status from their lines.
- *  - ON_DUTY   while they have any ASSIGNED/IN_PROGRESS line.
- *  - AVAILABLE once all their lines are terminal (DONE/CANCELLED) or gone.
- * Never touches a driver flagged OFF (manual hard-down wins).
+ * The days that make their driver ON_DUTY and their car IN_USE right now
+ * (owner, Oct 2026): a day under way (IN_PROGRESS, whatever its date), or a
+ * day not started yet on today's WIB calendar day (its date, or its
+ * pickup-to-end window touching today). A driver booked for next week is
+ * AVAILABLE until that day. SCHEDULED counts too, for days that got their
+ * driver before per-day assignment made them ASSIGNED.
  */
+export function occupyingNow(now: Date = new Date()): Prisma.OrderServiceItemWhereInput {
+  const start = wibStartOfDay(now);
+  const end = new Date(start.getTime() + 24 * 60 * 60 * 1000);
+  return {
+    is_external: false,
+    OR: [
+      { line_status: 'IN_PROGRESS' },
+      {
+        line_status: { in: ['SCHEDULED', 'ASSIGNED'] },
+        OR: [
+          { service_date: { gte: start, lt: end } },
+          { service_date: null, start_at: { gte: start, lt: end } },
+          { start_at: { lt: end }, end_at: { gt: start } },
+        ],
+      },
+    ],
+  };
+}
+
+/**
+ * Set drivers ON_DUTY / AVAILABLE from their days (occupyingNow). `ids`
+ * limits it to some drivers; leave it out for all of them (the periodic
+ * refresh, since the status depends on the date). OFF is a manual flag and is
+ * never touched. Two conditional updates, no reads: idempotent and cheap
+ * inside a transaction. Returns how many drivers changed.
+ */
+export async function refreshDriverStatuses(
+  db: Prisma.TransactionClient,
+  ids?: string[],
+  now: Date = new Date(),
+): Promise<number> {
+  if (ids && ids.length === 0) return 0;
+  const busy = occupyingNow(now);
+  const scope: Prisma.DriverWhereInput = ids ? { id: { in: ids } } : {};
+  const on = await db.driver.updateMany({
+    where: { ...scope, status: 'AVAILABLE', schedule_lines: { some: busy } },
+    data: { status: 'ON_DUTY' },
+  });
+  const off = await db.driver.updateMany({
+    where: { ...scope, status: 'ON_DUTY', schedule_lines: { none: busy } },
+    data: { status: 'AVAILABLE' },
+  });
+  return on.count + off.count;
+}
+
+/** Same for cars: IN_USE / AVAILABLE; MAINTENANCE is manual and never touched. */
+export async function refreshCarStatuses(
+  db: Prisma.TransactionClient,
+  ids?: string[],
+  now: Date = new Date(),
+): Promise<number> {
+  if (ids && ids.length === 0) return 0;
+  const busy = occupyingNow(now);
+  const scope: Prisma.CarWhereInput = ids ? { id: { in: ids } } : {};
+  const on = await db.car.updateMany({
+    where: { ...scope, status: 'AVAILABLE', schedule_lines: { some: busy } },
+    data: { status: 'IN_USE' },
+  });
+  const off = await db.car.updateMany({
+    where: { ...scope, status: 'IN_USE', schedule_lines: { none: busy } },
+    data: { status: 'AVAILABLE' },
+  });
+  return on.count + off.count;
+}
+
+/** One driver's status from their days (see refreshDriverStatuses). */
 export async function syncDriverStatus(
   tx: Prisma.TransactionClient,
   driverId: string,
 ): Promise<void> {
-  const driver = await tx.driver.findUnique({
-    where: { id: driverId },
-    select: { status: true },
-  });
-  if (!driver || driver.status === 'OFF') return;
-
-  const activeCount = await tx.orderServiceItem.count({
-    where: {
-      driver_id: driverId,
-      is_external: false,
-      line_status: { in: ACTIVE_LINE },
-    },
-  });
-  const next = activeCount > 0 ? 'ON_DUTY' : 'AVAILABLE';
-  if (driver.status !== next) {
-    await tx.driver.update({ where: { id: driverId }, data: { status: next } });
-  }
+  await refreshDriverStatuses(tx, [driverId]);
 }
 
-/**
- * Sync a car's status from its lines.
- *  - IN_USE    while it has any ASSIGNED/IN_PROGRESS line.
- *  - AVAILABLE once all its lines are terminal or gone.
- * Never touches a car flagged MAINTENANCE (manual hard-down wins).
- */
+/** One car's status from its days (see refreshCarStatuses). */
 export async function syncCarStatus(
   tx: Prisma.TransactionClient,
   carId: string,
 ): Promise<void> {
-  const car = await tx.car.findUnique({
-    where: { id: carId },
-    select: { status: true },
-  });
-  if (!car || car.status === 'MAINTENANCE') return;
-
-  const activeCount = await tx.orderServiceItem.count({
-    where: {
-      car_id: carId,
-      is_external: false,
-      line_status: { in: ACTIVE_LINE },
-    },
-  });
-  const next = activeCount > 0 ? 'IN_USE' : 'AVAILABLE';
-  if (car.status !== next) {
-    await tx.car.update({ where: { id: carId }, data: { status: next } });
-  }
+  await refreshCarStatuses(tx, [carId]);
 }
 
 /**
