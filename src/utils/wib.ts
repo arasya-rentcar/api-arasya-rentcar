@@ -17,3 +17,9 @@ export function wibStartOfDay(now = new Date()): Date {
 export function staleTripCutoff(now = new Date()): Date {
   return new Date(wibStartOfDay(now).getTime() - DAY_MS);
 }
+
+/** Short WIB calendar day for messages and labels, e.g. "3 Okt" ("" when unset). */
+export function wibShortDay(d: Date | null): string {
+  if (!d) return "";
+  return d.toLocaleDateString("id-ID", { timeZone: "Asia/Jakarta", day: "numeric", month: "short" });
+}

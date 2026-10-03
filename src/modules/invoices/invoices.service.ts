@@ -2,6 +2,7 @@ import { waLink, waManual } from "../../utils/waManual";
 import { startPayment } from "../orders/assignment-guard";
 import { notifyOrderPaidInFull } from "../../services/driverNotify";
 import { reportLeadPurchase } from "../../services/ga4.service";
+import type { Prisma } from "@prisma/client";
 import prisma from "../../prisma/client";
 import { AppError } from "../../utils/AppError";
 import { nextInvoiceNumber, nextReceiptNumber } from "../../utils/codes";
@@ -434,7 +435,56 @@ export async function getPaymentProofUrl(invoiceId: string) {
 }
 
 // Mark an invoice PAID -> it now prints as a Kwitansi/Receipt.
-// Recomputes the order payment_status from the sum of all PAID invoices.
+const INVOICE_TYPE_LABEL: Record<string, string> = {
+  DP: "Down Payment",
+  SETTLEMENT: "Settlement Payment",
+  FULL: "Full Payment",
+  ADDITIONAL: "Additional Charge",
+  COMBINED: "Rental + Additional (Combined)",
+};
+const PAYMENT_METHOD_LABEL: Record<string, string> = {
+  CASH: "Cash",
+  BANK_TRANSFER: "Bank Transfer",
+  QRIS: "QRIS",
+  OTHER: "Other",
+};
+const PAYMENT_RECEIVED_LABEL: Record<string, string> = {
+  DP: "Pembayaran DP diterima",
+  SETTLEMENT: "Pelunasan diterima",
+  FULL: "Pembayaran diterima",
+  ADDITIONAL: "Pembayaran tambahan diterima",
+};
+
+/**
+ * Money actually received on an order, one entry per paid invoice: its
+ * receipt amount (may exceed the invoice on overpayment), or the invoice
+ * amount for old rows without a receipt. An invoice voided later by a
+ * cancellation still counts: that money was received.
+ */
+async function paymentsOnOrder(
+  db: Prisma.TransactionClient | typeof prisma,
+  orderId: string,
+  excludeInvoiceId: string,
+) {
+  const paid = await db.invoice.findMany({
+    where: {
+      order_id: orderId,
+      id: { not: excludeInvoiceId },
+      OR: [{ status: "PAID" }, { status: "CANCELLED", paid_at: { not: null } }],
+    },
+    orderBy: [{ paid_at: "asc" }, { issue_date: "asc" }],
+    select: { id: true, invoice_type: true, amount: true, paid_at: true, issue_date: true },
+  });
+  const receipts = await db.receipt.findMany({
+    where: { invoice_id: { in: paid.map((p) => p.id) } },
+    select: { invoice_id: true, amount: true },
+  });
+  const received = new Map(receipts.map((r) => [r.invoice_id, Number(r.amount)]));
+  const items = paid.map((p) => ({ ...p, received: received.get(p.id) ?? Number(p.amount) }));
+  return { items, total: items.reduce((s, p) => s + p.received, 0) };
+}
+
+// Mark an invoice paid: money received, kwitansi, order payment status.
 export async function markInvoicePaid(
   invoiceId: string,
   input: {
@@ -453,7 +503,6 @@ export async function markInvoicePaid(
       order: {
         include: {
           service_items: { orderBy: { sort_order: "asc" } },
-          adjustments: { orderBy: { created_at: "asc" } },
           customer: true,
         },
       },
@@ -476,146 +525,11 @@ export async function markInvoicePaid(
   const paidAt = input.paid_at ? new Date(input.paid_at) : new Date();
   const paymentMethod = (input.payment_method ||
     invoice.payment_method) as string;
-
   // Sprint 2 payment model: record the ACTUAL money received, which may be more
   // than the invoice amount (overpayment). Defaults to the invoice amount.
-  const invoiceAmount = Number(invoice.amount);
   const amountReceived =
-    input.amount_received != null ? Number(input.amount_received) : invoiceAmount;
-  // Surplus paid against THIS invoice (carried toward the rest of the order).
-  const overpayThisInvoice = Math.max(amountReceived - invoiceAmount, 0);
-  const orderTotal = Number(invoice.order.final_price);
-
-  const typeLabels: Record<string, string> = {
-    DP: "Down Payment",
-    SETTLEMENT: "Settlement Payment",
-    FULL: "Full Payment",
-    ADDITIONAL: "Additional Charge",
-    COMBINED: "Rental + Additional (Combined)",
-  };
-  const methodLabels: Record<string, string> = {
-    CASH: "Cash",
-    BANK_TRANSFER: "Bank Transfer",
-    QRIS: "QRIS",
-    OTHER: "Other",
-  };
-
-  // For a COMBINED invoice the kwitansi mirrors the invoice: rental lines plus
-  // an Additional Charges section.
-  const receiptBillableAdjustments = invoice.order.adjustments.filter(
-    (a) => a.is_billable,
-  );
-  const receiptAdditionalItems =
-    invoice.invoice_type === "COMBINED"
-      ? receiptBillableAdjustments.map(adjustmentToLineItem)
-      : undefined;
-  // The kwitansi line items mirror the invoice: an ADDITIONAL receipt lists ONLY
-  // the additional charges; every other type lists the rental service days.
-  const receiptRentalItems = invoice.order.service_items.map((item) => ({
-    serviceDate: item.service_date,
-    description: item.description,
-    serviceKind: item.service_kind,
-    servicePackage: item.service_package,
-    pickupLocation: item.pickup_location,
-    dropoffLocation: item.dropoff_location,
-    quantity: item.quantity,
-    unitPrice: Number(item.unit_price),
-    totalPrice: Number(item.total_price),
-  }));
-  const receiptItems =
-    invoice.invoice_type === "ADDITIONAL"
-      ? receiptBillableAdjustments.map(adjustmentToLineItem)
-      : receiptRentalItems;
-
-  // Sum of prior invoices (excluding this one) for the receipt summary.
-  const priorAgg = await prisma.invoice.aggregate({
-    where: {
-      order_id: invoice.order_id,
-      id: { not: invoice.id },
-      status: { notIn: ["REVISED", "CANCELLED"] },
-    },
-    _sum: { amount: true },
-  });
-  const previouslyPaid = Number(priorAgg._sum.amount ?? 0);
-
-  // Build the "payments received" lines for the kuitansi: all PAID invoices so
-  // far (DP / settlement / etc.) plus the one being paid now.
-  const priorPaid = await prisma.invoice.findMany({
-    where: { order_id: invoice.order_id, status: "PAID", id: { not: invoice.id } },
-    orderBy: { issue_date: "asc" },
-  });
-  const typeLabelId: Record<string, string> = {
-    DP: "Pembayaran DP diterima",
-    SETTLEMENT: "Pelunasan diterima",
-    FULL: "Pembayaran diterima",
-    ADDITIONAL: "Pembayaran tambahan diterima",
-  };
-  const fmtTgl = (d: Date) =>
-    new Date(d).toLocaleDateString("id-ID", {
-      timeZone: "Asia/Jakarta",
-      day: "numeric",
-      month: "long",
-      year: "numeric",
-    });
-  // Prior receipts hold the ACTUAL money received per prior invoice (may exceed
-  // the invoice amount on overpayment). Map by invoice_id for accurate totals.
-  const priorReceipts = await prisma.receipt.findMany({
-    where: { invoice_id: { in: priorPaid.map((p) => p.id) } },
-  });
-  const receivedByInvoice = new Map(
-    priorReceipts.map((r) => [r.invoice_id, Number(r.amount)]),
-  );
-  const paymentsReceived = [
-    ...priorPaid.map((p) => ({
-      label: `${typeLabelId[p.invoice_type] ?? "Pembayaran diterima"} tanggal ${fmtTgl(p.paid_at ?? p.issue_date)}`,
-      amount: receivedByInvoice.get(p.id) ?? Number(p.amount),
-    })),
-    {
-      label: `${typeLabelId[invoice.invoice_type] ?? "Pembayaran diterima"} tanggal ${fmtTgl(paidAt)}`,
-      amount: amountReceived,
-    },
-  ];
-  const totalReceived = paymentsReceived.reduce((s, p) => s + p.amount, 0);
-  const remainingBalance = Math.max(orderTotal - totalReceived, 0);
-  // Refund is due ONLY when total received exceeds the ORDER total (never the DP).
-  const refundDue = Math.max(totalReceived - orderTotal, 0);
-
-  // Regenerate the PDF as a Kwitansi/Receipt (LUNAS stamp, payment date).
-  // IMPORTANT: this is stored in receipt_url, NOT file_url. The original
-  // invoice PDF (file_url) is kept so the order keeps BOTH documents paired.
-  let receiptUrl: string | null = null;
-  try {
-    const pdfBuffer = await generateInvoicePDF({
-      invoiceNumber: invoice.invoice_number,
-      displayNumber: invoice.order.order_code ?? null,
-      issueDate: invoice.issue_date,
-      customerName: invoice.order.customer_name,
-      customerPhone: invoice.order.customer_phone ?? null,
-      pickupLocation: invoice.order.pickup_location,
-      dropoffLocation: invoice.order.dropoff_location,
-      finalPrice: Number(invoice.order.final_price),
-      invoiceType: typeLabels[invoice.invoice_type] ?? invoice.invoice_type,
-      paymentMethod: methodLabels[paymentMethod] ?? paymentMethod,
-      amountPaid: amountReceived,
-      previouslyPaid,
-      documentMode: "RECEIPT",
-      paidAt,
-      paymentsReceived,
-      remainingBalance,
-      // Sprint 2: overpayment/refund details live ONLY in the PDF.
-      refundDue,
-      noteLines: buildNoteLines(invoice.order),
-      items: receiptItems,
-      additionalItems: receiptAdditionalItems,
-    });
-    receiptUrl = await uploadInvoicePDF(
-      pdfBuffer,
-      `${invoice.invoice_number}-receipt.pdf`,
-    );
-  } catch (err) {
-    // If receipt PDF fails, still mark paid; keep the existing invoice PDF.
-    console.error("Receipt PDF generation failed:", err);
-  }
+    input.amount_received != null ? Number(input.amount_received) : Number(invoice.amount);
+  const customer = invoice.order.customer;
 
   // Upload the payment proof to the private bucket (signed URLs are minted on
   // read). Store only the storage path on the receipt.
@@ -625,101 +539,97 @@ export async function markInvoicePaid(
     public: false,
   });
 
-  const customer = invoice.order.customer;
-
   // One payment per invoice, also on a double click or two admins at once:
-  // the order row is locked, the invoice turns PAID only if it is not already,
-  // and only that request reserves the kwitansi number, writes the receipt and
-  // adds to the totals (the other one burns no number and records nothing).
-  const paid = await prisma.$transaction(
-    async (tx) => {
-      await tx.$queryRaw`SELECT id FROM "orders" WHERE id = ${invoice.order_id} FOR UPDATE`;
-      // The order total as it is now (it may have changed since it was read).
-      const { final_price: currentTotal } = await tx.order.findUniqueOrThrow({
-        where: { id: invoice.order_id },
-        select: { final_price: true },
-      });
-      const orderTotalNow = Number(currentTotal);
-      const { count } = await tx.invoice.updateMany({
-        where: { id: invoiceId, status: { notIn: ["PAID", "REVISED", "CANCELLED"] } },
-        data: {
-          status: "PAID",
-          paid_at: paidAt,
-          receipt_url: receiptUrl,
-          ...(input.payment_method
-            ? { payment_method: input.payment_method as never }
-            : {}),
-        },
-      });
-      if (count === 0) return null;
-
-      // Create the Kwitansi/Receipt row: one per invoice payment.
-      if (customer) {
-        const { number: receiptNumber, seq: receiptSeq } = await nextReceiptNumber(
-          tx,
-          { id: customer.id, code: customer.code },
-          paidAt,
-        );
-        await tx.receipt.create({
+  // the invoice turns PAID only if it is not already, and only that request
+  // reserves the kwitansi number, writes the receipt and adds to the totals
+  // (the other one burns no number and records nothing). Lock order: invoice
+  // row, then order row (as cancelOrder and reviseInvoice), so they cannot
+  // deadlock; the order lock makes two invoices paid at once add up.
+  let applied: boolean;
+  try {
+    applied = await prisma.$transaction(
+      async (tx) => {
+        const { count } = await tx.invoice.updateMany({
+          where: { id: invoiceId, status: { notIn: ["PAID", "REVISED", "CANCELLED"] } },
           data: {
-            receipt_number: receiptNumber,
-            invoice_id: invoice.id,
-            customer_id: customer.id,
-            customer_seq: receiptSeq,
-            payment_date: paidAt,
-            // ACTUAL money received (may exceed the invoice amount on overpayment).
-            amount: amountReceived,
-            payment_method: paymentMethod as never,
-            file_url: receiptUrl,
-            // Private storage path; resolved to a signed URL on read.
-            payment_proof_url: proofUpload.path,
+            status: "PAID",
+            paid_at: paidAt,
+            ...(input.payment_method
+              ? { payment_method: input.payment_method as never }
+              : {}),
           },
         });
-        // total_paid = sum of receipts (cash actually collected, G9).
-        await tx.customer.update({
-          where: { id: customer.id },
-          data: { total_paid: { increment: amountReceived } },
+        if (count === 0) return false;
+        await tx.$queryRaw`SELECT id FROM "orders" WHERE id = ${invoice.order_id} FOR NO KEY UPDATE`;
+
+        if (customer) {
+          const { number: receiptNumber, seq: receiptSeq } = await nextReceiptNumber(
+            tx,
+            { id: customer.id, code: customer.code },
+            paidAt,
+          );
+          await tx.receipt.create({
+            data: {
+              receipt_number: receiptNumber,
+              invoice_id: invoice.id,
+              customer_id: customer.id,
+              customer_seq: receiptSeq,
+              payment_date: paidAt,
+              // ACTUAL money received (may exceed the invoice amount on overpayment).
+              amount: amountReceived,
+              payment_method: paymentMethod as never,
+              // Private storage path; resolved to a signed URL on read.
+              payment_proof_url: proofUpload.path,
+            },
+          });
+          // total_paid = sum of receipts (cash actually collected, G9).
+          await tx.customer.update({
+            where: { id: customer.id },
+            data: { total_paid: { increment: amountReceived } },
+          });
+        }
+
+        // paid_to_date = all money received on the order, this payment included.
+        const others = await paymentsOnOrder(tx, invoice.order_id, invoice.id);
+        const paidTotal = others.total + amountReceived;
+        const { final_price } = await tx.order.findUniqueOrThrow({
+          where: { id: invoice.order_id },
+          select: { final_price: true },
         });
-      }
+        const orderTotal = Number(final_price);
+        let paymentStatus: "UNPAID" | "DP_PAID" | "PAID" = "UNPAID";
+        if (paidTotal >= orderTotal && orderTotal > 0) paymentStatus = "PAID";
+        else if (paidTotal > 0) paymentStatus = "DP_PAID";
 
-      // paid_to_date = ACTUAL money received across the order: every other
-      // PAID invoice (its receipt amount, or the invoice amount for old rows
-      // without a receipt) + this payment. Read under the order lock, so a
-      // second invoice paid at the same moment is counted too.
-      const otherPaid = await tx.invoice.findMany({
-        where: { order_id: invoice.order_id, status: "PAID", id: { not: invoice.id } },
-        select: { id: true, amount: true },
-      });
-      const otherReceipts = await tx.receipt.findMany({
-        where: { invoice_id: { in: otherPaid.map((p) => p.id) } },
-        select: { invoice_id: true, amount: true },
-      });
-      const received = new Map(otherReceipts.map((r) => [r.invoice_id, Number(r.amount)]));
-      const paidTotal =
-        otherPaid.reduce((s, p) => s + (received.get(p.id) ?? Number(p.amount)), 0) +
-        amountReceived;
+        await tx.order.update({
+          where: { id: invoice.order_id },
+          data: { payment_status: paymentStatus, paid_to_date: paidTotal },
+        });
+        return true;
+      },
+      { maxWait: 15000, timeout: 20000 },
+    );
+  } catch (err) {
+    // Nothing was recorded: the proof must not stay behind in the bucket.
+    void removeFile(PAYMENT_PROOFS_BUCKET, proofUpload.path);
+    throw err;
+  }
 
-      let paymentStatus: "UNPAID" | "DP_PAID" | "PAID" = "UNPAID";
-      if (paidTotal >= orderTotalNow && orderTotalNow > 0) paymentStatus = "PAID";
-      else if (paidTotal > 0) paymentStatus = "DP_PAID";
-
-      await tx.order.update({
-        where: { id: invoice.order_id },
-        data: { payment_status: paymentStatus, paid_to_date: paidTotal },
-      });
-
-      return tx.invoice.findUniqueOrThrow({ where: { id: invoiceId } });
-    },
-    { maxWait: 15000, timeout: 20000 },
-  );
-
-  if (!paid) {
+  if (!applied) {
     // Another request recorded this payment first: drop our copy of the proof
     // and answer with the invoice as it is now.
     void removeFile(PAYMENT_PROOFS_BUCKET, proofUpload.path);
     const current = await prisma.invoice.findUnique({ where: { id: invoiceId } });
     if (current?.status === "PAID") return current;
     throw new AppError(`Cannot mark a ${current?.status ?? "missing"} invoice as paid`, 409);
+  }
+
+  // The kwitansi PDF, built from what is now committed (so a payment recorded
+  // at the same moment is on it too). If it fails the invoice stays paid.
+  try {
+    await attachReceiptPdf(invoiceId, { paidAt, paymentMethod, amountReceived });
+  } catch (err) {
+    console.error("Receipt PDF generation failed:", err);
   }
 
   // Website lead → GA4 "purchase" (first payment only; never blocks the admin).
@@ -732,7 +642,113 @@ export async function markInvoicePaid(
     void notifyOrderPaidInFull(invoice.order_id);
   }
 
-  return paid;
+  return prisma.invoice.findUniqueOrThrow({ where: { id: invoiceId } });
+}
+
+/**
+ * Regenerate the invoice as a Kwitansi/Receipt (LUNAS stamp, payment date)
+ * and attach it. Stored in receipt_url, NOT file_url: the original invoice PDF
+ * is kept so the order keeps BOTH documents paired.
+ */
+async function attachReceiptPdf(
+  invoiceId: string,
+  pay: { paidAt: Date; paymentMethod: string; amountReceived: number },
+) {
+  const invoice = await prisma.invoice.findUniqueOrThrow({
+    where: { id: invoiceId },
+    include: {
+      order: {
+        include: {
+          service_items: { orderBy: { sort_order: "asc" } },
+          adjustments: { orderBy: { created_at: "asc" } },
+        },
+      },
+    },
+  });
+  const order = invoice.order;
+  const orderTotal = Number(order.final_price);
+
+  // For a COMBINED invoice the kwitansi mirrors the invoice: rental lines plus
+  // an Additional Charges section. An ADDITIONAL receipt lists ONLY the
+  // additional charges; every other type lists the rental service days.
+  const billable = order.adjustments.filter((a) => a.is_billable);
+  const rentalItems = order.service_items.map((item) => ({
+    serviceDate: item.service_date,
+    description: item.description,
+    serviceKind: item.service_kind,
+    servicePackage: item.service_package,
+    pickupLocation: item.pickup_location,
+    dropoffLocation: item.dropoff_location,
+    quantity: item.quantity,
+    unitPrice: Number(item.unit_price),
+    totalPrice: Number(item.total_price),
+  }));
+  const items =
+    invoice.invoice_type === "ADDITIONAL" ? billable.map(adjustmentToLineItem) : rentalItems;
+  const additionalItems =
+    invoice.invoice_type === "COMBINED" ? billable.map(adjustmentToLineItem) : undefined;
+
+  // Sum of the other active invoices, for the receipt summary.
+  const priorAgg = await prisma.invoice.aggregate({
+    where: {
+      order_id: invoice.order_id,
+      id: { not: invoice.id },
+      status: { notIn: ["REVISED", "CANCELLED"] },
+    },
+    _sum: { amount: true },
+  });
+  const previouslyPaid = Number(priorAgg._sum.amount ?? 0);
+
+  // "Payments received" lines: every payment on the order so far, then this one.
+  const fmtTgl = (d: Date) =>
+    new Date(d).toLocaleDateString("id-ID", {
+      timeZone: "Asia/Jakarta",
+      day: "numeric",
+      month: "long",
+      year: "numeric",
+    });
+  const others = await paymentsOnOrder(prisma, invoice.order_id, invoice.id);
+  const paymentsReceived = [
+    ...others.items.map((p) => ({
+      label: `${PAYMENT_RECEIVED_LABEL[p.invoice_type] ?? "Pembayaran diterima"} tanggal ${fmtTgl(p.paid_at ?? p.issue_date)}`,
+      amount: p.received,
+    })),
+    {
+      label: `${PAYMENT_RECEIVED_LABEL[invoice.invoice_type] ?? "Pembayaran diterima"} tanggal ${fmtTgl(pay.paidAt)}`,
+      amount: pay.amountReceived,
+    },
+  ];
+  const totalReceived = others.total + pay.amountReceived;
+
+  const pdfBuffer = await generateInvoicePDF({
+    invoiceNumber: invoice.invoice_number,
+    displayNumber: order.order_code ?? null,
+    issueDate: invoice.issue_date,
+    customerName: order.customer_name,
+    customerPhone: order.customer_phone ?? null,
+    pickupLocation: order.pickup_location,
+    dropoffLocation: order.dropoff_location,
+    finalPrice: orderTotal,
+    invoiceType: INVOICE_TYPE_LABEL[invoice.invoice_type] ?? invoice.invoice_type,
+    paymentMethod: PAYMENT_METHOD_LABEL[pay.paymentMethod] ?? pay.paymentMethod,
+    amountPaid: pay.amountReceived,
+    previouslyPaid,
+    documentMode: "RECEIPT",
+    paidAt: pay.paidAt,
+    paymentsReceived,
+    remainingBalance: Math.max(orderTotal - totalReceived, 0),
+    // Sprint 2: overpayment/refund details live ONLY in the PDF. Refund is due
+    // only when total received exceeds the ORDER total (never the DP).
+    refundDue: Math.max(totalReceived - orderTotal, 0),
+    noteLines: buildNoteLines(order),
+    items,
+    additionalItems,
+  });
+  const receiptUrl = await uploadInvoicePDF(pdfBuffer, `${invoice.invoice_number}-receipt.pdf`);
+  await prisma.$transaction([
+    prisma.invoice.update({ where: { id: invoiceId }, data: { receipt_url: receiptUrl } }),
+    prisma.receipt.updateMany({ where: { invoice_id: invoiceId }, data: { file_url: receiptUrl } }),
+  ]);
 }
 
 // Build a single combined STATEMENT PDF for the whole order: all service-day
@@ -962,10 +978,18 @@ export async function reviseInvoice(
   const fileUrl = await uploadInvoicePDF(pdfBuffer, fileName);
 
   const revised = await prisma.$transaction(async (tx) => {
-    await tx.invoice.update({
-      where: { id: invoice.id },
+    // Conditional: an invoice paid (or revised) by someone else since it was
+    // read above is left alone (the revision would bill the customer twice).
+    const { count } = await tx.invoice.updateMany({
+      where: { id: invoice.id, status: { notIn: ["PAID", "REVISED", "CANCELLED"] } },
       data: { status: "REVISED" },
     });
+    if (count === 0) {
+      throw new AppError(
+        "Invoice ini baru saja dibayar atau direvisi. Muat ulang halaman lalu coba lagi.",
+        409,
+      );
+    }
     const revised = await tx.invoice.create({
       data: {
         order_id: invoice.order_id,
