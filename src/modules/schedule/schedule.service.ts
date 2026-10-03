@@ -40,6 +40,8 @@ const lineInclude = {
   car: { select: { id: true, model: true, plate_number: true } },
   external_vendor: { select: { id: true, name: true, phone: true } },
   external_car: { select: { id: true, model: true, plate_number: true } },
+  // Extras on the day's payable also come off the margin (Edit Hari preview).
+  payable: { select: { status: true, extras_amount: true } },
 } satisfies Prisma.OrderServiceItemInclude;
 
 const WIB_OFFSET_MS = 7 * 60 * 60 * 1000; // Asia/Jakarta is UTC+7, no DST.
