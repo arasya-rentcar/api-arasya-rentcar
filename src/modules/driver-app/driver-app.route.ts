@@ -3,6 +3,8 @@ import multer from "multer";
 import { verifyTokenMiddleware, requireRole } from "../../middleware/auth.middleware";
 import {
   actionSchema,
+  createDriverRequestSchema,
+  driverRequestsQuerySchema,
   finishSchema,
   notificationsQuerySchema,
   readNotificationsSchema,
@@ -22,6 +24,7 @@ import {
   markNotificationsRead,
   startTrip,
 } from "./driver-app.service";
+import { createDriverRequest, listOwnRequests } from "../driver-requests/driver-requests.service";
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 
@@ -45,7 +48,7 @@ router.get("/me", async (req, res, next) => {
     const d = await driverForUser(req.user!.user_id);
     res.json({
       status: "success",
-      data: { id: d.id, name: d.name, phone: d.phone, status: d.status, type: d.type },
+      data: { id: d.id, name: d.name, phone: d.phone, status: d.status, type: d.type, etoll_card: d.etoll_card },
     });
   } catch (err) {
     next(err);
@@ -78,5 +81,21 @@ router.post(
 // Inbox: every push sent to this driver, newest first, plus the unread count.
 router.get("/notifications", h((req, id) => listNotifications(id, notificationsQuerySchema.parse(req.query))));
 router.post("/notifications/read", h((req, id) => markNotificationsRead(id, readNotificationsSchema.parse(req.body ?? {}))));
+
+// Requests to the office (e-toll top-up). 201 when stored, 200 for a resend
+// (same client_ref) or when one of the same type is still open (already_open).
+router.post("/requests", async (req, res, next) => {
+  try {
+    const driver = await driverForUser(req.user!.user_id);
+    const r = await createDriverRequest(driver.id, createDriverRequestSchema.parse(req.body ?? {}));
+    res.status(r.created ? 201 : 200).json({
+      status: "success",
+      data: { request: r.request, ...(r.already_open ? { already_open: true } : {}) },
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+router.get("/requests", h((req, id) => listOwnRequests(id, driverRequestsQuerySchema.parse(req.query).status)));
 
 export default router;

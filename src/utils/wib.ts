@@ -23,3 +23,11 @@ export function wibShortDay(d: Date | null): string {
   if (!d) return "";
   return d.toLocaleDateString("id-ID", { timeZone: "Asia/Jakarta", day: "numeric", month: "short" });
 }
+
+/** WIB weekday + day + month for notifications, e.g. "Sen 6 Okt" ("" when unset). */
+export function wibDayLabel(d: Date | null): string {
+  if (!d) return "";
+  return d
+    .toLocaleDateString("id-ID", { timeZone: "Asia/Jakarta", weekday: "short", day: "numeric", month: "short" })
+    .replace(",", "");
+}

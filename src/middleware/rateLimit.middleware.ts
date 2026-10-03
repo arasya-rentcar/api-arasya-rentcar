@@ -9,6 +9,17 @@ export const globalLimiter = rateLimit({
   message: { status: 'error', message: 'Too many requests, please try again later.' },
 });
 
+// Dashboard notification bell (/api/v1/notifications): every open dashboard
+// tab polls it every 15 s, so it has its own budget and does not use up the
+// global one for an office of admins behind one IP.
+export const notificationsLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 1500,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { status: 'error', message: 'Too many requests, please try again later.' },
+});
+
 // Auth limiter: tight, protects /auth/login from brute force.
 export const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,

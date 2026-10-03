@@ -43,6 +43,7 @@ export async function createDriver(input: CreateDriverInput) {
       phone,
       type: input.type,
       location: input.location || null,
+      etoll_card: input.etoll_card || null,
     },
     include: { user: { select: { email: true, role: true } } },
   });

@@ -11,8 +11,8 @@ Express 4 + Prisma 5 (Postgres on Supabase) + Supabase Storage, TypeScript. Sour
 ## Layout
 - `src/app.ts` routes + CORS (public leads router is mounted **before** the dashboard CORS policy). `src/config/env.ts` zod-validated env.
 - `src/modules/<name>/{route,controller,service,validation}.ts`. Controllers parse with zod and answer `{ status: "success", data }`; errors via `AppError(message, status)` → `middleware/error.middleware.ts` (also maps multer errors to 413/400).
-- Key modules: `orders` (create/assign/cancel/finalize, `computeCancellationPenalty`), `schedule` (lines = trips, `assignScheduleLine`, `order-derive.service.ts` derives order/driver/car status), `invoices` (DP/settlement/receipts, WA sends), `confirmation` (trip-team messages, H-1 sweep), `leads` (public intake + admin inbox), `driver-app` (`/api/v1/driver/*`), `devices` (Expo push tokens), `customers` (identity, private documents, `/customers/lookup`), `external-vendors` (partners), `bot` (legacy WhatsApp bot endpoints).
-- Services: `services/push.service.ts` (Expo push), `services/tripNotify.ts`, `services/ga4.service.ts` (purchase via Measurement Protocol, claimed once), `services/storage.service.ts` (`PAYMENT_PROOFS_BUCKET` is private; customer docs under `customer-docs/<id>/`). Captions: `utils/waCaptions.ts`; manual WA links: `utils/waManual.ts`.
+- Key modules: `orders` (create/assign/cancel/finalize, `computeCancellationPenalty`), `schedule` (lines = trips, `assignScheduleLine`, `order-derive.service.ts` derives order/driver/car status), `invoices` (DP/settlement/receipts, WA sends), `confirmation` (trip-team messages, H-1 sweep), `leads` (public intake + admin inbox), `driver-app` (`/api/v1/driver/*`), `driver-requests` (e-toll top-up: driver side `/driver/requests`, admin side `/driver-requests`), `admin-notifications` (dashboard bell `/notifications`, per-admin read state), `devices` (Expo push tokens), `customers` (identity, private documents, `/customers/lookup`), `external-vendors` (partners), `bot` (legacy WhatsApp bot endpoints).
+- Services: `services/push.service.ts` (Expo push), `services/tripNotify.ts`, `services/adminNotify.ts` (dashboard feed; call after commit, only when the action really changed state; never throws), `services/ga4.service.ts` (purchase via Measurement Protocol, claimed once), `services/storage.service.ts` (`PAYMENT_PROOFS_BUCKET` is private; customer docs under `customer-docs/<id>/`). Captions: `utils/waCaptions.ts`; manual WA links: `utils/waManual.ts`.
 
 ## Conventions
 - A service-day line (`OrderServiceItem`) **is** the trip. After changing `line_status` always call `deriveAndSetOrderStatus` + `syncDriverStatus`/`syncCarStatus` in the same transaction. Order DONE only via admin finalize.
@@ -28,7 +28,7 @@ Express 4 + Prisma 5 (Postgres on Supabase) + Supabase Storage, TypeScript. Sour
 
 ## Local end-to-end testing
 Postgres 16 binaries are in `/usr/lib/postgresql/16/bin`. Typical recipe: `initdb` a data dir under `/var/tmp`, start on port 5433 (`-k /var/tmp`), `DATABASE_URL=DIRECT_URL=postgresql://postgres@localhost:5433/arasya?host=/var/tmp npx prisma migrate deploy`, run `node dist/src/server.js` with `PORT`, `JWT_SECRET`, fake `SUPABASE_URL/KEY`, `CONFIRMATION_SWEEP_ENABLED=false`, `EXPO_PUSH_URL` pointing at a local mock. Create an admin with a bcrypt hash directly in `users`. Stop processes by PID (never `pkill -f` patterns that match your own shell).
-`scripts/e2e/run-local.sh` does all of that and runs ~155 checks of the dashboard and driver-app flows (see `scripts/e2e/README.md`); run it before pushing API changes and add checks for new behaviour.
+`scripts/e2e/run-local.sh` does all of that and runs ~195 checks of the dashboard and driver-app flows (see `scripts/e2e/README.md`); run it before pushing API changes and add checks for new behaviour.
 `.github/workflows/api-smoke.yml` (manual) checks the live API read-only.
 
 ## Deploy

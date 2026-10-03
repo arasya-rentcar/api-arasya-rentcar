@@ -157,13 +157,14 @@ enum OrderAdjustmentType {
 }
 
 model User {
-  id         String        @id @default(uuid())
-  email      String        @unique
-  password   String
-  role       Role
-  created_at DateTime      @default(now())
-  driver     Driver?
-  devices    DeviceToken[]
+  id                       String                  @id @default(uuid())
+  email                    String                  @unique
+  password                 String
+  role                     Role
+  created_at               DateTime                @default(now())
+  driver                   Driver?
+  devices                  DeviceToken[]
+  admin_notification_reads AdminNotificationRead[]
 
   @@map("users")
 }
@@ -182,6 +183,9 @@ model Driver {
   schedule_lines OrderServiceItem[]
   payables       Payable[]
   notifications  DriverNotification[]
+  // E-toll card the driver carries (2026-10-04), e.g. "Mandiri 6032 ••••1234".
+  etoll_card     String?
+  requests       DriverRequest[]
 
   @@index([phone])
   @@index([type])
@@ -762,6 +766,9 @@ model TripReport {
   location_accuracy_m   Int?
   location_at           DateTime?
   location_mocked       Boolean?
+  // Place name for the fix, reverse geocoded on the phone (2026-10-04), e.g.
+  // "Jl. Pajajaran, Bogor". The coordinates stay the source of truth.
+  location_name         String?
 
   @@index([order_id])
   @@index([order_service_item_id])
@@ -940,4 +947,78 @@ model DeviceToken {
 
   @@index([user_id])
   @@map("device_tokens")
+}
+
+enum DriverRequestType {
+  ETOLL_TOPUP
+}
+
+enum DriverRequestStatus {
+  OPEN
+  DONE
+  CANCELLED
+}
+
+/// Requests a driver sends from the app to the office (2026-10-04), e.g. an
+/// e-toll top-up. Exactly-once on client_ref; at most one OPEN request per
+/// driver and type. An admin marks it DONE (the driver gets a push + inbox row).
+model DriverRequest {
+  id           String              @id @default(uuid())
+  driver_id    String
+  driver       Driver              @relation(fields: [driver_id], references: [id], onDelete: Cascade)
+  type         DriverRequestType
+  card_label   String?
+  // Card balance the driver reported, in rupiah.
+  balance      Decimal?            @db.Decimal(12, 2)
+  note         String?
+  status       DriverRequestStatus @default(OPEN)
+  client_ref   String              @unique
+  created_at   DateTime            @default(now())
+  handled_at   DateTime?
+  // Admin user id that handled it.
+  handled_by   String?
+  handled_note String?
+
+  @@index([driver_id, created_at])
+  @@index([status, created_at])
+  @@map("driver_requests")
+}
+
+/// Dashboard notification feed (2026-10-04): driver status changes, reports,
+/// trip costs and driver requests. Written after the driver's action commits,
+/// once per real change. Read state is per admin (AdminNotificationRead).
+model AdminNotification {
+  id                String                  @id @default(uuid())
+  // TRIP_ACCEPTED | TRIP_STARTED | TRIP_ARRIVED | TRIP_BOARDED | TRIP_FINISHED
+  // | TRIP_REPORT | TRIP_COST | DRIVER_REQUEST
+  type              String
+  title             String
+  body              String
+  order_id          String?
+  order_code        String?
+  service_item_id   String?
+  driver_id         String?
+  driver_request_id String?
+  expense_id        String?
+  // Dashboard path to open, e.g. "/dashboard/orders/<id>".
+  link              String
+  created_at        DateTime                @default(now())
+  reads             AdminNotificationRead[]
+
+  @@index([created_at])
+  @@index([service_item_id])
+  @@map("admin_notifications")
+}
+
+model AdminNotificationRead {
+  id              String            @id @default(uuid())
+  notification_id String
+  notification    AdminNotification @relation(fields: [notification_id], references: [id], onDelete: Cascade)
+  user_id         String
+  user            User              @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  read_at         DateTime          @default(now())
+
+  @@unique([notification_id, user_id])
+  @@index([user_id])
+  @@map("admin_notification_reads")
 }

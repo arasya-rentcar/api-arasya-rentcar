@@ -6,6 +6,8 @@ export const createDriverSchema = z.object({
   phone: z.string().min(1, 'Phone is required'),
   type: z.enum(['INTERNAL', 'EXTERNAL']).default('INTERNAL'),
   location: z.string().optional(),
+  // E-toll card the driver carries, e.g. "Mandiri 6032 ••••1234".
+  etoll_card: z.string().trim().max(60).nullish(),
 });
 
 export const updateDriverSchema = z.object({
@@ -14,6 +16,13 @@ export const updateDriverSchema = z.object({
   type: z.enum(['INTERNAL', 'EXTERNAL']).optional(),
   location: z.string().optional(),
   status: z.enum(['AVAILABLE', 'ON_DUTY', 'OFF']).optional(),
+  // Empty or null clears it.
+  etoll_card: z
+    .string()
+    .trim()
+    .max(60)
+    .nullish()
+    .transform((v) => (v === undefined ? undefined : v || null)),
 });
 
 export type CreateDriverInput = z.infer<typeof createDriverSchema>;

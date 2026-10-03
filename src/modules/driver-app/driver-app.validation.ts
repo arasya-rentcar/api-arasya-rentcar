@@ -27,6 +27,10 @@ const locationFields = {
     (v) => (v === "true" || v === true ? true : v === "false" || v === false ? false : undefined),
     z.boolean().optional(),
   ),
+  // Place name for the fix, reverse geocoded on the phone ("Jl. Pajajaran, Bogor").
+  location_name: z
+    .preprocess(blank, z.string().trim().max(200).optional())
+    .transform((v) => v || undefined),
 };
 const bothOrNone = (v: { latitude?: number; longitude?: number }) =>
   (v.latitude == null) === (v.longitude == null);
@@ -84,3 +88,32 @@ export const readNotificationsSchema = z
     all: z.boolean().optional(),
   })
   .refine((v) => v.all || (v.ids && v.ids.length > 0), { message: "ids or all is required" });
+
+// Requests to the office (e-toll top-up). client_ref makes a resend a no-op.
+export const createDriverRequestSchema = z.object({
+  type: z.enum(["ETOLL_TOPUP"]),
+  card_label: z
+    .string()
+    .trim()
+    .max(60)
+    .nullish()
+    .transform((v) => v || undefined),
+  // Card balance in rupiah, as the driver read it.
+  balance: z.preprocess(blank, z.coerce.number().min(0).max(100_000_000).optional()),
+  note: z
+    .string()
+    .trim()
+    .max(500)
+    .nullish()
+    .transform((v) => v || undefined),
+  client_ref: z.string().uuid(),
+  occurred_at: occurredAt,
+});
+export type CreateDriverRequestInput = z.infer<typeof createDriverRequestSchema>;
+
+export const driverRequestsQuerySchema = z.object({
+  status: z.preprocess(
+    (v) => (typeof v === "string" ? v.toLowerCase() : v),
+    z.enum(["open", "all"]).default("all"),
+  ),
+});

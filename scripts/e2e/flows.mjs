@@ -8,10 +8,10 @@ const tag = Date.now().toString(36).slice(-5);
 const rnd = () => String(Math.floor(Math.random() * 1e7)).padStart(7, '0');
 
 // ── Helpers that mirror dashboard / app actions ────────────────────────────
-async function makeDriver(n) {
+async function makeDriver(n, extra = {}) {
   const phone = `0813${rnd()}`;
   const u = await call('POST', '/users', { token: admin, body: { email: `drv${n}-${tag}@e2e.local`, password: 'secret123', role: 'DRIVER' } });
-  const d = await call('POST', '/drivers', { token: admin, body: { user_id: u.data.id, name: `Driver ${n} ${tag}`, phone } });
+  const d = await call('POST', '/drivers', { token: admin, body: { user_id: u.data.id, name: `Driver ${n} ${tag}`, phone, ...extra } });
   await call('PUT', `/drivers/${d.data.id}/app-password`, { token: admin, body: { password: 'test1234' } });
   const login = await call('POST', '/auth/login', { body: { identifier: phone, password: 'test1234' } });
   await call('POST', '/devices', { token: login.data.token, body: { token: `ExponentPushToken[drv${n}-${tag}]`, platform: 'android' } });
@@ -628,6 +628,140 @@ await section('K. Validation edges', async () => {
   check('K6 unassigning a driver allowed', (await putLine(lineId, { is_external: false, driver_id: null, car_id: null, line_status: 'SCHEDULED' })).status === 200);
   check('K7 unpaid payable removed with the driver', (await prisma.payable.findUnique({ where: { service_item_id: lineId } })) === null);
   check('K8 removed driver gets 404 on that trip', (await call('GET', `/driver/trips/${lineId}`, { token: d2.token })).status === 404);
+});
+
+// ── L. Admin notifications, e-toll requests, location names (F1, F4–F6) ────
+await section('L. Admin notifications, driver requests, location names', async () => {
+  const d4 = await makeDriver(4, { etoll_card: 'Mandiri 6032 ••••1234' });
+  const me = async () => (await call('GET', '/driver/me', { token: d4.token })).data;
+  check('L1 driver created with etoll_card; /driver/me returns it', (await me())?.etoll_card === 'Mandiri 6032 ••••1234');
+  const upd = await call('PUT', `/drivers/${d4.id}`, { token: admin, body: { etoll_card: 'BCA Flazz ••••9876' } });
+  const listed = (await call('GET', '/drivers', { token: admin })).data.find((x) => x.id === d4.id);
+  check('L2 admin edits etoll_card (update, list, /driver/me)', upd.status === 200 && listed?.etoll_card === 'BCA Flazz ••••9876' && (await me()).etoll_card === 'BCA Flazz ••••9876');
+  check('L3 etoll_card over 60 characters refused (400)', (await call('PUT', `/drivers/${d4.id}`, { token: admin, body: { etoll_card: 'x'.repeat(61) } })).status === 400);
+  await call('PUT', `/drivers/${d4.id}`, { token: admin, body: { etoll_card: '' } });
+  check('L4 empty etoll_card clears it', (await me()).etoll_card === null);
+  await call('PUT', `/drivers/${d4.id}`, { token: admin, body: { etoll_card: 'Mandiri ••••1234' } });
+
+  // Each driver action notifies the admins once; resends add nothing.
+  const o = await makeOrder('L', { startDay: 0 });
+  await payFull(o);
+  const lineId = o.service_items[0].id;
+  const car6 = await makeCar('Brio');
+  const asg = await putLine(lineId, { is_external: false, driver_id: d4.id, car_id: car6.id, line_status: 'ASSIGNED' });
+  if (asg.status !== 200) throw new Error(`assign: ${asg.status} ${asg.json?.message}`);
+  const notes = (type) => prisma.adminNotification.findMany({ where: { service_item_id: lineId, type } });
+  const n = async (type) => (await notes(type)).length;
+  await act(d4, lineId, 'accept');
+  await act(d4, lineId, 'accept');
+  check('L5 accept twice → one TRIP_ACCEPTED', (await n('TRIP_ACCEPTED')) === 1);
+  const sref = uuid();
+  await act(d4, lineId, 'start', { client_ref: sref });
+  await act(d4, lineId, 'start', { client_ref: sref });
+  await act(d4, lineId, 'start');
+  const started = await notes('TRIP_STARTED');
+  check('L6 start, resend, second start → one TRIP_STARTED linked to the order', started.length === 1 && started[0].link === `/dashboard/orders/${o.id}` && started[0].order_code === o.order_code && started[0].driver_id === d4.id && started[0].title.includes(`Driver 4 ${tag}`), started[0]?.title);
+  const loc = { latitude: -6.5971, longitude: 106.806, location_accuracy_m: 9, location_mocked: false, location_name: 'Jl. Pajajaran, Bogor' };
+  check('L7 location_name over 200 characters refused (400)', (await act(d4, lineId, 'arrive', { ...loc, location_name: 'x'.repeat(201) })).status === 400);
+  const aref = uuid();
+  const a1 = await act(d4, lineId, 'arrive', { client_ref: aref, ...loc });
+  await act(d4, lineId, 'arrive', { client_ref: aref, ...loc });
+  const arrived = await notes('TRIP_ARRIVED');
+  check('L8 arrive + resend → one TRIP_ARRIVED with the place name', a1.status === 200 && arrived.length === 1 && /sampai di lokasi jemput/.test(arrived[0].title) && arrived[0].body.includes('Jl. Pajajaran, Bogor') && arrived[0].body.startsWith(o.order_code), arrived[0]?.body);
+  const arow = await prisma.tripReport.findFirst({ where: { order_service_item_id: lineId, report_type: 'ARRIVE_CUSTOMER' } });
+  check('L9 arrive stores location_name with the GPS fix', arow?.location_name === 'Jl. Pajajaran, Bogor' && arow.latitude === -6.5971);
+  const bref = uuid();
+  await act(d4, lineId, 'board', { client_ref: bref });
+  await act(d4, lineId, 'board', { client_ref: bref });
+  check('L10 board + resend → one TRIP_BOARDED', (await n('TRIP_BOARDED')) === 1);
+  const photo = { client_ref: uuid(), report_type: 'PHOTO', notes: 'Checkpoint 1', stamped: 'true', latitude: -6.6, longitude: 106.81, location_accuracy_m: 15, location_name: 'Tol Jagorawi KM 30' };
+  const p1 = await report(d4, lineId, photo);
+  const p2 = await report(d4, lineId, photo);
+  const reps = await notes('TRIP_REPORT');
+  check('L11 checkpoint photo + resend → one TRIP_REPORT', p1.status === 200 && p2.status === 200 && reps.length === 1 && /mengirim foto/.test(reps[0].title) && reps[0].body.includes('Checkpoint 1'), reps.map((r) => r.title).join(' | '));
+  const prow = await prisma.tripReport.findUnique({ where: { client_ref: photo.client_ref } });
+  check('L12 report stores GPS + location_name and returns it', prow?.location_name === 'Tol Jagorawi KM 30' && prow.latitude === -6.6 && p1.data?.location_name === 'Tol Jagorawi KM 30' && p2.data?.location_name === 'Tol Jagorawi KM 30');
+  const toll = { client_ref: uuid(), report_type: 'TOLL', amount: 45000, notes: 'Tol Jagorawi' };
+  await report(d4, lineId, toll);
+  await report(d4, lineId, toll);
+  const costs = await notes('TRIP_COST');
+  const exp = await prisma.expense.findFirst({ where: { order_service_item_id: lineId, type: 'TOLL' } });
+  check('L13 toll receipt + resend → one TRIP_COST "Tol Rp 45.000 — perlu ditinjau"', costs.length === 1 && costs[0].title.includes('Tol Rp 45.000') && costs[0].title.includes('perlu ditinjau') && costs[0].expense_id === exp?.id && costs[0].link === `/dashboard/orders/${o.id}`, costs[0]?.title);
+  check('L14 a cost is not also a TRIP_REPORT', (await n('TRIP_REPORT')) === 1);
+  const fref = uuid();
+  await act(d4, lineId, 'finish', { client_ref: fref });
+  await act(d4, lineId, 'finish', { client_ref: fref });
+  await act(d4, lineId, 'finish');
+  check('L15 finish + resends → one TRIP_FINISHED', (await n('TRIP_FINISHED')) === 1);
+  check('L16 seven notifications for the trip in all', (await prisma.adminNotification.count({ where: { service_item_id: lineId } })) === 7);
+
+  // location_name wherever the coordinates are returned.
+  const trip = (await call('GET', `/driver/trips/${lineId}`, { token: d4.token })).data;
+  check('L17 driver trip detail returns location_name', trip.reports.some((r) => r.report_type === 'ARRIVE_CUSTOMER' && r.location_name === 'Jl. Pajajaran, Bogor') && trip.reports.some((r) => r.report_type === 'PHOTO' && r.location_name === 'Tol Jagorawi KM 30'));
+  check('L18 admin order view returns location_name', (await order(o.id)).service_items[0].reports.some((r) => r.location_name === 'Jl. Pajajaran, Bogor'));
+  const hist = await call('GET', `/schedule/history?driver_id=${d4.id}&page_size=200`, { token: admin });
+  check('L19 trip history (schedule) returns location_name', hist.json?.items?.find((l) => l.id === lineId)?.reports?.some((r) => r.location_name === 'Jl. Pajajaran, Bogor'));
+
+  // Feed + per-admin read state.
+  const u2 = await call('POST', '/users', { token: admin, body: { email: `admin2-${tag}@e2e.local`, password: 'secret123', role: 'ADMIN' } });
+  const admin2 = (await call('POST', '/auth/login', { body: { email: `admin2-${tag}@e2e.local`, password: 'secret123' } })).data?.token;
+  const feed = await call('GET', '/notifications?limit=100', { token: admin });
+  const mine = feed.data?.items?.filter((x) => x.service_item_id === lineId) ?? [];
+  const keys = ['id', 'type', 'title', 'body', 'order_id', 'order_code', 'service_item_id', 'driver_id', 'driver_request_id', 'expense_id', 'link', 'created_at', 'read'];
+  check('L20 GET /notifications lists them newest first with the contract fields', feed.status === 200 && mine.length === 7 && mine[0].type === 'TRIP_FINISHED' && keys.every((k) => k in mine[0]) && mine.every((x) => x.read === false) && typeof feed.data.unread_count === 'number', `${feed.status} ${mine.length}`);
+  check('L21 driver token cannot read the admin feed (403)', (await call('GET', '/notifications', { token: d4.token })).status === 403);
+  const c1 = (await call('GET', '/notifications/unread-count', { token: admin })).data;
+  const c2 = (await call('GET', '/notifications/unread-count', { token: admin2 })).data;
+  const newest = await prisma.adminNotification.findFirst({ orderBy: [{ created_at: 'desc' }, { id: 'desc' }] });
+  check('L22 unread-count gives the count and the newest notification', u2.status === 201 && c1.unread_count >= 7 && c1.latest_id === newest.id && new Date(c1.latest_at).getTime() === newest.created_at.getTime() && c2.unread_count === c1.unread_count, JSON.stringify(c1));
+  const r1 = await call('POST', '/notifications/read', { token: admin, body: { ids: [mine[0].id] } });
+  await call('POST', '/notifications/read', { token: admin, body: { ids: [mine[0].id] } });
+  check('L23 reading one: unread_count − 1 for that admin only (re-read is a no-op)', r1.data?.unread_count === c1.unread_count - 1 && (await call('GET', '/notifications/unread-count', { token: admin })).data.unread_count === c1.unread_count - 1 && (await call('GET', '/notifications/unread-count', { token: admin2 })).data.unread_count === c2.unread_count);
+  const f1 = (await call('GET', '/notifications?limit=100', { token: admin })).data.items.find((x) => x.id === mine[0].id);
+  const f2 = (await call('GET', '/notifications?limit=100', { token: admin2 })).data.items.find((x) => x.id === mine[0].id);
+  const unreadOnly = (await call('GET', '/notifications?limit=100&unread=1', { token: admin })).data.items;
+  check('L24 read flag is per admin; unread=1 hides read ones', f1?.read === true && f2?.read === false && !unreadOnly.some((x) => x.id === mine[0].id) && unreadOnly.some((x) => x.id === mine[1].id));
+  const older = (await call('GET', `/notifications?limit=2&before=${encodeURIComponent(mine[1].created_at)}`, { token: admin })).data.items;
+  check('L25 before= pages to older ones', older.length > 0 && older.every((x) => new Date(x.created_at) < new Date(mine[1].created_at)));
+  check('L26 read without ids or all refused (400)', (await call('POST', '/notifications/read', { token: admin, body: {} })).status === 400);
+  const all = await call('POST', '/notifications/read', { token: admin, body: { all: true } });
+  check('L27 read all → 0 for that admin, the other admin unchanged', all.data?.unread_count === 0 && (await call('GET', '/notifications/unread-count', { token: admin2 })).data.unread_count === c2.unread_count);
+
+  // E-toll top-up request (F5).
+  const before = await prisma.adminNotification.count({ where: { type: 'DRIVER_REQUEST', driver_id: d4.id } });
+  const ref1 = uuid();
+  const body = { type: 'ETOLL_TOPUP', balance: 12000, note: 'Saldo tinggal sedikit', client_ref: ref1, occurred_at: new Date().toISOString() };
+  const q1 = await call('POST', '/driver/requests', { token: d4.token, body });
+  const reqNotes = () => prisma.adminNotification.findMany({ where: { type: 'DRIVER_REQUEST', driver_id: d4.id } });
+  const rn = await reqNotes();
+  check('L28 e-toll request → 201 OPEN, card from the driver profile', q1.status === 201 && q1.data?.request?.status === 'OPEN' && q1.data.request.card_label === 'Mandiri ••••1234' && q1.data.request.balance === 12000, JSON.stringify(q1.json));
+  check('L29 admins notified "minta top-up e-toll" with card and balance', rn.length === before + 1 && /minta top-up e-toll/.test(rn[0]?.title) && rn[0].body.includes('Kartu Mandiri ••••1234') && rn[0].body.includes('saldo Rp 12.000') && rn[0].driver_request_id === q1.data.request.id, rn[0]?.body);
+  const q2 = await call('POST', '/driver/requests', { token: d4.token, body });
+  check('L30 same client_ref → 200, same request, no new notification', q2.status === 200 && q2.data?.request?.id === q1.data.request.id && !q2.data.already_open && (await reqNotes()).length === before + 1);
+  const q3 = await call('POST', '/driver/requests', { token: d4.token, body: { ...body, client_ref: uuid() } });
+  check('L31 another while one is open → 200 already_open, no new notification', q3.status === 200 && q3.data?.already_open === true && q3.data.request.id === q1.data.request.id && (await reqNotes()).length === before + 1);
+  check('L32 another driver cannot reuse the client_ref (409)', (await call('POST', '/driver/requests', { token: d3.token, body })).status === 409);
+  check('L33 unknown request type refused (400)', (await call('POST', '/driver/requests', { token: d4.token, body: { ...body, type: 'FUEL', client_ref: uuid() } })).status === 400);
+  const own = await call('GET', '/driver/requests?status=open', { token: d4.token });
+  check('L34 driver lists own open requests', own.status === 200 && own.data.items.length === 1 && own.data.items[0].id === q1.data.request.id);
+  const adm = await call('GET', '/driver-requests?status=OPEN', { token: admin });
+  const row = adm.data?.items?.find((x) => x.id === q1.data.request.id);
+  check('L35 admin list shows it with driver id/name/phone only', !!row && Object.keys(row.driver).sort().join() === 'id,name,phone' && row.driver.id === d4.id);
+  check('L36 driver token cannot use the admin list (403)', (await call('GET', '/driver-requests', { token: d4.token })).status === 403);
+  const done = await call('POST', `/driver-requests/${q1.data.request.id}/done`, { token: admin, body: { note: 'Sudah diisi Rp 100.000' } });
+  await sleep(300);
+  const topupPush = (await pushesTo(d4)).filter((x) => x.title === 'Top-up e-toll sudah diproses');
+  const inbox = await call('GET', '/driver/notifications', { token: d4.token });
+  check('L37 admin marks done → DONE, driver gets one push + inbox row', done.status === 200 && done.data?.request?.status === 'DONE' && !!done.data.request.handled_at && done.data.request.handled_note === 'Sudah diisi Rp 100.000' && topupPush.length === 1 && topupPush[0].body.includes('Sudah diisi Rp 100.000') && inbox.data.items.some((x) => x.type === 'driver_request_done'), `${done.status} pushes ${topupPush.length}`);
+  const again = await call('POST', `/driver-requests/${q1.data.request.id}/done`, { token: admin2, body: {} });
+  check('L38 second "done" refused (409), no second push', again.status === 409 && (await pushesTo(d4)).filter((x) => x.title === 'Top-up e-toll sudah diproses').length === 1, `${again.status}`);
+  check('L39 unknown request id → 404', (await call('POST', `/driver-requests/${uuid()}/done`, { token: admin, body: {} })).status === 404);
+  const q4 = await call('POST', '/driver/requests', { token: d4.token, body: { type: 'ETOLL_TOPUP', card_label: 'BRIZZI ••••5555', client_ref: uuid() } });
+  check('L40 after done a new request is accepted (201) and notifies', q4.status === 201 && q4.data.request.id !== q1.data.request.id && q4.data.request.card_label === 'BRIZZI ••••5555' && (await reqNotes()).length === before + 2);
+  const allOwn = await call('GET', '/driver/requests?status=all', { token: d4.token });
+  check('L41 driver list (all) newest first', allOwn.data.items.length === 2 && allOwn.data.items[0].id === q4.data.request.id && allOwn.data.items[1].status === 'DONE');
+  const doneList = await call('GET', '/driver-requests?status=done', { token: admin });
+  check('L42 admin list by status DONE', doneList.data.items.some((x) => x.id === q1.data.request.id) && !doneList.data.items.some((x) => x.id === q4.data.request.id));
 });
 
 const failed = summary();
