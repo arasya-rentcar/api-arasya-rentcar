@@ -18,7 +18,7 @@ export const reviseInvoiceSchema = z.object({
 
 export const markInvoicePaidSchema = z.object({
   payment_method: z.enum(["CASH", "BANK_TRANSFER", "QRIS", "OTHER"]).optional(),
-  paid_at: z.string().optional(),
+  paid_at: z.string().datetime({ offset: true }).optional(),
   // Sprint 2: actual money received, which may differ from the invoice amount
   // (overpayment). Defaults to the invoice amount when omitted. Coerced because
   // multipart form fields arrive as strings.

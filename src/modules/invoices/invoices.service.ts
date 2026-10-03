@@ -1,5 +1,5 @@
 import { waLink, waManual } from "../../utils/waManual";
-import { startPayment } from "../orders/assignment-guard";
+import { paymentStatusFor, startPayment } from "../orders/assignment-guard";
 import { notifyOrderPaidInFull } from "../../services/driverNotify";
 import { reportLeadPurchase } from "../../services/ga4.service";
 import type { Prisma } from "@prisma/client";
@@ -49,6 +49,83 @@ function fmtAdjustmentDate(d: Date | string | null | undefined): string | null {
 
 // Turn a billable adjustment into a PDF line item, appending the date to the
 // description (e.g. "overtime 2 jam - Senin, 22 Juni 2026").
+const INVOICE_TYPE_LABEL: Record<string, string> = {
+  DP: "Down Payment",
+  SETTLEMENT: "Settlement Payment",
+  FULL: "Full Payment",
+  ADDITIONAL: "Additional Charge",
+  COMBINED: "Rental + Additional (Combined)",
+};
+const PAYMENT_METHOD_LABEL: Record<string, string> = {
+  CASH: "Cash",
+  BANK_TRANSFER: "Bank Transfer",
+  QRIS: "QRIS",
+  OTHER: "Other",
+};
+const PAYMENT_RECEIVED_LABEL: Record<string, string> = {
+  DP: "Pembayaran DP diterima",
+  SETTLEMENT: "Pelunasan diterima",
+  FULL: "Pembayaran diterima",
+  ADDITIONAL: "Pembayaran tambahan diterima",
+};
+
+/** "3 Oktober 2026" in WIB. */
+function fmtLongWibDate(d: Date): string {
+  return new Date(d).toLocaleDateString("id-ID", {
+    timeZone: "Asia/Jakarta",
+    day: "numeric",
+    month: "long",
+    year: "numeric",
+  });
+}
+
+/**
+ * Money actually received on an order, one entry per paid invoice: its
+ * receipt amount (may exceed the invoice on overpayment), or the invoice
+ * amount for old rows without a receipt. An invoice voided later by a
+ * cancellation still counts: that money was received.
+ */
+async function paymentsOnOrder(
+  db: Prisma.TransactionClient | typeof prisma,
+  orderId: string,
+  excludeInvoiceId?: string,
+) {
+  const paid = await db.invoice.findMany({
+    where: {
+      order_id: orderId,
+      ...(excludeInvoiceId ? { id: { not: excludeInvoiceId } } : {}),
+      OR: [{ status: "PAID" }, { status: "CANCELLED", paid_at: { not: null } }],
+    },
+    orderBy: [{ paid_at: "asc" }, { issue_date: "asc" }],
+    select: {
+      id: true,
+      invoice_type: true,
+      amount: true,
+      paid_at: true,
+      issue_date: true,
+      receipts: { select: { amount: true }, orderBy: { created_at: "asc" }, take: 1 },
+    },
+  });
+  const items = paid.map((p) => ({
+    id: p.id,
+    invoice_type: p.invoice_type as string,
+    paid_at: p.paid_at,
+    issue_date: p.issue_date,
+    received: p.receipts[0] ? Number(p.receipts[0].amount) : Number(p.amount),
+  }));
+  return { items, total: items.reduce((s, p) => s + p.received, 0) };
+}
+
+/** "Payments received" lines for a kwitansi or statement. */
+function paymentLines(
+  items: { invoice_type: string; paid_at: Date | null; issue_date: Date; received: number }[],
+) {
+  return items.map((p) => ({
+    label: `${PAYMENT_RECEIVED_LABEL[p.invoice_type] ?? "Pembayaran diterima"} tanggal ${fmtLongWibDate(p.paid_at ?? p.issue_date)}`,
+    amount: p.received,
+  }));
+}
+
 function adjustmentToLineItem(a: {
   description: string;
   amount: unknown;
@@ -293,13 +370,7 @@ export async function generateInvoice(
   }
 
   // Determine PDF description label
-  const typeLabels: Record<string, string> = {
-    DP: "Down Payment",
-    SETTLEMENT: "Settlement Payment",
-    FULL: "Full Payment",
-    ADDITIONAL: "Additional Charge",
-    COMBINED: "Rental + Additional (Combined)",
-  };
+
 
   // For COMBINED, render the billable adjustments as an "Additional Charges"
   // section in the same PDF as the rental service lines.
@@ -326,12 +397,7 @@ export async function generateInvoice(
   const pdfItems =
     input.invoice_type === "ADDITIONAL" ? additionalLineItems : rentalLineItems;
 
-  const methodLabels: Record<string, string> = {
-    CASH: "Cash",
-    BANK_TRANSFER: "Bank Transfer",
-    QRIS: "QRIS",
-    OTHER: "Other",
-  };
+
 
   const pdfBuffer = await generateInvoicePDF({
     invoiceNumber,
@@ -342,8 +408,8 @@ export async function generateInvoice(
     pickupLocation: order.pickup_location,
     dropoffLocation: order.dropoff_location,
     finalPrice,
-    invoiceType: typeLabels[input.invoice_type] ?? input.invoice_type,
-    paymentMethod: methodLabels[input.payment_method] ?? input.payment_method,
+    invoiceType: INVOICE_TYPE_LABEL[input.invoice_type] ?? input.invoice_type,
+    paymentMethod: PAYMENT_METHOD_LABEL[input.payment_method] ?? input.payment_method,
     amountPaid: input.amount,
     previouslyPaid: alreadyInvoiced,
     documentMode: "INVOICE",
@@ -435,55 +501,6 @@ export async function getPaymentProofUrl(invoiceId: string) {
 }
 
 // Mark an invoice PAID -> it now prints as a Kwitansi/Receipt.
-const INVOICE_TYPE_LABEL: Record<string, string> = {
-  DP: "Down Payment",
-  SETTLEMENT: "Settlement Payment",
-  FULL: "Full Payment",
-  ADDITIONAL: "Additional Charge",
-  COMBINED: "Rental + Additional (Combined)",
-};
-const PAYMENT_METHOD_LABEL: Record<string, string> = {
-  CASH: "Cash",
-  BANK_TRANSFER: "Bank Transfer",
-  QRIS: "QRIS",
-  OTHER: "Other",
-};
-const PAYMENT_RECEIVED_LABEL: Record<string, string> = {
-  DP: "Pembayaran DP diterima",
-  SETTLEMENT: "Pelunasan diterima",
-  FULL: "Pembayaran diterima",
-  ADDITIONAL: "Pembayaran tambahan diterima",
-};
-
-/**
- * Money actually received on an order, one entry per paid invoice: its
- * receipt amount (may exceed the invoice on overpayment), or the invoice
- * amount for old rows without a receipt. An invoice voided later by a
- * cancellation still counts: that money was received.
- */
-async function paymentsOnOrder(
-  db: Prisma.TransactionClient | typeof prisma,
-  orderId: string,
-  excludeInvoiceId: string,
-) {
-  const paid = await db.invoice.findMany({
-    where: {
-      order_id: orderId,
-      id: { not: excludeInvoiceId },
-      OR: [{ status: "PAID" }, { status: "CANCELLED", paid_at: { not: null } }],
-    },
-    orderBy: [{ paid_at: "asc" }, { issue_date: "asc" }],
-    select: { id: true, invoice_type: true, amount: true, paid_at: true, issue_date: true },
-  });
-  const receipts = await db.receipt.findMany({
-    where: { invoice_id: { in: paid.map((p) => p.id) } },
-    select: { invoice_id: true, amount: true },
-  });
-  const received = new Map(receipts.map((r) => [r.invoice_id, Number(r.amount)]));
-  const items = paid.map((p) => ({ ...p, received: received.get(p.id) ?? Number(p.amount) }));
-  return { items, total: items.reduce((s, p) => s + p.received, 0) };
-}
-
 // Mark an invoice paid: money received, kwitansi, order payment status.
 export async function markInvoicePaid(
   invoiceId: string,
@@ -500,12 +517,7 @@ export async function markInvoicePaid(
   const invoice = await prisma.invoice.findUnique({
     where: { id: invoiceId },
     include: {
-      order: {
-        include: {
-          service_items: { orderBy: { sort_order: "asc" } },
-          customer: true,
-        },
-      },
+      order: { include: { customer: true } },
     },
   });
   if (!invoice) throw new AppError("Invoice not found", 404);
@@ -545,7 +557,7 @@ export async function markInvoicePaid(
   // (the other one burns no number and records nothing). Lock order: invoice
   // row, then order row (as cancelOrder and reviseInvoice), so they cannot
   // deadlock; the order lock makes two invoices paid at once add up.
-  let applied: boolean;
+  let applied: { becameReady: boolean } | null;
   try {
     applied = await prisma.$transaction(
       async (tx) => {
@@ -559,8 +571,9 @@ export async function markInvoicePaid(
               : {}),
           },
         });
-        if (count === 0) return false;
-        await tx.$queryRaw`SELECT id FROM "orders" WHERE id = ${invoice.order_id} FOR NO KEY UPDATE`;
+        if (count === 0) return null;
+        const [locked] = await tx.$queryRaw<{ final_price: unknown; paid_to_date: unknown }[]>`
+          SELECT final_price, paid_to_date FROM "orders" WHERE id = ${invoice.order_id} FOR NO KEY UPDATE`;
 
         if (customer) {
           const { number: receiptNumber, seq: receiptSeq } = await nextReceiptNumber(
@@ -592,20 +605,23 @@ export async function markInvoicePaid(
         // paid_to_date = all money received on the order, this payment included.
         const others = await paymentsOnOrder(tx, invoice.order_id, invoice.id);
         const paidTotal = others.total + amountReceived;
-        const { final_price } = await tx.order.findUniqueOrThrow({
-          where: { id: invoice.order_id },
-          select: { final_price: true },
-        });
-        const orderTotal = Number(final_price);
-        let paymentStatus: "UNPAID" | "DP_PAID" | "PAID" = "UNPAID";
-        if (paidTotal >= orderTotal && orderTotal > 0) paymentStatus = "PAID";
-        else if (paidTotal > 0) paymentStatus = "DP_PAID";
-
         await tx.order.update({
           where: { id: invoice.order_id },
-          data: { payment_status: paymentStatus, paid_to_date: paidTotal },
+          data: {
+            payment_status: paymentStatusFor(paidTotal, locked.final_price),
+            paid_to_date: paidTotal,
+          },
         });
-        return true;
+        // Did this payment make the rental paid in full? Decided under the
+        // lock, so two invoices paid at once notify the drivers only once.
+        const days = await tx.orderServiceItem.findMany({
+          where: { order_id: invoice.order_id },
+          select: { total_price: true, line_status: true },
+        });
+        const becameReady =
+          !startPayment({ paid_to_date: locked.paid_to_date }, days).ready &&
+          startPayment({ paid_to_date: paidTotal }, days).ready;
+        return { becameReady };
       },
       { maxWait: 15000, timeout: 20000 },
     );
@@ -638,9 +654,7 @@ export async function markInvoicePaid(
   );
   // Paid in full just now: the assigned drivers may begin the trip with the
   // customer (app unlocks "Mulai perjalanan") and get a notification.
-  if (!startPayment(invoice.order, invoice.order.service_items).ready) {
-    void notifyOrderPaidInFull(invoice.order_id);
-  }
+  if (applied.becameReady) void notifyOrderPaidInFull(invoice.order_id);
 
   return prisma.invoice.findUniqueOrThrow({ where: { id: invoiceId } });
 }
@@ -700,24 +714,11 @@ async function attachReceiptPdf(
   const previouslyPaid = Number(priorAgg._sum.amount ?? 0);
 
   // "Payments received" lines: every payment on the order so far, then this one.
-  const fmtTgl = (d: Date) =>
-    new Date(d).toLocaleDateString("id-ID", {
-      timeZone: "Asia/Jakarta",
-      day: "numeric",
-      month: "long",
-      year: "numeric",
-    });
   const others = await paymentsOnOrder(prisma, invoice.order_id, invoice.id);
-  const paymentsReceived = [
-    ...others.items.map((p) => ({
-      label: `${PAYMENT_RECEIVED_LABEL[p.invoice_type] ?? "Pembayaran diterima"} tanggal ${fmtTgl(p.paid_at ?? p.issue_date)}`,
-      amount: p.received,
-    })),
-    {
-      label: `${PAYMENT_RECEIVED_LABEL[invoice.invoice_type] ?? "Pembayaran diterima"} tanggal ${fmtTgl(pay.paidAt)}`,
-      amount: pay.amountReceived,
-    },
-  ];
+  const paymentsReceived = paymentLines([
+    ...others.items,
+    { invoice_type: invoice.invoice_type, paid_at: pay.paidAt, issue_date: invoice.issue_date, received: pay.amountReceived },
+  ]);
   const totalReceived = others.total + pay.amountReceived;
 
   const pdfBuffer = await generateInvoicePDF({
@@ -805,25 +806,12 @@ export async function generateOrderStatement(
     .filter((a) => a.is_billable)
     .map(adjustmentToLineItem);
 
-  // Every payment actually received (PAID invoices only).
-  const typeLabelId: Record<string, string> = {
-    DP: "Pembayaran DP diterima",
-    SETTLEMENT: "Pelunasan diterima",
-    FULL: "Pembayaran diterima",
-    ADDITIONAL: "Pembayaran tambahan diterima",
-  };
-  const fmtTgl = (d: Date) =>
-    new Date(d).toLocaleDateString("id-ID", {
-      timeZone: "Asia/Jakarta",
-      day: "numeric",
-      month: "long",
-      year: "numeric",
-    });
-  const paidInvoices = order.invoices.filter((i) => i.status === "PAID");
-  const paymentsReceived = paidInvoices.map((p) => ({
-    label: `${typeLabelId[p.invoice_type] ?? "Pembayaran diterima"} tanggal ${fmtTgl(p.paid_at ?? p.issue_date)}`,
-    amount: Number(p.amount),
-  }));
+  // Every payment actually received on the chosen invoices (the money on the
+  // receipt, also for an invoice voided later by a cancellation).
+  const chosen = new Set(order.invoices.map((i) => i.id));
+  const paymentsReceived = paymentLines(
+    (await paymentsOnOrder(prisma, order.id)).items.filter((p) => chosen.has(p.id)),
+  );
   const totalReceived = paymentsReceived.reduce((s, p) => s + p.amount, 0);
   const remainingBalance = Math.max(finalPrice - totalReceived, 0);
   const fullyPaid = remainingBalance <= 0 && finalPrice > 0;
@@ -904,12 +892,7 @@ export async function reviseInvoice(
     ADDITIONAL: "Additional Charge Revision",
   };
 
-  const methodLabels: Record<string, string> = {
-    CASH: "Cash",
-    BANK_TRANSFER: "Bank Transfer",
-    QRIS: "QRIS",
-    OTHER: "Other",
-  };
+
 
   // For a revision, exclude the invoice being revised from the "previously paid" total.
   const aggregate = await prisma.invoice.aggregate({
@@ -966,7 +949,7 @@ export async function reviseInvoice(
     finalPrice,
     invoiceType:
       typeLabels[invoice.invoice_type] ?? `${invoice.invoice_type} Revision`,
-    paymentMethod: methodLabels[paymentMethod] ?? paymentMethod,
+    paymentMethod: PAYMENT_METHOD_LABEL[paymentMethod] ?? paymentMethod,
     amountPaid: amount,
     previouslyPaid,
     invoiceKind: invoice.invoice_type,
@@ -974,7 +957,9 @@ export async function reviseInvoice(
     additionalItems: reviseAdditionalItems,
   });
 
-  const fileName = `${invoiceNumber}.pdf`;
+  // Unique per attempt: two revisions at once must not overwrite each other's
+  // PDF (only one of them is recorded, see the conditional update below).
+  const fileName = `${invoiceNumber}-${Date.now().toString(36)}.pdf`;
   const fileUrl = await uploadInvoicePDF(pdfBuffer, fileName);
 
   const revised = await prisma.$transaction(async (tx) => {

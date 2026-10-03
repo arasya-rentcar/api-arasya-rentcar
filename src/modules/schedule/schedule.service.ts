@@ -3,6 +3,7 @@ import prisma from '../../prisma/client';
 import { AppError } from '../../utils/AppError';
 import {
   assertOrderPaidForDriverAssignment,
+  paymentStatusFor,
   startPayment,
   startPaymentSelect,
 } from '../orders/assignment-guard';
@@ -454,6 +455,8 @@ export async function rollupOrderFinance(
     select: {
       order_status: true,
       final_price: true,
+      paid_to_date: true,
+      payment_status: true,
       invoices: {
         where: {
           invoice_type: 'CANCELLATION_FEE',
@@ -511,11 +514,19 @@ export async function rollupOrderFinance(
     ? Number(order.final_price)
     : revenue + charges;
 
+  // payment_status follows the money received against the (new) total, so an
+  // order whose total grows (a day added, a charge billed) is no longer shown
+  // as paid. A cancelled order's status is set by cancelOrder.
+  const paymentStatus = paymentStatusFor(order.paid_to_date, finalPrice);
   await tx.order.update({
     where: { id: orderId },
     data: cancelledOrder
       ? { is_external: anyExternal }
-      : { final_price: finalPrice, is_external: anyExternal },
+      : {
+          final_price: finalPrice,
+          is_external: anyExternal,
+          ...(paymentStatus !== order.payment_status ? { payment_status: paymentStatus } : {}),
+        },
   });
   const totals = {
     total_user_amount: finalPrice,
