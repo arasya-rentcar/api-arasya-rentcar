@@ -10,6 +10,7 @@ import {
   scheduleStockController,
   tripHistoryController,
   scheduleWeekController,
+  driverFeePresetsController,
 } from './schedule.controller';
 import {
   sendLineConfirmationController,
@@ -25,6 +26,7 @@ router.get('/driver-availability', driverAvailabilityController);
 router.get('/stock', scheduleStockController);
 router.get('/week', scheduleWeekController);
 router.get('/history', tripHistoryController);
+router.get('/driver-fee-presets', driverFeePresetsController);
 router.put('/lines/:id', assignScheduleLineController);
 // #A1/#A2 trip-team confirmation messaging.
 router.post('/lines/:id/send-confirmation', sendLineConfirmationController);

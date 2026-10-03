@@ -52,6 +52,23 @@ enum ExpenseType {
   OTHER
 }
 
+/// Trip cost review: costs reported from the driver app wait for an admin
+/// (PENDING); only APPROVED costs count toward margin, reimbursement and
+/// customer billing. Costs the admin adds are APPROVED at once.
+enum ExpenseStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+/// Who paid a trip cost on the road. DRIVER = the driver's own money or the
+/// uang jalan (reimbursed through the driver payable); COMPANY = company card,
+/// e-toll or paid by the office directly (no money owed to the driver).
+enum ExpensePayer {
+  DRIVER
+  COMPANY
+}
+
 enum InvoiceStatus {
   DRAFT
   ISSUED
@@ -417,9 +434,18 @@ model OrderServiceItem {
 
   // --- Per-day finance (daily margin = roll-up source) ---
   rtr_amount             Decimal? @db.Decimal(12, 2)
+  // Arasya's share of this day's trip costs: APPROVED expenses that are not
+  // billed to the customer. Derived (recomputeLineMoney); not typed by hand.
   ops_cost               Decimal  @default(0) @db.Decimal(12, 2)
   margin_amount          Decimal? @db.Decimal(12, 2)
   margin_formula_version String?
+  // Driver pay (2026-10-03). driver_fee = what the internal driver earns for
+  // this day (filled from the fee table on first assignment, admin may change);
+  // driver_fee_note = how it was built ("12 jam + OT 2 jam"); travel_advance =
+  // uang jalan handed out before the trip (deducted from the driver payable).
+  driver_fee             Decimal? @db.Decimal(12, 2)
+  driver_fee_note        String?
+  travel_advance         Decimal? @db.Decimal(12, 2)
 
   payable Payable?
 
@@ -501,13 +527,17 @@ model Payable {
   vendor_id String?
   vendor    ExternalVendor? @relation(fields: [vendor_id], references: [id], onDelete: SetNull)
 
-  service_date  DateTime?
-  // FEE (driver) / HARGA (vendor): the base amount owed, synced from the line cost.
-  base_amount   Decimal   @default(0) @db.Decimal(12, 2)
+  service_date     DateTime?
+  // FEE (driver = line.driver_fee) / HARGA (vendor = line.rtr_amount), synced from the line.
+  base_amount      Decimal   @default(0) @db.Decimal(12, 2)
   // LAINNYA roll-up: sum of extras (overtime, meal, deductions). Can be negative.
-  extras_amount Decimal   @default(0) @db.Decimal(12, 2)
-  // base + extras = TOTAL owed.
-  total_amount  Decimal   @default(0) @db.Decimal(12, 2)
+  extras_amount    Decimal   @default(0) @db.Decimal(12, 2)
+  // DRIVER only (2026-10-03): approved costs the driver paid (reimbursed) and
+  // the uang jalan already handed out (deducted).
+  reimburse_amount Decimal   @default(0) @db.Decimal(12, 2)
+  advance_amount   Decimal   @default(0) @db.Decimal(12, 2)
+  // TOTAL owed = base + reimburse - advance + extras.
+  total_amount     Decimal   @default(0) @db.Decimal(12, 2)
 
   keterangan        String?
   paid_at           DateTime?
@@ -637,6 +667,7 @@ model OrderAdjustment {
   is_billable Boolean             @default(true)
   created_by  String?
   created_at  DateTime            @default(now())
+  expense     Expense?
 
   @@index([order_id])
   @@index([type])
@@ -668,7 +699,24 @@ model Expense {
   note                  String?
   created_at            DateTime          @default(now())
 
+  // Review (2026-10-03): see ExpenseStatus / ExpensePayer.
+  status           ExpenseStatus    @default(PENDING)
+  paid_by          ExpensePayer     @default(DRIVER)
+  // Customer pays this cost (X Parkir / X Ops packages): while APPROVED it is
+  // mirrored as a billable OrderAdjustment so it lands on Invoice Tambahan.
+  bill_to_customer Boolean          @default(false)
+  trip_report_id   String?          @unique
+  trip_report      TripReport?      @relation(fields: [trip_report_id], references: [id], onDelete: SetNull)
+  adjustment_id    String?          @unique
+  adjustment       OrderAdjustment? @relation(fields: [adjustment_id], references: [id], onDelete: SetNull)
+  // null = reported from the driver app; otherwise the admin who added it.
+  created_by       String?
+  reviewed_at      DateTime?
+  reviewed_by      String?
+  review_note      String?
+
   @@index([order_service_item_id])
+  @@index([status])
   @@map("expenses")
 }
 
@@ -697,6 +745,7 @@ model TripReport {
   client_ref            String?           @unique
   amount                Decimal?          @db.Decimal(12, 2)
   created_at            DateTime          @default(now())
+  expense               Expense?
 
   @@index([order_id])
   @@index([order_service_item_id])

@@ -483,6 +483,7 @@ export async function revenueReport(opts: RevenueOpts = {}) {
       ops_cost: true,
       margin_amount: true,
       rtr_amount: true,
+      driver_fee: true,
       line_status: true,
       is_external: true,
       car_id: true,
@@ -495,7 +496,13 @@ export async function revenueReport(opts: RevenueOpts = {}) {
       external_car: { select: { id: true, model: true, plate_number: true } },
       order: { select: { order_status: true } },
       payable: {
-        select: { kind: true, total_amount: true, status: true, paid_at: true },
+        select: {
+          kind: true,
+          total_amount: true,
+          extras_amount: true,
+          status: true,
+          paid_at: true,
+        },
       },
     },
   });
@@ -590,10 +597,9 @@ export async function revenueReport(opts: RevenueOpts = {}) {
       slot.ops += n(l.ops_cost);
       slot.trips += 1;
       orderSlot.add(l.order_id);
-      // Driver fee on this line, accrual basis.
-      const driverFee =
-        l.payable && l.payable.kind === 'DRIVER' ? n(l.payable.total_amount) : 0;
-      slot.driver_fee += driverFee;
+      // Driver fee on this line, accrual basis (the day's fee, not the
+      // payable total, which also holds reimbursed trip costs).
+      slot.driver_fee += n(l.driver_fee) + n(l.payable?.extras_amount);
       if (l.margin_amount != null) {
         slot.net_margin += n(l.margin_amount);
         if (isFinal(l)) b.final_margin_known = true;
@@ -621,7 +627,7 @@ export async function revenueReport(opts: RevenueOpts = {}) {
           });
         }
         const d = cMap.get(dkey)!;
-        const amt = n(l.payable.total_amount);
+        const amt = n(l.driver_fee) + n(l.payable.extras_amount);
         d.fee_total += amt;
         if (l.payable.status === 'PAID') d.fee_paid += amt;
         else d.fee_pending += amt;
@@ -659,7 +665,7 @@ export async function revenueReport(opts: RevenueOpts = {}) {
       }
       const u = v.units.get(ukey)!;
       const vendorCost =
-        l.payable && l.payable.kind === 'VENDOR' ? n(l.payable.total_amount) : 0;
+        n(l.rtr_amount) + n(l.ops_cost) + n(l.payable?.extras_amount);
       const final = isFinal(l);
       const vSlot = final ? v.final : v.estimated;
       const uSlot = final ? u.final : u.estimated;
@@ -908,9 +914,15 @@ async function accrualSlice(start: Date, end: Date): Promise<AccrualSlice> {
     select: {
       total_price: true,
       ops_cost: true,
-      payable: { select: { kind: true, total_amount: true } },
+      driver_fee: true,
+      rtr_amount: true,
+      is_external: true,
+      payable: { select: { extras_amount: true } },
     },
   });
+  // Same rule as the order card (margin v4): revenue − driver fees − RTR −
+  // Arasya's share of the approved trip costs. Payables are not used here:
+  // a driver payable also carries reimbursed trip costs (already in ops_cost).
   let revenue = 0;
   let ops_cost = 0;
   let driver_cost = 0;
@@ -918,11 +930,9 @@ async function accrualSlice(start: Date, end: Date): Promise<AccrualSlice> {
   for (const l of lines) {
     revenue += n(l.total_price);
     ops_cost += n(l.ops_cost);
-    if (l.payable) {
-      const amt = n(l.payable.total_amount);
-      if (l.payable.kind === 'DRIVER') driver_cost += amt;
-      else if (l.payable.kind === 'VENDOR') vendor_cost += amt;
-    }
+    const extras = n(l.payable?.extras_amount);
+    if (l.is_external) vendor_cost += n(l.rtr_amount) + extras;
+    else driver_cost += n(l.driver_fee) + extras;
   }
   const margin = revenue - ops_cost - driver_cost - vendor_cost;
   return {
@@ -964,7 +974,9 @@ async function channelSplit(start: Date, end: Date) {
       total_price: true,
       ops_cost: true,
       is_external: true,
-      payable: { select: { kind: true, total_amount: true } },
+      driver_fee: true,
+      rtr_amount: true,
+      payable: { select: { extras_amount: true } },
     },
   });
   const internal = { revenue: 0, ops_cost: 0, driver_cost: 0, margin: 0, trips: 0 };
@@ -973,12 +985,13 @@ async function channelSplit(start: Date, end: Date) {
     const price = n(l.total_price);
     if (l.is_external) {
       vendor.billed += price;
-      if (l.payable?.kind === 'VENDOR') vendor.vendor_cost += n(l.payable.total_amount);
+      vendor.vendor_cost +=
+        n(l.rtr_amount) + n(l.ops_cost) + n(l.payable?.extras_amount);
       vendor.trips += 1;
     } else {
       internal.revenue += price;
       internal.ops_cost += n(l.ops_cost);
-      if (l.payable?.kind === 'DRIVER') internal.driver_cost += n(l.payable.total_amount);
+      internal.driver_cost += n(l.driver_fee) + n(l.payable?.extras_amount);
       internal.trips += 1;
     }
   }

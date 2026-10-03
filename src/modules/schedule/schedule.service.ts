@@ -2,9 +2,11 @@ import { notifyNewTrips, notifyTripsRemoved } from '../../services/tripNotify';
 import prisma from '../../prisma/client';
 import { AppError } from '../../utils/AppError';
 import { assertOrderPaidForDriverAssignment } from '../orders/assignment-guard';
-import { computeLineMargin, MARGIN_FORMULA_VERSION } from '../../utils/margin';
+import { MARGIN_FORMULA_VERSION } from '../../utils/margin';
 import { staleTripCutoff } from '../../utils/wib';
-import { syncPayableForLine } from '../payables/payables.service';
+import { defaultDriverFee } from '../../utils/driverFee';
+import { paidPayableBlockingChange } from '../payables/payables.service';
+import { recomputeLineMoney } from './line-money.service';
 import {
   deriveAndSetOrderStatus,
   syncDriverStatus,
@@ -203,28 +205,80 @@ export async function assignScheduleLine(
       throw new AppError('External car not found', 404);
   }
 
-  const revenue = Number(line.total_price ?? 0);
-  const ops = input.ops_cost != null ? input.ops_cost : Number(line.ops_cost ?? 0);
-  const rtr =
-    input.rtr_amount !== undefined
-      ? input.rtr_amount
-      : line.rtr_amount != null
-        ? Number(line.rtr_amount)
+  // ── Driver pay (2026-10-03) ───────────────────────────────────────────
+  // undefined = leave as is. Older dashboards send "Biaya Ops", which was the
+  // driver's pay, so it stands in for driver_fee on internal days.
+  let fee: number | null | undefined =
+    input.driver_fee !== undefined
+      ? input.driver_fee
+      : !isExternal && input.ops_cost !== undefined
+        ? input.ops_cost
+        : undefined;
+  let feeNote: string | null | undefined = input.driver_fee_note;
+  let rtr: number | null | undefined = input.rtr_amount;
+  const feeGiven = fee !== undefined;
+
+  const nextDriverId = isExternal
+    ? null
+    : input.driver_id !== undefined
+      ? input.driver_id
+      : line.driver_id;
+  const nextVendorId = !isExternal
+    ? null
+    : input.external_vendor_id !== undefined
+      ? input.external_vendor_id
+      : line.is_external
+        ? line.external_vendor_id
         : null;
-  const margin = computeLineMargin({
-    isExternal,
-    revenue,
-    ops_cost: ops,
-    rtr_amount: rtr,
+
+  // A day already paid to someone cannot silently move to someone else.
+  const paidTo = await paidPayableBlockingChange(prisma, id, {
+    kind: nextDriverId ? 'DRIVER' : nextVendorId ? 'VENDOR' : null,
+    ownerId: nextDriverId ?? nextVendorId ?? null,
   });
+  if (paidTo) {
+    throw new AppError(
+      `Hari ini sudah dibayar ke ${paidTo}. Tandai belum terbayar dulu di menu Utang sebelum mengganti driver atau rekanan.`,
+      409,
+    );
+  }
+
+  // First internal driver on a day without a fee: fill it from the fee table.
+  if (!isExternal && nextDriverId && !feeGiven && line.driver_fee == null) {
+    const d = defaultDriverFee(line.service_kind);
+    fee = d.amount;
+    if (feeNote === undefined) feeNote = d.note;
+  }
+
+  // Cancelled before the trip started: nobody earned anything for this day,
+  // unless the admin enters an amount in the same save.
+  const becomesCancelled =
+    input.line_status === 'CANCELLED' && line.line_status !== 'CANCELLED';
+  const started = !!(line.actual_start_at || line.trip_started_at);
+  if (becomesCancelled && !started) {
+    if (!isExternal && !feeGiven) {
+      fee = 0;
+      feeNote = 'Dibatalkan sebelum berangkat';
+    }
+    if (isExternal && input.rtr_amount === undefined) rtr = 0;
+  }
 
   const data: Prisma.OrderServiceItemUncheckedUpdateInput = {
     is_external: isExternal,
-    margin_amount: margin,
-    margin_formula_version: MARGIN_FORMULA_VERSION,
-    ops_cost: ops,
-    rtr_amount: rtr,
   };
+  if (isExternal) {
+    // Partner day: no Arasya driver pay.
+    data.driver_fee = null;
+    data.driver_fee_note = null;
+    data.travel_advance = null;
+    if (rtr !== undefined) data.rtr_amount = rtr;
+  } else {
+    data.rtr_amount = null;
+    if (fee !== undefined) data.driver_fee = fee;
+    if (feeNote !== undefined) data.driver_fee_note = feeNote?.trim() || null;
+    if (input.travel_advance !== undefined)
+      data.travel_advance = input.travel_advance;
+  }
   // When switching mode, clear the other side's links.
   if (isExternal) {
     data.driver_id = null;
@@ -278,19 +332,19 @@ export async function assignScheduleLine(
   const prevCarId = line.car_id;
 
   const updated = await prisma.$transaction(async (tx) => {
-    const u = await tx.orderServiceItem.update({
-      where: { id },
-      data,
-      include: lineInclude,
-    });
-    await syncPayableForLine(tx, id);
+    await tx.orderServiceItem.update({ where: { id }, data });
+    // Costs, margin and the payable follow the day; then the order totals.
+    await recomputeLineMoney(tx, id);
     await rollupOrderFinance(tx, line.order_id);
 
     // Batch 2: keep order status derived from the lines inside this same
     // transaction so order_status / awaiting_finalization never drift.
     await deriveAndSetOrderStatus(tx, line.order_id);
 
-    return u;
+    return tx.orderServiceItem.findUniqueOrThrow({
+      where: { id },
+      include: lineInclude,
+    });
   }, { timeout: 20000, maxWait: 10000 });
 
   // Driver/car ON_DUTY/AVAILABLE status is NOT on the critical path: the
@@ -331,65 +385,102 @@ export async function assignScheduleLine(
   return { ...updated, confirmation_state: deriveState(updated) };
 }
 
-/** Recompute the order's rolled-up totals + margin from its day-lines. */
+/**
+ * Recompute the order's rolled-up totals + margin from its day-lines.
+ *
+ *  - final_price = active (non-cancelled) days + all billable charges,
+ *    except on a cancelled order, whose price is the cancellation fee.
+ *  - Costs: driver fees, Arasya's trip costs and partner RTR of every day
+ *    (a cancelled day can still cost money if the trip had started).
+ *  - margin = Σ active day margins − costs of cancelled days + charges that
+ *    are real extra income (overtime, extra stop…). Trip costs billed to the
+ *    customer are pass-through: income and cost cancel out.
+ */
 export async function rollupOrderFinance(
   tx: Prisma.TransactionClient,
   orderId: string,
 ) {
+  const order = await tx.order.findUnique({
+    where: { id: orderId },
+    select: {
+      order_status: true,
+      final_price: true,
+      invoices: {
+        where: {
+          invoice_type: 'CANCELLATION_FEE',
+          status: { notIn: ['CANCELLED', 'REVISED'] },
+        },
+        select: { id: true },
+      },
+    },
+  });
+  if (!order) return;
   const lines = await tx.orderServiceItem.findMany({
     where: { order_id: orderId },
+    include: { payable: { select: { extras_amount: true } } },
   });
+  // Orders without day-lines keep their manually set price.
+  if (lines.length === 0) return;
+
   let revenue = 0;
   let ops = 0;
   let rtr = 0;
+  let fees = 0;
   let margin = 0;
   let anyExternal = false;
   for (const l of lines) {
-    revenue += Number(l.total_price ?? 0);
+    const cancelled = l.line_status === 'CANCELLED';
+    const fee = l.is_external ? 0 : Number(l.driver_fee ?? 0);
+    const vendor = l.is_external ? Number(l.rtr_amount ?? 0) : 0;
+    const costs =
+      Number(l.ops_cost ?? 0) + Number(l.payable?.extras_amount ?? 0);
     ops += Number(l.ops_cost ?? 0);
-    rtr += Number(l.rtr_amount ?? 0);
-    margin += Number(l.margin_amount ?? 0);
+    rtr += vendor;
+    fees += fee;
     if (l.is_external) anyExternal = true;
+    if (cancelled) {
+      margin -= fee + vendor + costs;
+    } else {
+      revenue += Number(l.total_price ?? 0);
+      margin += Number(l.margin_amount ?? 0);
+    }
   }
-  // Billable adjustments (overtime/parking/etc.) bump the order total too, so
-  // include them — otherwise re-running the rollup would wipe additional
-  // charges back down to the bare service-line sum.
   const adjustments = await tx.orderAdjustment.findMany({
     where: { order_id: orderId, is_billable: true },
+    select: { amount: true, quantity: true, expense: { select: { id: true } } },
   });
-  const adjustmentsTotal = adjustments.reduce(
-    (s, a) => s + Number(a.amount ?? 0) * (a.quantity ?? 1),
-    0,
-  );
-  const finalPrice = revenue + adjustmentsTotal;
-  // Additional billable charges also add to revenue + margin (they are pure
-  // markup with no extra resource cost recorded here).
-  margin += adjustmentsTotal;
-  // External lines pay RTR to the vendor; internal lines pay ops_cost to the
-  // driver. Roll RTR up so the order-level Finance card no longer shows a
-  // blank RTR for external orders. total_driver_amount stays a manual/optional
-  // override (Driver Cost) so it does not duplicate Ops Cost.
+  let charges = 0;
+  for (const a of adjustments) {
+    const amt = Number(a.amount ?? 0) * (a.quantity ?? 1);
+    charges += amt;
+    if (!a.expense) margin += amt;
+  }
+
+  const cancelledOrder =
+    order.order_status === 'CANCELLED' || order.invoices.length > 0;
+  const finalPrice = cancelledOrder
+    ? Number(order.final_price)
+    : revenue + charges;
+
   await tx.order.update({
     where: { id: orderId },
-    data: { final_price: finalPrice, is_external: anyExternal },
+    data: cancelledOrder
+      ? { is_external: anyExternal }
+      : { final_price: finalPrice, is_external: anyExternal },
   });
+  const totals = {
+    total_user_amount: finalPrice,
+    total_ops_cost: ops,
+    rtr_amount: rtr,
+    total_driver_amount: fees,
+    driver_fee_amount: fees,
+    margin_amount: margin,
+    margin_formula_version: MARGIN_FORMULA_VERSION,
+  };
   await tx.orderFinalFinance.upsert({
     where: { order_id: orderId },
-    update: {
-      total_user_amount: finalPrice,
-      total_ops_cost: ops,
-      rtr_amount: rtr,
-      margin_amount: margin,
-      margin_formula_version: MARGIN_FORMULA_VERSION,
-    },
-    create: {
-      order_id: orderId,
-      total_user_amount: finalPrice,
-      total_ops_cost: ops,
-      rtr_amount: rtr,
-      margin_amount: margin,
-      margin_formula_version: MARGIN_FORMULA_VERSION,
-    },
+    update: totals,
+    create: { order_id: orderId, ...totals },
   });
 }
 
@@ -880,6 +971,21 @@ export async function tripHistory(query: TripHistoryQuery) {
         file_mime: true,
         driver_phone: true,
         status: true,
+        amount: true,
+        source: true,
+        created_at: true,
+      },
+      orderBy: { created_at: 'asc' as const },
+    },
+    expenses: {
+      select: {
+        id: true,
+        type: true,
+        amount: true,
+        note: true,
+        status: true,
+        paid_by: true,
+        bill_to_customer: true,
         created_at: true,
       },
       orderBy: { created_at: 'asc' as const },

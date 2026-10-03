@@ -1,4 +1,5 @@
 import { Prisma, ScheduleStatus } from "@prisma/client";
+import { billedToCustomerByPackage } from "../../utils/driverFee";
 import prisma from "../../prisma/client";
 import { AppError } from "../../utils/AppError";
 import {
@@ -167,6 +168,7 @@ export async function getTrip(driverId: string, lineId: string) {
       type: e.type,
       amount: Number(e.amount),
       note: e.note,
+      status: e.status,
       created_at: e.created_at,
     })),
   };
@@ -369,7 +371,8 @@ async function applyOnce(
 /**
  * Photo / receipt / note from the app. Idempotent on client_ref (the phone
  * retries uploads after a lost connection). Costs also become Expense rows on
- * the line; they are kept separate from ops_cost (the driver payable base).
+ * the line, waiting for admin review; approved ones feed the day's costs, the
+ * driver's reimbursement and (per package) the customer's extra charges.
  */
 export async function addReport(
   driverId: string,
@@ -426,6 +429,8 @@ export async function addReport(
       },
     });
     if (costType && amount) {
+      // Waits for the admin to check the receipt (PENDING). The driver paid it
+      // (own money or uang jalan); X Parkir / X Ops costs go to the customer.
       await tx.expense.create({
         data: {
           order_service_item_id: lineId,
@@ -433,6 +438,10 @@ export async function addReport(
           amount,
           note: input.notes ?? null,
           created_at: at,
+          status: "PENDING",
+          paid_by: "DRIVER",
+          bill_to_customer: billedToCustomerByPackage(line.service_package, costType),
+          trip_report_id: r.id,
         },
       });
     }

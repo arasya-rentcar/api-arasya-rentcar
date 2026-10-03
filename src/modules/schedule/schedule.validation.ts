@@ -41,7 +41,13 @@ export const assignScheduleLineSchema = z
     service_date: z.string().datetime().nullable().optional(),
     start_at: z.string().datetime().nullable().optional(),
     end_at: z.string().datetime().nullable().optional(),
-    rtr_amount: z.number().nullable().optional(),
+    rtr_amount: z.number().nonnegative().nullable().optional(),
+    // Driver pay (2026-10-03): the day's fee, how it was built, uang jalan.
+    driver_fee: z.number().nonnegative().max(100_000_000).nullable().optional(),
+    driver_fee_note: z.string().max(200).nullable().optional(),
+    travel_advance: z.number().nonnegative().max(100_000_000).nullable().optional(),
+    // Legacy: older dashboards send "Biaya Ops", which was the driver's pay.
+    // Treated as driver_fee when driver_fee is not given.
     ops_cost: z.number().nonnegative().optional(),
     notes: z.string().nullable().optional(),
   })

@@ -10,10 +10,16 @@
  *  - EXTERNAL (vendor-supplied):  margin = (TOTAL USER | HARGA JUAL) − RTR
  *      (driver fee is an internal concept; vendor cost is captured by RTR.)
  *
+ * v4 (2026-10-03, per-day driver pay): a day's margin is
+ *   revenue − (driver_fee for an internal day | RTR for a partner day)
+ *           − Arasya's share of the approved trip costs (ops_cost).
+ * The order margin is the sum of its day margins plus billable charges that
+ * are not pass-through trip costs (see rollupOrderFinance).
+ *
  * Bump MARGIN_FORMULA_VERSION whenever this logic changes so historical rows
  * remain auditable.
  */
-export const MARGIN_FORMULA_VERSION = 'v3-2026-06-22';
+export const MARGIN_FORMULA_VERSION = 'v4-2026-10-03';
 
 export interface MarginInputs {
   isExternal: boolean;
@@ -50,13 +56,14 @@ export function computeMargin(input: MarginInputs): number {
 export interface LineMarginInputs {
   isExternal: boolean;
   revenue?: number | null; // that day's user/sell price (total_price)
-  ops_cost?: number | null; // that day's ops (bensin/tol/fee/parkir/etc.)
+  ops_cost?: number | null; // Arasya's share of the day's approved trip costs
   rtr_amount?: number | null; // vendor RTR for external days
+  driver_fee?: number | null; // internal days: what the driver earns
 }
 
 export function computeLineMargin(input: LineMarginInputs): number {
   if (input.isExternal) {
-    return n(input.revenue) - n(input.rtr_amount);
+    return n(input.revenue) - n(input.rtr_amount) - n(input.ops_cost);
   }
-  return n(input.revenue) - n(input.ops_cost);
+  return n(input.revenue) - n(input.driver_fee) - n(input.ops_cost);
 }

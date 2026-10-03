@@ -6,6 +6,8 @@ import {
   UpdatePayableInput,
   MarkPayablePaidInput,
 } from './payables.validation';
+import { recomputeLineMoney } from '../schedule/line-money.service';
+import { rollupOrderFinance } from '../schedule/schedule.service';
 
 const payableInclude = {
   order: {
@@ -28,14 +30,20 @@ const payableInclude = {
 } satisfies Prisma.PayableInclude;
 
 /**
- * Sync (create / update / remove) the payable for a single service line based
- * on its current assignment. Called from assignScheduleLine inside its tx.
+ * Sync (create / update / remove) the payable for a single service line from
+ * the line itself. Called inside the caller's transaction (normally through
+ * recomputeLineMoney, after the line's ops/margin were refreshed).
  *
- * Rules:
- *  - Internal driver assigned -> DRIVER payable, base_amount = ops_cost.
- *  - External vendor assigned -> VENDOR payable, base_amount = rtr_amount.
- *  - No assignment -> remove any existing UNPAID payable (keep PAID for history).
- *  - base/total are kept in sync while UNPAID; once PAID we never silently rewrite.
+ * Rules (driver pay, 2026-10-03):
+ *  - Internal driver -> DRIVER payable:
+ *      base (fee)       = line.driver_fee
+ *      reimburse_amount = APPROVED expenses the driver paid (own money / uang jalan)
+ *      advance_amount   = line.travel_advance (uang jalan already handed out)
+ *      total            = base + reimburse − advance + extras
+ *  - Partner vendor -> VENDOR payable, base = line.rtr_amount, total = base + extras.
+ *  - No assignment, or a cancelled day that owes nothing -> remove the UNPAID payable.
+ *  - A PAID payable is frozen: never re-priced and never moved to another
+ *    driver/vendor (assignScheduleLine refuses that change instead).
  */
 export async function syncPayableForLine(
   tx: Prisma.TransactionClient,
@@ -43,82 +51,103 @@ export async function syncPayableForLine(
 ) {
   const line = await tx.orderServiceItem.findUnique({
     where: { id: serviceItemId },
-    include: { payable: { include: { extras: true } } },
+    include: {
+      payable: { include: { extras: true } },
+      expenses: {
+        where: { status: 'APPROVED', paid_by: 'DRIVER' },
+        select: { amount: true },
+      },
+    },
   });
   if (!line) return;
 
   const existing = line.payable;
+  if (existing && existing.status === 'PAID') return;
+
   const isExternal = line.is_external;
   const hasDriver = !isExternal && !!line.driver_id;
   const hasVendor = isExternal && !!line.external_vendor_id;
 
   // No (valid) assignment for a payable.
   if (!hasDriver && !hasVendor) {
-    if (existing && existing.status === 'UNPAID') {
-      await tx.payable.delete({ where: { id: existing.id } });
-    }
+    if (existing) await tx.payable.delete({ where: { id: existing.id } });
     return;
   }
 
   const kind: 'DRIVER' | 'VENDOR' = hasDriver ? 'DRIVER' : 'VENDOR';
   const base =
     kind === 'DRIVER'
-      ? Number(line.ops_cost ?? 0)
+      ? Number(line.driver_fee ?? 0)
       : Number(line.rtr_amount ?? 0);
-
-  // Preserve manually-entered extras on existing payable.
+  const reimburse =
+    kind === 'DRIVER'
+      ? line.expenses.reduce((s, e) => s + Number(e.amount), 0)
+      : 0;
+  const advance = kind === 'DRIVER' ? Number(line.travel_advance ?? 0) : 0;
+  // Manually-entered extras (bonus, potongan) survive every re-sync.
   const extrasSum = existing
     ? existing.extras.reduce((s, e) => s + Number(e.amount), 0)
     : 0;
+  const total = base + reimburse - advance + extrasSum;
+
+  // A cancelled day that owes nothing has no payable.
+  if (
+    line.line_status === 'CANCELLED' &&
+    base === 0 &&
+    reimburse === 0 &&
+    advance === 0 &&
+    extrasSum === 0
+  ) {
+    if (existing) await tx.payable.delete({ where: { id: existing.id } });
+    return;
+  }
+
+  const data = {
+    kind,
+    driver_id: kind === 'DRIVER' ? line.driver_id : null,
+    vendor_id: kind === 'VENDOR' ? line.external_vendor_id : null,
+    service_date: line.service_date,
+    base_amount: base,
+    reimburse_amount: reimburse,
+    advance_amount: advance,
+    extras_amount: extrasSum,
+    total_amount: total,
+  };
 
   if (!existing) {
     await tx.payable.create({
       data: {
-        kind,
+        ...data,
         status: 'UNPAID',
         service_item_id: line.id,
         order_id: line.order_id,
-        driver_id: kind === 'DRIVER' ? line.driver_id : null,
-        vendor_id: kind === 'VENDOR' ? line.external_vendor_id : null,
-        service_date: line.service_date,
-        base_amount: base,
-        extras_amount: 0,
-        total_amount: base,
       },
     });
     return;
   }
-
-  // Keep PAID payables for history; only refresh assignment link + service_date.
-  if (existing.status === 'PAID') {
-    await tx.payable.update({
-      where: { id: existing.id },
-      data: {
-        kind,
-        driver_id: kind === 'DRIVER' ? line.driver_id : null,
-        vendor_id: kind === 'VENDOR' ? line.external_vendor_id : null,
-        service_date: line.service_date,
-      },
-    });
-    return;
-  }
-
-  await tx.payable.update({
-    where: { id: existing.id },
-    data: {
-      kind,
-      driver_id: kind === 'DRIVER' ? line.driver_id : null,
-      vendor_id: kind === 'VENDOR' ? line.external_vendor_id : null,
-      service_date: line.service_date,
-      base_amount: base,
-      extras_amount: extrasSum,
-      total_amount: base + extrasSum,
-    },
-  });
+  await tx.payable.update({ where: { id: existing.id }, data });
 }
 
-function recalcTotal(base: number, extrasSum: number): number {
-  return base + extrasSum;
+/**
+ * The driver/vendor a PAID payable belongs to, when the requested change
+ * would move this line's money to someone else. Used to refuse such edits.
+ */
+export async function paidPayableBlockingChange(
+  tx: Prisma.TransactionClient | typeof prisma,
+  serviceItemId: string,
+  next: { kind: 'DRIVER' | 'VENDOR' | null; ownerId: string | null },
+): Promise<string | null> {
+  const p = await tx.payable.findUnique({
+    where: { service_item_id: serviceItemId },
+    include: {
+      driver: { select: { name: true } },
+      vendor: { select: { name: true } },
+    },
+  });
+  if (!p || p.status !== 'PAID') return null;
+  const ownerId = p.kind === 'DRIVER' ? p.driver_id : p.vendor_id;
+  if (p.kind === next.kind && ownerId === next.ownerId) return null;
+  return p.driver?.name ?? p.vendor?.name ?? 'driver/rekanan sebelumnya';
 }
 
 /** List payables with filters, pagination, and summary totals. */
@@ -257,6 +286,11 @@ export async function updatePayable(id: string, input: UpdatePayableInput) {
     include: { extras: true },
   });
   if (!existing) throw new AppError('Payable not found', 404);
+  if (existing.status === 'PAID')
+    throw new AppError(
+      'Tagihan ini sudah terbayar. Tandai belum terbayar dulu bila ingin mengubahnya.',
+      409,
+    );
 
   return prisma.$transaction(async (tx) => {
     // Replace extras list if provided.
@@ -275,21 +309,28 @@ export async function updatePayable(id: string, input: UpdatePayableInput) {
       extrasSum = input.extras.reduce((s, e) => s + e.amount, 0);
     }
 
-    const base =
-      input.base_amount != null
-        ? input.base_amount
-        : Number(existing.base_amount);
+    // Fee / RTR come from the day (Edit Hari) and reimbursements from the
+    // approved trip costs, so only extras + keterangan are edited here.
+    // base_amount is still accepted from older dashboards but ignored.
+    const base = Number(existing.base_amount);
+    const total =
+      base +
+      Number(existing.reimburse_amount) -
+      Number(existing.advance_amount) +
+      extrasSum;
 
     const data: Prisma.PayableUncheckedUpdateInput = {
-      base_amount: base,
       extras_amount: extrasSum,
-      total_amount: recalcTotal(base, extrasSum),
+      total_amount: total,
     };
     if (input.keterangan !== undefined) data.keterangan = input.keterangan;
 
     await tx.payable.update({ where: { id }, data });
+    // Extras change the day's margin and the order totals.
+    await recomputeLineMoney(tx, existing.service_item_id);
+    await rollupOrderFinance(tx, existing.order_id);
     return tx.payable.findUnique({ where: { id }, include: payableInclude });
-  });
+  }, { maxWait: 15000, timeout: 30000 });
 }
 
 /** Mark a payable PAID (records paid_at + optional method). */
@@ -314,9 +355,14 @@ export async function markPayablePaid(id: string, input: MarkPayablePaidInput) {
 export async function markPayableUnpaid(id: string) {
   const existing = await prisma.payable.findUnique({ where: { id } });
   if (!existing) throw new AppError('Payable not found', 404);
-  await prisma.payable.update({
-    where: { id },
-    data: { status: 'UNPAID', paid_at: null, payment_method: null },
+  await prisma.$transaction(async (tx) => {
+    await tx.payable.update({
+      where: { id },
+      data: { status: 'UNPAID', paid_at: null, payment_method: null },
+    });
+    // While it was paid the day may have changed (fee, costs, driver):
+    // bring the amounts back in line with the day.
+    await syncPayableForLine(tx, existing.service_item_id);
   });
   return prisma.payable.findUnique({ where: { id }, include: payableInclude });
 }

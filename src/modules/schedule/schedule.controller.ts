@@ -15,6 +15,7 @@ import {
   tripHistory,
   scheduleWeek,
 } from './schedule.service';
+import { DRIVER_FEE_BASE, DRIVER_FEE_ADDONS } from '../../utils/driverFee';
 
 export async function listScheduleController(
   req: Request,
@@ -98,4 +99,12 @@ export async function scheduleWeekController(
   } catch (err) {
     next(err);
   }
+}
+
+/** The driver fee table (quick buttons in "Edit Hari"). */
+export function driverFeePresetsController(_req: Request, res: Response): void {
+  res.json({
+    status: 'success',
+    data: { base: DRIVER_FEE_BASE, addons: DRIVER_FEE_ADDONS },
+  });
 }
