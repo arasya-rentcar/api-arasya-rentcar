@@ -19,6 +19,7 @@ import { generateInvoicePDF } from "../../services/pdf.service";
 import {
   uploadInvoicePDF,
   uploadFile,
+  removeFile,
   assertValidUpload,
   getSignedUrl,
   PAYMENT_PROOFS_BUCKET,
@@ -624,72 +625,102 @@ export async function markInvoicePaid(
     public: false,
   });
 
-  // Reserve the kwitansi number atomically (per-customer kwitansi_seq) before
-  // the main transaction. Receipts always belong to a customer (via the order).
   const customer = invoice.order.customer;
-  let receiptNumber: string | null = null;
-  let receiptSeq: number | null = null;
-  if (customer) {
-    const gen = await prisma.$transaction((tx) =>
-      nextReceiptNumber(tx, { id: customer.id, code: customer.code }, paidAt),
-    );
-    receiptNumber = gen.number;
-    receiptSeq = gen.seq;
-  }
 
-  const paid = await prisma.$transaction(async (tx) => {
-    const updated = await tx.invoice.update({
-      where: { id: invoiceId },
-      data: {
-        status: "PAID",
-        paid_at: paidAt,
-        receipt_url: receiptUrl,
-        ...(input.payment_method
-          ? { payment_method: input.payment_method as never }
-          : {}),
-      },
-    });
-
-    // Create the Kwitansi/Receipt row (idempotency: one receipt per invoice
-    // payment event; the early `status === PAID` return above prevents repeats).
-    if (customer && receiptNumber && receiptSeq !== null) {
-      await tx.receipt.create({
+  // One payment per invoice, also on a double click or two admins at once:
+  // the order row is locked, the invoice turns PAID only if it is not already,
+  // and only that request reserves the kwitansi number, writes the receipt and
+  // adds to the totals (the other one burns no number and records nothing).
+  const paid = await prisma.$transaction(
+    async (tx) => {
+      await tx.$queryRaw`SELECT id FROM "orders" WHERE id = ${invoice.order_id} FOR UPDATE`;
+      // The order total as it is now (it may have changed since it was read).
+      const { final_price: currentTotal } = await tx.order.findUniqueOrThrow({
+        where: { id: invoice.order_id },
+        select: { final_price: true },
+      });
+      const orderTotalNow = Number(currentTotal);
+      const { count } = await tx.invoice.updateMany({
+        where: { id: invoiceId, status: { notIn: ["PAID", "REVISED", "CANCELLED"] } },
         data: {
-          receipt_number: receiptNumber,
-          invoice_id: invoice.id,
-          customer_id: customer.id,
-          customer_seq: receiptSeq,
-          payment_date: paidAt,
-          // ACTUAL money received (may exceed the invoice amount on overpayment).
-          amount: amountReceived,
-          payment_method: paymentMethod as never,
-          file_url: receiptUrl,
-          // Private storage path; resolved to a signed URL on read.
-          payment_proof_url: proofUpload.path,
+          status: "PAID",
+          paid_at: paidAt,
+          receipt_url: receiptUrl,
+          ...(input.payment_method
+            ? { payment_method: input.payment_method as never }
+            : {}),
         },
       });
-      // total_paid = sum of receipts (cash actually collected, G9).
-      await tx.customer.update({
-        where: { id: customer.id },
-        data: { total_paid: { increment: amountReceived } },
+      if (count === 0) return null;
+
+      // Create the Kwitansi/Receipt row: one per invoice payment.
+      if (customer) {
+        const { number: receiptNumber, seq: receiptSeq } = await nextReceiptNumber(
+          tx,
+          { id: customer.id, code: customer.code },
+          paidAt,
+        );
+        await tx.receipt.create({
+          data: {
+            receipt_number: receiptNumber,
+            invoice_id: invoice.id,
+            customer_id: customer.id,
+            customer_seq: receiptSeq,
+            payment_date: paidAt,
+            // ACTUAL money received (may exceed the invoice amount on overpayment).
+            amount: amountReceived,
+            payment_method: paymentMethod as never,
+            file_url: receiptUrl,
+            // Private storage path; resolved to a signed URL on read.
+            payment_proof_url: proofUpload.path,
+          },
+        });
+        // total_paid = sum of receipts (cash actually collected, G9).
+        await tx.customer.update({
+          where: { id: customer.id },
+          data: { total_paid: { increment: amountReceived } },
+        });
+      }
+
+      // paid_to_date = ACTUAL money received across the order: every other
+      // PAID invoice (its receipt amount, or the invoice amount for old rows
+      // without a receipt) + this payment. Read under the order lock, so a
+      // second invoice paid at the same moment is counted too.
+      const otherPaid = await tx.invoice.findMany({
+        where: { order_id: invoice.order_id, status: "PAID", id: { not: invoice.id } },
+        select: { id: true, amount: true },
       });
-    }
+      const otherReceipts = await tx.receipt.findMany({
+        where: { invoice_id: { in: otherPaid.map((p) => p.id) } },
+        select: { invoice_id: true, amount: true },
+      });
+      const received = new Map(otherReceipts.map((r) => [r.invoice_id, Number(r.amount)]));
+      const paidTotal =
+        otherPaid.reduce((s, p) => s + (received.get(p.id) ?? Number(p.amount)), 0) +
+        amountReceived;
 
-    // paid_to_date = sum of ACTUAL money received across the order (= totalReceived,
-    // prior receipts + this payment). Drives payment_status + refund flag.
-    const paidTotal = totalReceived;
+      let paymentStatus: "UNPAID" | "DP_PAID" | "PAID" = "UNPAID";
+      if (paidTotal >= orderTotalNow && orderTotalNow > 0) paymentStatus = "PAID";
+      else if (paidTotal > 0) paymentStatus = "DP_PAID";
 
-    let paymentStatus: "UNPAID" | "DP_PAID" | "PAID" = "UNPAID";
-    if (paidTotal >= orderTotal && orderTotal > 0) paymentStatus = "PAID";
-    else if (paidTotal > 0) paymentStatus = "DP_PAID";
+      await tx.order.update({
+        where: { id: invoice.order_id },
+        data: { payment_status: paymentStatus, paid_to_date: paidTotal },
+      });
 
-    await tx.order.update({
-      where: { id: invoice.order_id },
-      data: { payment_status: paymentStatus, paid_to_date: paidTotal },
-    });
+      return tx.invoice.findUniqueOrThrow({ where: { id: invoiceId } });
+    },
+    { maxWait: 15000, timeout: 20000 },
+  );
 
-    return updated;
-  });
+  if (!paid) {
+    // Another request recorded this payment first: drop our copy of the proof
+    // and answer with the invoice as it is now.
+    void removeFile(PAYMENT_PROOFS_BUCKET, proofUpload.path);
+    const current = await prisma.invoice.findUnique({ where: { id: invoiceId } });
+    if (current?.status === "PAID") return current;
+    throw new AppError(`Cannot mark a ${current?.status ?? "missing"} invoice as paid`, 409);
+  }
 
   // Website lead → GA4 "purchase" (first payment only; never blocks the admin).
   reportLeadPurchase(invoice.order_id).catch((err) =>
@@ -950,21 +981,9 @@ export async function reviseInvoice(
         parent_id: invoice.parent_id || invoice.id,
       },
     });
-    const newTotal = previouslyPaid + amount;
-    let paymentStatus: "UNPAID" | "DP_PAID" | "PAID" = invoice.order
-      .payment_status as "UNPAID" | "DP_PAID" | "PAID";
-    if (newTotal >= finalPrice) {
-      paymentStatus = "PAID";
-    } else if (newTotal > 0) {
-      paymentStatus = "DP_PAID";
-    } else {
-      paymentStatus = "UNPAID";
-    }
-
-    await tx.order.update({
-      where: { id: invoice.order_id },
-      data: { payment_status: paymentStatus },
-    });
+    // payment_status is NOT recomputed here: it follows the money received
+    // (markInvoicePaid), never the amount billed. Revising an unpaid invoice
+    // must not mark the order paid (the owner's DP rule and GA4 rely on it).
 
     await tx.orderChangeLog.create({
       data: {
@@ -978,10 +997,6 @@ export async function reviseInvoice(
     });
     return revised;
   });
-  // A revision can move payment_status to DP_PAID/PAID (website lead → GA4).
-  reportLeadPurchase(invoice.order_id).catch((err) =>
-    console.error("GA4 purchase report failed:", err),
-  );
   return revised;
 }
 
