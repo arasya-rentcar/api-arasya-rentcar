@@ -288,6 +288,33 @@ await section('C. Edit Order on a running order (T1)', async () => {
   await putLine(cd.service_items[0].id, { is_external: false, line_status: 'CANCELLED' });
   const cdRes = await call('PUT', `/orders/${cd.id}`, { token: admin, body: editBody(await order(cd.id), { reason: 'hapus', days: [{ id: cd.service_items[1].id }] }) });
   check('C29 cancelled day with a driver cannot be removed; message says it stays', cdRes.status === 409 && /sudah dibatalkan/.test(cdRes.json?.message ?? ''), cdRes.json?.message);
+
+  // A day stored at 08:00 WIB (made without a date): the form sends WIB
+  // midnight of the same day, which is not a move.
+  const nd = await call('POST', '/orders', {
+    token: admin,
+    body: {
+      customer_name: `TEST C30 ${tag}`, customer_phone: `0857${rnd()}`, pickup_location: 'Bogor', dropoff_location: 'Jakarta',
+      order_date: new Date().toISOString(), final_price: 1_000_000,
+      service_items: [{ start_at: wibIso(13, '08:00'), end_at: wibIso(13, '20:00'), pickup_location: 'Bogor', dropoff_location: 'Jakarta', service_kind: '12H', service_package: 'ALL-IN', unit_price: 1_000_000 }],
+    },
+  });
+  const ndo = await order(nd.data.id);
+  await payDp(ndo, 200_000);
+  await putLine(ndo.service_items[0].id, { is_external: false, driver_id: d2.id, car_id: car2.id, line_status: 'ASSIGNED' });
+  await call('POST', `/schedule/lines/${ndo.service_items[0].id}/send-confirmation`, { token: admin, body: {} });
+  const pushesBefore = (await pushesTo(d2)).length;
+  const ndEdit = await call('PUT', `/orders/${ndo.id}`, { token: admin, body: editBody(await order(ndo.id), { notes: 'x', days: [{ id: ndo.service_items[0].id, service_date: wibIso(13, '00:00') }] }) });
+  await sleep(600);
+  const ndLine = await prisma.orderServiceItem.findUnique({ where: { id: ndo.service_items[0].id } });
+  check('C30 same WIB day sent as midnight is not a move (no push, confirmation kept)', ndEdit.status === 200 && !!ndLine.confirmation_sent_at && (await pushesTo(d2)).length === pushesBefore, ndEdit.json?.message);
+  check('C31 final_price alone cannot be set (400)', (await call('PUT', `/orders/${ndo.id}`, { token: admin, body: { final_price: 5_000_000, change_reason: 'x' } })).status === 400);
+  // A stored total that is out of date (charges an older edit left out) is
+  // corrected by the next edit without asking for a reason.
+  await call('POST', `/orders/${ndo.id}/adjustments`, { token: admin, body: { type: 'OVERTIME', description: 'OT 2 jam', amount: 60000 } });
+  await prisma.order.update({ where: { id: ndo.id }, data: { final_price: 1_000_000 } });
+  const st = await call('PUT', `/orders/${ndo.id}`, { token: admin, body: editBody(await order(ndo.id), { notes: 'y' }) });
+  check('C32 stale total corrected on the next edit (no reason needed), logged', st.status === 200 && Number((await order(ndo.id)).final_price) === 1060000 && (await prisma.orderChangeLog.count({ where: { order_id: ndo.id, actor: 'SYSTEM' } })) === 1, st.json?.message);
 });
 
 // ── D. Full driver flow ────────────────────────────────────────────────────
@@ -463,6 +490,20 @@ await section('G. Payments (T3)', async () => {
   const code7 = (await order(o7.id)).order_code;
   const lunas = (await pushesTo(d3)).filter((x) => x.title.includes(code7) && /sudah lunas/.test(x.title));
   check('G18 two payments completing the order at once: one "sudah lunas" push', lunas.length === 1, `pushes ${lunas.length}`);
+  // Revising keeps the customer's total_billed = sum of active invoices.
+  const o8 = await makeOrder('G19');
+  const i8 = await invoice(o8.id, 'DP', 200_000);
+  await call('POST', `/orders/${o8.id}/invoice/${i8.data.id}/revise`, { token: admin, body: { amount: 250_000 } });
+  check('G19 revision moves total_billed with the new amount (250.000)', Number((await prisma.customer.findUnique({ where: { id: o8.customer_id } })).total_billed) === 250000);
+  // Payment recorded without paid_to_date (sheet import) keeps its status.
+  const o9 = await makeOrder('G20');
+  await prisma.order.update({ where: { id: o9.id }, data: { payment_status: 'PAID' } });
+  await putLine(o9.service_items[0].id, { is_external: false, notes: 'catatan' });
+  check('G20 imported "paid" order without paid_to_date stays PAID after a day edit', (await order(o9.id)).payment_status === 'PAID');
+  // Money refunded no longer counts: a charge after a refund is owed again.
+  await call('POST', `/orders/${o2.id}/adjustments`, { token: admin, body: { type: 'OVERTIME', description: 'OT', amount: 100000 } }).catch(() => null);
+  const o2b = await order(o2.id);
+  check('G21 after a 100.000 refund, a 100.000 charge makes the order DP_PAID again', Number(o2b.final_price) === 1100000 && o2b.payment_status === 'DP_PAID', `${o2b.final_price} ${o2b.payment_status}`);
 });
 
 // ── H. Website leads ───────────────────────────────────────────────────────

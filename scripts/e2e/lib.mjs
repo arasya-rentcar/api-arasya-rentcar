@@ -84,11 +84,14 @@ export function jpeg() {
   return new Blob([Buffer.from('ffd8ffe000104a46494600010100000100010000ffd9', 'hex')], { type: 'image/jpeg' });
 }
 
+const wibYmd = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jakarta' });
 /** An instant on the WIB calendar day `daysFromToday` away, at HH:MM WIB. */
 export function wibIso(daysFromToday, hhmm = '09:00') {
-  const now = new Date(Date.now() + 7 * 3600e3);
-  const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + daysFromToday));
-  return new Date(`${d.toISOString().slice(0, 10)}T${hhmm}:00+07:00`).toISOString();
+  const [y, m, d] = wibYmd.format(new Date()).split('-').map(Number);
+  // Calendar arithmetic on the WIB date (UTC fields used only as a calendar).
+  const day = new Date(Date.UTC(y, m - 1, d + daysFromToday));
+  const ymd = [day.getUTCFullYear(), String(day.getUTCMonth() + 1).padStart(2, '0'), String(day.getUTCDate()).padStart(2, '0')].join('-');
+  return new Date(`${ymd}T${hhmm}:00+07:00`).toISOString();
 }
 
 export const uuid = () => crypto.randomUUID();

@@ -61,6 +61,16 @@ export const startPaymentSelect = {
  * rule for every place that changes either number (payments, the order total
  * after days or charges change, cancellation).
  */
+/** Money the customer has paid and Arasya kept (a refund settled is given back). */
+export function netPaid(order: {
+  paid_to_date: unknown;
+  is_refunded?: boolean | null;
+  refund_amount?: unknown;
+}): number {
+  const refunded = order.is_refunded ? Number(order.refund_amount ?? 0) : 0;
+  return Number(order.paid_to_date ?? 0) - refunded;
+}
+
 export function paymentStatusFor(
   paidToDate: unknown,
   orderTotal: unknown,
