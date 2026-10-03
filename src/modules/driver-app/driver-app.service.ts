@@ -9,6 +9,7 @@ import {
 } from "../schedule/order-derive.service";
 import { refreshOrderSummary } from "../bot/bot.service";
 import { pushToAdmins } from "../../services/push.service";
+import { notifyTripEvent, notifyTripReport } from "../../services/adminNotify";
 import { env } from "../../config/env";
 import {
   uploadFile,
@@ -202,18 +203,21 @@ function toReport(r: Prisma.TripReportGetPayload<object>) {
     latitude: r.latitude,
     longitude: r.longitude,
     location_accuracy_m: r.location_accuracy_m,
+    location_name: r.location_name,
   };
 }
 
 type LocationInput = Pick<
   ActionInput,
-  "latitude" | "longitude" | "location_accuracy_m" | "location_at" | "location_mocked"
+  "latitude" | "longitude" | "location_accuracy_m" | "location_at" | "location_mocked" | "location_name"
 >;
 
 /** GPS fix fields for a trip_reports row (all null when the phone sent none). */
 function locationData(loc: LocationInput = {}) {
-  if (loc.latitude == null || loc.longitude == null) return {};
+  const name = loc.location_name ? { location_name: loc.location_name } : {};
+  if (loc.latitude == null || loc.longitude == null) return name;
   return {
+    ...name,
     latitude: loc.latitude,
     longitude: loc.longitude,
     location_accuracy_m: loc.location_accuracy_m ?? null,
@@ -245,10 +249,11 @@ export function eventTime(occurredAt?: string): Date {
 export async function acceptTrip(driverId: string, lineId: string, occurredAt?: string) {
   const line = await ownLine(driverId, lineId);
   if (line.line_status === "CANCELLED") throw new AppError("Trip was cancelled", 409);
-  await applyOnce(line, driverId, {
+  const applied = await applyOnce(line, driverId, {
     guard: { driver_accepted_at: null, line_status: { not: "CANCELLED" } },
     data: { driver_accepted_at: eventTime(occurredAt) },
   });
+  if (applied) await notifyTripEvent("TRIP_ACCEPTED", lineId);
   return toTrip(await ownLine(driverId, lineId));
 }
 
@@ -270,6 +275,7 @@ export async function startTrip(driverId: string, lineId: string, opts: ActionOp
     report: { type: "START", notes: "Berangkat (aplikasi driver)", at: now, clientRef: opts.clientRef },
   });
   if (applied) {
+    await notifyTripEvent("TRIP_STARTED", lineId);
     await refreshOrderSummary(line.order_id);
     void pushToAdmins({
       title: `Driver berangkat · ${line.order.order_code ?? ""}`.trim(),
@@ -293,7 +299,7 @@ export async function arriveTrip(
   if (TERMINAL.includes(line.line_status))
     throw new AppError(`Trip is already ${line.line_status === "DONE" ? "finished" : "cancelled"}`, 409);
   const now = eventTime(opts.occurredAt);
-  await applyOnce(line, driverId, {
+  const applied = await applyOnce(line, driverId, {
     guard: { actual_pickup_at: null, line_status: { notIn: TERMINAL } },
     data: { actual_pickup_at: now, driver_accepted_at: line.driver_accepted_at ?? now },
     report: {
@@ -304,6 +310,7 @@ export async function arriveTrip(
       location: opts.location,
     },
   });
+  if (applied) await notifyTripEvent("TRIP_ARRIVED", lineId, opts.location?.location_name);
   return toTrip(await ownLine(driverId, lineId));
 }
 
@@ -319,7 +326,7 @@ export async function boardTrip(driverId: string, lineId: string, opts: ActionOp
     throw new AppError(`Trip is already ${line.line_status === "DONE" ? "finished" : "cancelled"}`, 409);
   await assertPaidToBoard(line, opts.clientRef);
   const now = eventTime(opts.occurredAt);
-  await applyOnce(line, driverId, {
+  const applied = await applyOnce(line, driverId, {
     guard: { customer_onboard_at: null, line_status: { notIn: TERMINAL } },
     data: {
       customer_onboard_at: now,
@@ -336,6 +343,7 @@ export async function boardTrip(driverId: string, lineId: string, opts: ActionOp
       clientRef: opts.clientRef,
     },
   });
+  if (applied) await notifyTripEvent("TRIP_BOARDED", lineId);
   return toTrip(await ownLine(driverId, lineId));
 }
 
@@ -371,6 +379,7 @@ export async function finishTrip(
     },
   });
   if (applied) {
+    await notifyTripEvent("TRIP_FINISHED", lineId);
     await refreshOrderSummary(line.order_id);
     void pushToAdmins({
       title: `Trip selesai · ${line.order.order_code ?? ""}`.trim(),
@@ -514,6 +523,7 @@ export async function addReport(
 
   const at = eventTime(input.occurred_at);
   let report;
+  let expense: { id: string; type: string; amount: number; bill_to_customer: boolean } | null = null;
   try {
     report = await prisma.$transaction(async (tx) => {
     const r = await tx.tripReport.create({
@@ -539,7 +549,7 @@ export async function addReport(
     if (costType && amount) {
       // Waits for the admin to check the receipt (PENDING). The driver paid it
       // (own money or uang jalan); X Parkir / X Ops costs go to the customer.
-      await tx.expense.create({
+      const e = await tx.expense.create({
         data: {
           order_service_item_id: lineId,
           type: costType,
@@ -552,6 +562,7 @@ export async function addReport(
           trip_report_id: r.id,
         },
       });
+      expense = { id: e.id, type: e.type, amount: Number(e.amount), bill_to_customer: e.bill_to_customer };
     }
     return r;
     });
@@ -562,6 +573,17 @@ export async function addReport(
     if (!stored) throw err;
     return toReport(stored);
   }
+  // Only the request that stored the report gets here (resends returned above).
+  await notifyTripReport(
+    lineId,
+    {
+      report_type: report.report_type,
+      notes: report.notes,
+      amount: report.amount == null ? null : Number(report.amount),
+      location_name: report.location_name,
+    },
+    expense,
+  );
   await refreshOrderSummary(line.order_id);
   return toReport(report);
 }
@@ -630,6 +652,7 @@ async function stampArrival(
       `SAMPAI DI LOKASI JEMPUT | ${line.order.order_code ?? ""}`,
       `Driver: ${driver?.name ?? "-"}`,
       `${at.toLocaleString("id-ID", WIB_STAMP)} WIB`,
+      ...(input.location_name ? [`Lokasi: ${input.location_name}`] : []),
       `GPS ${input.latitude!.toFixed(6)}, ${input.longitude!.toFixed(6)}${acc}`,
       `Jemput: ${line.pickup_location}`,
     ]);

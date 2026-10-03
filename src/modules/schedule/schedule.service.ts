@@ -1052,6 +1052,7 @@ export async function tripHistory(query: TripHistoryQuery) {
         location_accuracy_m: true,
         location_at: true,
         location_mocked: true,
+        location_name: true,
       },
       orderBy: { created_at: 'asc' as const },
     },

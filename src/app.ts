@@ -5,7 +5,7 @@ import pinoHttp from 'pino-http';
 
 import { env } from './config/env';
 import { logger } from './config/logger';
-import { globalLimiter, authLimiter, botLimiter } from './middleware/rateLimit.middleware';
+import { globalLimiter, authLimiter, botLimiter, notificationsLimiter } from './middleware/rateLimit.middleware';
 
 import authRoutes from './modules/auth/auth.route';
 import usersRoutes from './modules/users/users.route';
@@ -25,6 +25,8 @@ import analyticsRoutes from './modules/analytics/analytics.route';
 import leadsRoutes, { publicLeadsRouter } from './modules/leads/leads.route';
 import devicesRoutes from './modules/devices/devices.route';
 import driverAppRoutes from './modules/driver-app/driver-app.route';
+import driverRequestsRoutes from './modules/driver-requests/driver-requests.route';
+import adminNotificationsRoutes from './modules/admin-notifications/admin-notifications.route';
 
 import { errorMiddleware } from './middleware/error.middleware';
 
@@ -88,6 +90,10 @@ app.get('/health', (_req, res) => {
   res.json({ status: 'ok', service: 'arasya-rentcar-api' });
 });
 
+// Admin notification bell: polled by every dashboard tab, so it is registered
+// before the global limiter with a budget of its own.
+app.use('/api/v1/notifications', notificationsLimiter, adminNotificationsRoutes);
+
 // Global rate limit on the API surface (/health is registered above and excluded).
 app.use('/api/', globalLimiter);
 
@@ -107,6 +113,8 @@ app.use('/api/v1/analytics', analyticsRoutes);
 app.use('/api/v1/leads', leadsRoutes);
 app.use('/api/v1/devices', devicesRoutes);
 app.use('/api/v1/driver', driverAppRoutes);
+// Admin side of driver requests (e-toll top-up); the driver side is /driver/requests.
+app.use('/api/v1/driver-requests', driverRequestsRoutes);
 // Merge: expenses now hang off service-day lines (the line IS the trip).
 app.use('/api/v1/lines', expensesRoutes);
 app.use('/api/v1/bot', botLimiter, botRoutes);
