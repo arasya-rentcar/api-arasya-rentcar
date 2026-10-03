@@ -46,8 +46,8 @@ export const assignScheduleLineSchema = z
     driver_fee: z.number().nonnegative().max(100_000_000).nullable().optional(),
     driver_fee_note: z.string().max(200).nullable().optional(),
     travel_advance: z.number().nonnegative().max(100_000_000).nullable().optional(),
-    // Legacy: older dashboards send "Biaya Ops", which was the driver's pay.
-    // Treated as driver_fee when driver_fee is not given.
+    // Legacy: older dashboards send "Biaya Ops". Accepted and ignored; ops_cost
+    // is derived from the approved trip costs (recomputeLineMoney).
     ops_cost: z.number().nonnegative().optional(),
     notes: z.string().nullable().optional(),
   })

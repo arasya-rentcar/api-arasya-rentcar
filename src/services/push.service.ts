@@ -69,18 +69,25 @@ export async function pushToDriver(driverId: string, msg: PushMessage): Promise<
     const driver = await prisma.driver.findUnique({ where: { id: driverId }, select: { user_id: true } });
     if (!driver) return;
     const type = typeof msg.data?.type === "string" ? msg.data.type : "info";
-    const row = await prisma.driverNotification.create({
-      data: {
-        driver_id: driverId,
-        type,
-        title: msg.title,
-        body: msg.body,
-        data: (msg.data ?? {}) as Prisma.InputJsonValue,
-      },
-    });
+    // The inbox row is best-effort: the push still goes out if it fails.
+    let notificationId: string | null = null;
+    try {
+      const row = await prisma.driverNotification.create({
+        data: {
+          driver_id: driverId,
+          type,
+          title: msg.title,
+          body: msg.body,
+          data: (msg.data ?? {}) as Prisma.InputJsonValue,
+        },
+      });
+      notificationId = row.id;
+    } catch (err) {
+      logger.error({ err }, "driver inbox write failed");
+    }
     await pushToUsers([driver.user_id], {
       ...msg,
-      data: { ...(msg.data ?? {}), notification_id: row.id },
+      data: { ...(msg.data ?? {}), ...(notificationId ? { notification_id: notificationId } : {}) },
     });
   } catch (err) {
     logger.error({ err }, "push to driver failed");

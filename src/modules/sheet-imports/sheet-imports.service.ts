@@ -286,11 +286,16 @@ export async function importSheetRows(options: ImportOptions = {}) {
         const revenue = Number(f.total_user_amount ?? f.sell_price ?? 0);
         const ops = Number(f.total_ops_cost ?? 0);
         const rtr = f.rtr_amount != null ? Number(f.rtr_amount) : null;
+        // Per-day driver pay (2026-10-03): the sheet's TOTAL OPS COST on an
+        // internal day is the driver's pay, so it is stored as driver_fee
+        // (same as the migration backfill). ops_cost is derived from approved
+        // trip costs and would be recomputed to 0. A partner day keeps the old
+        // margin (revenue − RTR).
         const lineMargin = computeLineMargin({
           isExternal: dayExternal,
           revenue,
-          ops_cost: ops,
           rtr_amount: rtr,
+          driver_fee: dayExternal ? null : ops,
         });
         orderRevenue += revenue;
         orderOps += ops;
@@ -344,7 +349,8 @@ export async function importSheetRows(options: ImportOptions = {}) {
           driver_name_raw: f.driver_vendor_raw || null,
           plate_raw: f.plate_no_raw || null,
           rtr_amount: rtr,
-          ops_cost: ops,
+          ops_cost: 0,
+          driver_fee: dayExternal ? null : ops,
           margin_amount: lineMargin,
           margin_formula_version: MARGIN_FORMULA_VERSION,
         });

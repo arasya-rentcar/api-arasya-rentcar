@@ -238,19 +238,10 @@ export async function assignScheduleLine(
   }
 
   // ── Driver pay (2026-10-03) ───────────────────────────────────────────
-  // undefined = leave as is. Older dashboards send "Biaya Ops" on every save,
-  // prefilled with the line's ops_cost (now Arasya's share of the approved
-  // trip costs). Only a value the admin actually changed stands in for
-  // driver_fee (it used to be the driver's pay); sending the shown value back
-  // must not wipe the fee.
-  const legacyFee =
-    !isExternal &&
-    input.ops_cost !== undefined &&
-    input.ops_cost !== Number(line.ops_cost ?? 0)
-      ? input.ops_cost
-      : undefined;
-  let fee: number | null | undefined =
-    input.driver_fee !== undefined ? input.driver_fee : legacyFee;
+  // undefined = leave as is. "Biaya Ops" (ops_cost) from older dashboards is
+  // ignored: it is now derived from the approved trip costs, and treating the
+  // prefilled value as the fee wiped the driver's fee on every save.
+  let fee: number | null | undefined = input.driver_fee;
   let feeNote: string | null | undefined = input.driver_fee_note;
   let rtr: number | null | undefined = input.rtr_amount;
   const feeGiven = fee !== undefined;

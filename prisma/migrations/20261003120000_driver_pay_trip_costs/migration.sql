@@ -44,6 +44,9 @@ ALTER TABLE "expenses" ADD CONSTRAINT "expenses_adjustment_id_fkey" FOREIGN KEY 
 -- (it was the driver payable base). Move it to driver_fee; ops_cost now holds
 -- Arasya's share of approved trip costs (none approved yet). The day margin
 -- (revenue − old ops_cost) equals revenue − driver_fee, so it stays valid.
+-- One-time data move (reviewed 3 Oct): only days that had a driver and were
+-- not cancelled; a cancelled day keeps its old value as a trip cost.
 UPDATE "order_service_items"
 SET "driver_fee" = "ops_cost", "ops_cost" = 0
-WHERE "is_external" = false AND "driver_fee" IS NULL AND "ops_cost" > 0;
+WHERE "is_external" = false AND "driver_fee" IS NULL AND "ops_cost" > 0
+  AND "driver_id" IS NOT NULL AND "line_status" <> 'CANCELLED';

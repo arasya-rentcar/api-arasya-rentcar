@@ -13,6 +13,7 @@ import { upsertCustomerForOrder } from "../customers/customers.service";
 import { attachLeadToOrder } from "../leads/leads.service";
 import { notifyNewTrips, notifyTripsRemoved } from "../../services/tripNotify";
 import { defaultDriverFee } from "../../utils/driverFee";
+import { computeMargin, MARGIN_FORMULA_VERSION } from "../../utils/margin";
 import { recomputeLineMoney } from "../schedule/line-money.service";
 import { rollupOrderFinance } from "../schedule/schedule.service";
 import { nextOrderCode } from "../../utils/codes";
@@ -527,8 +528,15 @@ export async function upsertOrderFinance(
   id: string,
   input: UpsertOrderFinanceInput,
 ) {
-  const order = await prisma.order.findUnique({ where: { id } });
+  const order = await prisma.order.findUnique({
+    where: { id },
+    select: { id: true, _count: { select: { service_items: true } } },
+  });
   if (!order) throw new AppError("Order not found", 404);
+  if (order._count.service_items === 0) {
+    await upsertLegacyOrderFinance(id, input);
+    return getOrderById(id);
+  }
 
   // Driver pay (2026-10-03): fees, trip costs, RTR and margin are computed
   // from the days (Edit Hari + approved trip costs). Only the finance note is
@@ -546,6 +554,111 @@ export async function upsertOrderFinance(
   });
 
   return getOrderById(id);
+}
+
+const nn = (v?: number | null) => (v == null ? null : Number(v));
+
+/**
+ * Orders without day-lines (older or manual orders) keep the old order-level
+ * finance editing: there are no days for the rollup to compute from.
+ */
+async function upsertLegacyOrderFinance(
+  id: string,
+  input: UpsertOrderFinanceInput,
+) {
+  const order = await prisma.order.findUnique({
+    where: { id },
+    include: { final_finance: true },
+  });
+  if (!order) throw new AppError("Order not found", 404);
+
+  const existing = order.final_finance;
+  const num = (v: unknown) => (v == null ? null : Number(v));
+
+  // Merge incoming values over existing finance.
+  const totalUser =
+    input.total_user_amount !== undefined
+      ? nn(input.total_user_amount)
+      : (num(existing?.total_user_amount) ?? Number(order.final_price));
+  const sellPrice =
+    input.sell_price !== undefined
+      ? nn(input.sell_price)
+      : num(existing?.sell_price);
+  const rtr =
+    input.rtr_amount !== undefined
+      ? nn(input.rtr_amount)
+      : num(existing?.rtr_amount);
+
+  // Ops cost: explicit value wins; otherwise sum the cost components when given;
+  // otherwise keep existing.
+  let opsCost: number | null;
+  if (input.total_ops_cost !== undefined) {
+    opsCost = nn(input.total_ops_cost);
+  } else if (
+    input.fuel_amount !== undefined ||
+    input.toll_amount !== undefined ||
+    input.parking_cash_amount !== undefined
+  ) {
+    opsCost =
+      (nn(input.fuel_amount) ?? 0) +
+      (nn(input.toll_amount) ?? 0) +
+      (nn(input.parking_cash_amount) ?? 0);
+  } else {
+    opsCost = num(existing?.total_ops_cost);
+  }
+
+  const driverTotal =
+    input.total_driver_amount !== undefined
+      ? nn(input.total_driver_amount)
+      : num(existing?.total_driver_amount);
+
+  const margin = computeMargin({
+    isExternal: order.is_external,
+    total_user_amount: totalUser,
+    total_ops_cost: opsCost,
+    // The admin-entered driver fee (one per order) is total_driver_amount.
+    // Internal margin now subtracts it; external ignores it (RTR covers vendor).
+    driver_fee_amount: driverTotal,
+    sell_price: sellPrice,
+    rtr_amount: rtr,
+  });
+
+  const data = {
+    total_user_amount: totalUser,
+    sell_price: sellPrice,
+    rtr_amount: rtr,
+    total_ops_cost: opsCost,
+    fuel_amount:
+      input.fuel_amount !== undefined
+        ? nn(input.fuel_amount)
+        : num(existing?.fuel_amount),
+    toll_amount:
+      input.toll_amount !== undefined
+        ? nn(input.toll_amount)
+        : num(existing?.toll_amount),
+    parking_cash_amount:
+      input.parking_cash_amount !== undefined
+        ? nn(input.parking_cash_amount)
+        : num(existing?.parking_cash_amount),
+    driver_fee_amount:
+      input.driver_fee_amount !== undefined
+        ? nn(input.driver_fee_amount)
+        : num(existing?.driver_fee_amount),
+    total_driver_amount: driverTotal,
+    finance_note:
+      input.finance_note !== undefined
+        ? input.finance_note
+        : (existing?.finance_note ?? null),
+    margin_amount: margin,
+    margin_formula_version: MARGIN_FORMULA_VERSION,
+  };
+
+  await prisma.orderFinalFinance.upsert({
+    where: { order_id: id },
+    update: data,
+    create: { ...data, order_id: id },
+  });
+
 }
 
 /** The website lead an order came from, as shown on the order. */
@@ -795,19 +908,30 @@ export async function assignOrder(orderId: string, input: AssignOrderInput) {
     where: openUnassigned,
     select: { id: true, service_kind: true, driver_fee: true },
   });
+  let got = newLines;
   const updated = await prisma.$transaction(
     async (tx) => {
+      // Conditional: a day another admin assigned meanwhile is left alone.
       await tx.orderServiceItem.updateMany({
-        where: { id: { in: newLines.map((l) => l.id) } },
+        where: { ...openUnassigned, id: { in: newLines.map((l) => l.id) } },
         data: {
           driver_id: input.driver_id,
           car_id: input.car_id,
           line_status: "ASSIGNED",
         },
       });
+      const mine = new Set(
+        (
+          await tx.orderServiceItem.findMany({
+            where: { id: { in: newLines.map((l) => l.id) }, driver_id: input.driver_id },
+            select: { id: true },
+          })
+        ).map((l) => l.id),
+      );
+      got = newLines.filter((l) => mine.has(l.id));
       // Each day gets its fee from the fee table (if not set yet) and its
       // payable, exactly like a single-day assign.
-      for (const l of newLines) {
+      for (const l of got) {
         if (l.driver_fee == null) {
           const d = defaultDriverFee(l.service_kind);
           await tx.orderServiceItem.update({
@@ -826,7 +950,7 @@ export async function assignOrder(orderId: string, input: AssignOrderInput) {
     { maxWait: 15000, timeout: 30000 },
   );
 
-  void notifyNewTrips(input.driver_id, newLines.map((l) => l.id));
+  void notifyNewTrips(input.driver_id, got.map((l) => l.id));
   return updated;
 }
 
@@ -1360,6 +1484,15 @@ export async function cancelOrder(
       if (l.driver_id) driverIds.add(l.driver_id);
       if (l.car_id) carIds.add(l.car_id);
     }
+    // A day already paid out (driver fee / partner RTR) keeps who drove and
+    // its amounts, like a started day: the payment stays on record.
+    const paidOut = await tx.payable.findMany({
+      where: { service_item_id: { in: cancellableIds }, status: "PAID" },
+      select: { service_item_id: true },
+    });
+    for (const p of paidOut) {
+      if (!startedIds.includes(p.service_item_id)) startedIds.push(p.service_item_id);
+    }
     const notStartedIds = cancellableIds.filter((id) => !startedIds.includes(id));
     if (notStartedIds.length > 0) {
       // Not started: release driver/car; nobody earned anything that day.
@@ -1379,7 +1512,8 @@ export async function cancelOrder(
       });
     }
     if (startedIds.length > 0) {
-      // Already on the road: keep who drove so their pay stays with them.
+      // Already on the road (or already paid): keep who drove so their pay
+      // stays with them.
       await tx.orderServiceItem.updateMany({
         where: { id: { in: startedIds } },
         data: { line_status: "CANCELLED" },

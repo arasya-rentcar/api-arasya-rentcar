@@ -348,8 +348,9 @@ export async function finishTrip(
   const line = await ownLine(driverId, lineId);
   if (line.line_status === "CANCELLED") throw new AppError("Trip was cancelled", 409);
   // Finishing a trip the customer never "boarded" in the app (older app
-  // versions have no such step) needs the same full payment.
-  await assertPaidToBoard(line, opts.clientRef);
+  // versions have no such step) needs the same full payment. A finish on a
+  // day already closed stays a no-op.
+  if (line.line_status !== "DONE") await assertPaidToBoard(line, opts.clientRef);
   const now = eventTime(opts.occurredAt);
   const applied = await applyOnce(line, driverId, {
     guard: { line_status: { in: ["SCHEDULED", "ASSIGNED", "IN_PROGRESS"] } },

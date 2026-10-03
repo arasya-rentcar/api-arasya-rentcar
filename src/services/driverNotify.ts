@@ -56,7 +56,9 @@ export async function notifyPayablesPaid(payableIds: string[]): Promise<void> {
           ? total < 0
             ? `Sisa uang jalan ${rupiah(total)} untuk trip ${day(first.service_date)} · ${first.order.order_code ?? ""} sudah diperhitungkan.`
             : `${rupiah(total)}${how} untuk trip ${day(first.service_date)} · ${first.order.order_code ?? ""}.`
-          : `Total ${rupiah(total)} untuk ${list.length} trip, ${day(first.service_date)} s.d. ${day(list[list.length - 1].service_date)}.`;
+          : total < 0
+            ? `Sisa uang jalan ${rupiah(total)} untuk ${list.length} trip, ${day(first.service_date)} s.d. ${day(list[list.length - 1].service_date)}, sudah diperhitungkan.`
+            : `Total ${rupiah(total)} untuk ${list.length} trip, ${day(first.service_date)} s.d. ${day(list[list.length - 1].service_date)}.`;
       await pushToDriver(driverId, {
         title: list.length === 1 ? "Fee sudah dibayar" : `${list.length} fee sudah dibayar`,
         body: body.replace(/ · \./, "."),

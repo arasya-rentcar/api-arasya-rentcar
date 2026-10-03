@@ -1,6 +1,6 @@
 import prisma from '../../prisma/client';
 import { AppError } from '../../utils/AppError';
-import type { Prisma, PaymentMethod } from '@prisma/client';
+import { Prisma, type PaymentMethod } from '@prisma/client';
 import {
   ListPayablesQuery,
   UpdatePayableInput,
@@ -374,22 +374,14 @@ export async function markPayableUnpaid(id: string) {
 export async function bulkMarkPaid(ids: string[], paidAt?: string) {
   if (!ids.length) throw new AppError('No payable ids provided', 400);
   const when = paidAt ? new Date(paidAt) : new Date();
-  // Row by row and conditional, so only the payables this call actually
-  // flipped are announced to their drivers.
-  const due = await prisma.payable.findMany({
-    where: { id: { in: ids }, status: 'UNPAID' },
-    select: { id: true },
-  });
-  const paid: string[] = [];
-  await prisma.$transaction(async (tx) => {
-    for (const p of due) {
-      const { count } = await tx.payable.updateMany({
-        where: { id: p.id, status: 'UNPAID' },
-        data: { status: 'PAID', paid_at: when },
-      });
-      if (count === 1) paid.push(p.id);
-    }
-  }, { maxWait: 15000, timeout: 30000 });
+  // One conditional UPDATE … RETURNING: only the payables this call actually
+  // flipped are announced to their drivers (a repeated click notifies none).
+  const rows = await prisma.$queryRaw<{ id: string }[]>`
+    UPDATE "payables"
+    SET "status" = 'PAID'::"PayableStatus", "paid_at" = ${when}, "updated_at" = NOW()
+    WHERE "id" IN (${Prisma.join(ids)}) AND "status" = 'UNPAID'::"PayableStatus"
+    RETURNING "id"`;
+  const paid = rows.map((r) => r.id);
   void notifyPayablesPaid(paid);
   return { updated: paid.length };
 }
