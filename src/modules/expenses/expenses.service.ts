@@ -1,3 +1,4 @@
+import { Prisma } from '@prisma/client';
 import prisma from '../../prisma/client';
 import { AppError } from '../../utils/AppError';
 import { billedToCustomerByPackage } from '../../utils/driverFee';
@@ -52,9 +53,17 @@ export async function createExpense(
   }
 
   // Admin: allowed on any day (late receipts after the trip, a started trip
-  // that was cancelled, …).
+  // that was cancelled, …). A resent request (same client_ref) is a no-op.
+  if (input.client_ref) {
+    const seen = await prisma.expense.findUnique({ where: { client_ref: input.client_ref } });
+    if (seen) {
+      if (seen.order_service_item_id !== lineId) throw new AppError('client_ref already used', 409);
+      return seen;
+    }
+  }
   const reviewer = await reviewerName(userId);
-  return prisma.$transaction(
+  try {
+  return await prisma.$transaction(
     async (tx) => {
       const e = await tx.expense.create({
         data: {
@@ -70,6 +79,7 @@ export async function createExpense(
           created_by: reviewer,
           reviewed_at: new Date(),
           reviewed_by: reviewer,
+          client_ref: input.client_ref ?? null,
         },
       });
       await recomputeLineMoney(tx, lineId);
@@ -78,6 +88,14 @@ export async function createExpense(
     },
     { maxWait: 15000, timeout: 30000 },
   );
+  } catch (err) {
+    // Two copies of the same request at once: the other one was stored.
+    if (input.client_ref && err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
+      const stored = await prisma.expense.findUnique({ where: { client_ref: input.client_ref } });
+      if (stored) return stored;
+    }
+    throw err;
+  }
 }
 
 export async function listExpensesByTrip(lineId: string) {

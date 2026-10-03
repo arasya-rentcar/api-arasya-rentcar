@@ -2,6 +2,9 @@
 ALTER TABLE "order_service_items" ADD COLUMN     "customer_onboard_at" TIMESTAMP(3);
 
 -- AlterTable
+ALTER TABLE "expenses" ADD COLUMN     "client_ref" TEXT;
+
+-- AlterTable
 ALTER TABLE "trip_reports" ADD COLUMN     "latitude" DOUBLE PRECISION,
 ADD COLUMN     "location_accuracy_m" INTEGER,
 ADD COLUMN     "location_at" TIMESTAMP(3),
@@ -24,6 +27,9 @@ CREATE TABLE "driver_notifications" (
 
 -- CreateIndex
 CREATE INDEX "driver_notifications_driver_id_created_at_idx" ON "driver_notifications"("driver_id", "created_at");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "expenses_client_ref_key" ON "expenses"("client_ref");
 
 -- AddForeignKey
 ALTER TABLE "driver_notifications" ADD CONSTRAINT "driver_notifications_driver_id_fkey" FOREIGN KEY ("driver_id") REFERENCES "drivers"("id") ON DELETE CASCADE ON UPDATE CASCADE;

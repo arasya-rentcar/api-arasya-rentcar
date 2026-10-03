@@ -11,6 +11,8 @@ export const createExpenseSchema = z.object({
   // Admin entries (2026-10-03): who paid and whether the customer pays it.
   paid_by: z.enum(['DRIVER', 'COMPANY']).optional(),
   bill_to_customer: z.boolean().optional(),
+  // Idempotency key (admin form): a resend after a lost answer is a no-op.
+  client_ref: z.string().uuid().optional(),
 });
 
 export type CreateExpenseInput = z.infer<typeof createExpenseSchema>;

@@ -716,6 +716,8 @@ model Expense {
   adjustment       OrderAdjustment? @relation(fields: [adjustment_id], references: [id], onDelete: SetNull)
   // null = reported from the driver app; otherwise the admin who added it.
   created_by       String?
+  // Idempotency key from the dashboard's "Tambah biaya" (resend = no-op).
+  client_ref       String?          @unique
   reviewed_at      DateTime?
   reviewed_by      String?
   review_note      String?
