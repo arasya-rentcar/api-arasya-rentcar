@@ -192,8 +192,8 @@ await section('C. Edit Order on a running order (T1)', async () => {
   const reports = await prisma.tripReport.count({ where: { order_service_item_id: lineId } });
   check('C12 reports still attached to the day', reports >= 2, `reports=${reports}`);
 
-  const drop = await call('PUT', `/orders/${o.id}`, { token: admin, body: editBody(after, { days: [] }) });
-  check('C13 removing a running day refused (409), nothing changed', drop.status === 409 && (await order(o.id)).service_items.length === 1, drop.json?.message);
+  const drop = await call('PUT', `/orders/${o.id}`, { token: admin, body: editBody(after, { days: [{ service_date: nl.service_date, start_at: nl.start_at, end_at: nl.end_at }] }) });
+  check('C13 replacing a running day with a new one refused (409), nothing changed', drop.status === 409 && (await order(o.id)).service_items[0].id === lineId, drop.json?.message);
   const legacy = await call('PUT', `/orders/${o.id}`, {
     token: admin,
     body: { ...editBody(after), service_items: editBody(after).service_items.map(({ id, ...rest }) => rest) },
@@ -216,6 +216,39 @@ await section('C. Edit Order on a running order (T1)', async () => {
   const o4 = await order(o.id);
   check('C19 removing the untouched new day works; total back to 1.000.000', removeNew.status === 200 && o4.service_items.length === 1 && Number(o4.final_price) === 1000000, removeNew.json?.message);
   check('C20 driver not stuck: ON_DUTY because of the running day', (await prisma.driver.findUnique({ where: { id: d1.id } })).status === 'ON_DUTY');
+  check('C21 an order must keep at least one day (400)', (await call('PUT', `/orders/${o.id}`, { token: admin, body: { ...editBody(o4), service_items: [] } })).status === 400);
+
+  // Mixed order: one day handed to a partner; a day added later starts internal.
+  const m = await makeOrder('C22', { days: 2, startDay: 5 });
+  const vendor = await call('POST', '/external-vendors', { token: admin, body: { name: `Vendor C ${tag}`, phone: '081211111111' } });
+  await putLine(m.service_items[1].id, { is_external: true, external_vendor_id: vendor.data.id, driver_name_raw: 'Pak Ujang', plate_raw: 'F 1 AA', rtr_amount: 500000 });
+  const mo = await order(m.id);
+  const addM = await call('PUT', `/orders/${m.id}`, {
+    token: admin,
+    body: editBody(mo, { reason: 'tambah hari', days: [...mo.service_items.map((l) => ({ id: l.id })), { service_date: wibIso(7, '00:00'), start_at: wibIso(7, '08:00'), end_at: wibIso(7, '20:00'), unit_price: 1_000_000 }] }),
+  });
+  const mAfter = await order(m.id);
+  const addedDay = mAfter.service_items.find((l) => !mo.service_items.some((x) => x.id === l.id));
+  check('C22 day added to a mixed order is internal (no vendor)', addM.status === 200 && addedDay && !addedDay.is_external && !addedDay.external_vendor_id, addM.json?.message);
+  // A day with only a car reserved is in use: not deleted by leaving it out.
+  await putLine(addedDay.id, { is_external: false, car_id: car5.id });
+  const dropCar = await call('PUT', `/orders/${m.id}`, { token: admin, body: editBody(mAfter, { reason: 'hapus hari', days: mo.service_items.map((l) => ({ id: l.id })) }) });
+  check('C23 a day with a car reserved cannot be removed (409)', dropCar.status === 409 && (await order(m.id)).service_items.length === 3);
+  const dropPartner = await call('PUT', `/orders/${m.id}`, { token: admin, body: editBody(mAfter, { reason: 'hapus hari', days: [{ id: mo.service_items[0].id }, { id: addedDay.id }] }) });
+  check('C24 a partner day with driver/plate cannot be removed (409)', dropPartner.status === 409);
+
+  // Edit Order and a driver action on the same order at the same moment.
+  const race = await makeOrder('C25', { startDay: 0 });
+  await payFull(race);
+  await putLine(race.service_items[0].id, { is_external: false, driver_id: d3.id, car_id: car4.id, line_status: 'ASSIGNED' });
+  const ro = await order(race.id);
+  const [er, sr] = await Promise.all([
+    call('PUT', `/orders/${race.id}`, { token: admin, body: editBody(ro, { notes: 'balapan', days: [{ id: ro.service_items[0].id, pickup_location: 'Gerbang Tol Bogor' }] }) }),
+    act(d3, ro.service_items[0].id, 'start'),
+  ]);
+  const raceLine = (await order(race.id)).service_items[0];
+  check('C25 Edit Order + "Berangkat" at once: both succeed, day kept and started', er.status === 200 && sr.status === 200 && raceLine.line_status === 'IN_PROGRESS' && raceLine.pickup_location === 'Gerbang Tol Bogor', `${er.status}/${sr.status}`);
+  await act(d3, ro.service_items[0].id, 'finish');
 });
 
 // ── D. Full driver flow ────────────────────────────────────────────────────
@@ -354,6 +387,27 @@ await section('G. Payments (T3)', async () => {
   check('G11 two invoices paid at once: paid_to_date 1.000.000, PAID', Number(ord3.paid_to_date) === 1000000 && ord3.payment_status === 'PAID', `${ord3.paid_to_date} ${ord3.payment_status}`);
   const nums = (await prisma.receipt.findMany({ where: { invoice: { order_id: o3.id } }, select: { customer_seq: true } })).map((r) => r.customer_seq).sort();
   check('G12 kwitansi numbers have no gap', nums.length === 2 && nums[1] - nums[0] === 1, nums.join(','));
+  const inv3 = await prisma.invoice.findUnique({ where: { id: i1.data.id }, include: { receipts: true } });
+  check('G13 kwitansi PDF attached after payment (invoice + receipt)', !!inv3.receipt_url && inv3.receipts.every((r) => !!r.file_url));
+  // Pay and revise the same invoice at the same moment: exactly one wins.
+  const o4 = await makeOrder('G14');
+  const i4 = await invoice(o4.id, 'DP', 200_000);
+  const [pay4, rev4] = await Promise.all([
+    markPaid(o4.id, i4.data.id),
+    call('POST', `/orders/${o4.id}/invoice/${i4.data.id}/revise`, { token: admin, body: { amount: 300_000 } }),
+  ]);
+  const st4 = (await prisma.invoice.findUnique({ where: { id: i4.data.id } })).status;
+  const rc4 = await prisma.receipt.count({ where: { invoice_id: i4.data.id } });
+  const ok4 = (st4 === 'PAID' && rc4 === 1 && rev4.status === 409) || (st4 === 'REVISED' && rc4 === 0 && pay4.status === 409);
+  check('G14 pay + revise at once: one wins, no payment on a revised invoice', ok4, `invoice ${st4}, receipts ${rc4}, pay ${pay4.status}, revise ${rev4.status}`);
+  // Money on an invoice voided by a cancellation still counts.
+  const o5 = await makeOrder('G15', { startDay: 4 });
+  await payDp(o5, 200_000);
+  const c5 = await call('POST', `/orders/${o5.id}/cancel`, { token: admin, body: { reason: 'batal' } });
+  const fee = (await order(o5.id)).invoices.find((i) => i.invoice_type === 'CANCELLATION_FEE');
+  await markPaid(o5.id, fee.id, { amount_received: 50_000 });
+  const ord5 = await order(o5.id);
+  check('G15 paid_to_date keeps the DP of a cancelled order (200.000 + 50.000)', c5.status === 200 && Number(ord5.paid_to_date) === 250000, String(ord5.paid_to_date));
 });
 
 // ── H. Website leads ───────────────────────────────────────────────────────
@@ -400,6 +454,13 @@ await section('I. Partner (rekanan) days', async () => {
   const edit = await call('PUT', `/orders/${o.id}`, { token: admin, body: editBody(cur, { notes: 'catatan' }) });
   const after = (await order(o.id)).service_items[0];
   check('I5 Edit Order keeps the partner day (vendor, driver, plate)', edit.status === 200 && after.is_external && after.external_vendor_id === v.data.id && after.plate_raw === 'B 1234 XY');
+  // An order made for a partner: editing it creates no empty vendor payables,
+  // and an untouched partner day can still be removed.
+  const po = await makeOrder('I6', { days: 2, extra: { is_external: true, external_vendor_id: v.data.id } });
+  const pe = await call('PUT', `/orders/${po.id}`, { token: admin, body: editBody(po, { notes: 'catatan' }) });
+  check('I6 Edit Order on a partner order creates no 0-rupiah vendor payables', pe.status === 200 && (await prisma.payable.count({ where: { order_id: po.id } })) === 0);
+  const pr = await call('PUT', `/orders/${po.id}`, { token: admin, body: editBody(po, { reason: 'kurangi hari', days: [{ id: po.service_items[0].id }] }) });
+  check('I7 an untouched partner day can be removed', pr.status === 200 && (await order(po.id)).service_items.length === 1, pr.json?.message);
 });
 
 // ── J. Phone clock, stale trips, packages, same-day cancel ─────────────────

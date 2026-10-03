@@ -1,5 +1,5 @@
 import prisma from "../../prisma/client";
-import type { ScheduleStatus } from "@prisma/client";
+import type { Prisma, ScheduleStatus } from "@prisma/client";
 import { AppError } from "../../utils/AppError";
 import { assertOrderPaidForDriverAssignment, startPayment } from "./assignment-guard";
 import {
@@ -17,6 +17,7 @@ import { computeMargin, MARGIN_FORMULA_VERSION } from "../../utils/margin";
 import { recomputeLineMoney } from "../schedule/line-money.service";
 import { rollupOrderFinance } from "../schedule/schedule.service";
 import { nextOrderCode } from "../../utils/codes";
+import { wibShortDay } from "../../utils/wib";
 import { buildCancellationFeePdf } from "../invoices/invoices.service";
 import {
   deriveAndSetOrderStatus,
@@ -767,70 +768,103 @@ function assertOrderStructurallyEditable(order: {
   }
 }
 
-// A day that already has someone or something on it: a driver, a trip
-// started, reports or costs from the road, or money owed/paid for it. Such a
-// day is cancelled from "Edit Hari", never deleted by editing the order.
+// What a day in the order form carries (everything else on a day belongs to
+// Edit Hari: who serves it, its status, its money).
+const DAY_CONTENT_FIELDS = [
+  "service_date",
+  "start_at",
+  "end_at",
+  "description",
+  "service_kind",
+  "service_package",
+  "pickup_location",
+  "dropoff_location",
+  "driver_origin_location",
+  "quantity",
+  "unit_price",
+  "total_price",
+  "notes",
+  "sort_order",
+] as const;
+
 const DAY_IN_USE_STATUSES: ScheduleStatus[] = ["ASSIGNED", "IN_PROGRESS", "DONE"];
 
-function dayInUse(l: {
-  line_status: ScheduleStatus;
-  driver_id: string | null;
-  actual_start_at: Date | null;
-  trip_started_at: Date | null;
-  payable: { id: string } | null;
-  _count: { reports: number; expenses: number };
-}): boolean {
+const dayForEditSelect = {
+  id: true,
+  line_status: true,
+  service_date: true,
+  start_at: true,
+  end_at: true,
+  description: true,
+  service_kind: true,
+  service_package: true,
+  pickup_location: true,
+  dropoff_location: true,
+  driver_origin_location: true,
+  quantity: true,
+  unit_price: true,
+  total_price: true,
+  notes: true,
+  sort_order: true,
+  driver_id: true,
+  car_id: true,
+  actual_start_at: true,
+  trip_started_at: true,
+  travel_advance: true,
+  driver_name_raw: true,
+  driver_phone_raw: true,
+  plate_raw: true,
+  confirmation_sent_at: true,
+  payable: { select: { id: true } },
+  _count: { select: { reports: true, expenses: true } },
+} as const;
+
+type DayForEdit = Prisma.OrderServiceItemGetPayload<{ select: typeof dayForEditSelect }>;
+
+/**
+ * A day that already has someone or something on it: a driver or car, a trip
+ * started, reports or costs from the road, uang jalan, money owed or paid, a
+ * partner's driver/plate, or a confirmation sent to the customer. Such a day
+ * is cancelled from "Edit Hari", never deleted by editing the order.
+ */
+function dayInUse(l: DayForEdit): boolean {
   return (
     !!l.driver_id ||
+    !!l.car_id ||
     !!l.payable ||
     !!l.actual_start_at ||
     !!l.trip_started_at ||
+    Number(l.travel_advance ?? 0) !== 0 ||
+    !!l.driver_name_raw ||
+    !!l.driver_phone_raw ||
+    !!l.plate_raw ||
+    !!l.confirmation_sent_at ||
     l._count.reports > 0 ||
     l._count.expenses > 0 ||
     DAY_IN_USE_STATUSES.includes(l.line_status)
   );
 }
 
-function wibDayLabel(d: Date | null): string {
-  if (!d) return "tanpa tanggal";
-  return d.toLocaleDateString("id-ID", {
-    timeZone: "Asia/Jakarta",
-    day: "numeric",
-    month: "short",
-  });
+function sameValue(a: unknown, b: unknown): boolean {
+  if (a == null || b == null) return a == null && b == null;
+  if (a instanceof Date || b instanceof Date)
+    return new Date(a as Date).getTime() === new Date(b as Date).getTime();
+  if (typeof a === "object" || typeof b === "object") return Number(a) === Number(b); // Decimal
+  return a === b;
 }
-
-const round2 = (n: number) => Math.round(n * 100) / 100;
 
 /**
  * Edit an order. The service days are merged by id, never replaced: a day the
  * form sends back with its id keeps its driver, car, status, reports, costs
- * and payable, and only its content (date, times, places, package, price,
- * notes) changes. A day without an id is new. A day left out is deleted only
- * when nothing is on it yet (dayInUse); otherwise the edit is refused, so an
- * older dashboard that sends no ids cannot wipe an assigned or running order.
+ * and payable, and only the content fields that changed are written. A day
+ * without an id is new. A day left out is deleted only when nothing is on it
+ * yet (dayInUse); otherwise the edit is refused, so an older dashboard that
+ * sends no ids cannot wipe an assigned or running order.
  */
 export async function updateOrder(id: string, input: UpdateOrderInput) {
   const order = await prisma.order.findUnique({
     where: { id },
-    include: {
-      service_items: {
-        select: {
-          id: true,
-          line_status: true,
-          service_date: true,
-          driver_id: true,
-          actual_start_at: true,
-          trip_started_at: true,
-          payable: { select: { id: true } },
-          _count: { select: { reports: true, expenses: true } },
-        },
-      },
-      adjustments: {
-        where: { is_billable: true },
-        select: { amount: true, quantity: true },
-      },
-    },
+    include: { service_items: { select: dayForEditSelect } },
   });
   if (!order) throw new AppError("Order not found", 404);
 
@@ -849,10 +883,12 @@ export async function updateOrder(id: string, input: UpdateOrderInput) {
 
   // ── Service days: which to update, create and delete ─────────────────────
   type DayData = NonNullable<ReturnType<typeof normalizeServiceItems>>[number];
-  type DayUpdate = { id: string; data: Partial<DayData>; cancelled: boolean };
+  type DayUpdate = { line: DayForEdit; data: Partial<DayData> };
   let days: { updates: DayUpdate[]; creates: DayData[]; deletes: string[] } | null =
     null;
   if (service_items) {
+    if (service_items.length === 0)
+      throw new AppError("Order harus punya minimal satu hari layanan.", 400);
     const normalized = normalizeServiceItems({ ...input, service_items }) ?? [];
     const existing = new Map(order.service_items.map((l) => [l.id, l]));
     const kept = new Set<string>();
@@ -876,68 +912,25 @@ export async function updateOrder(id: string, input: UpdateOrderInput) {
           400,
         );
       kept.add(lineId);
-      // The order form has no field for the driver's origin: keep it.
-      const { driver_origin_location, ...content } = data;
-      updates.push({
-        id: lineId,
-        data: service_items[i].driver_origin_location !== undefined
-          ? { ...content, driver_origin_location }
-          : content,
-        cancelled: line.line_status === "CANCELLED",
-      });
+      // Only what changed is written. The order form has no field for the
+      // driver's origin, so it is kept unless sent.
+      const changed: Partial<DayData> = {};
+      for (const f of DAY_CONTENT_FIELDS) {
+        if (f === "driver_origin_location" && service_items[i].driver_origin_location === undefined)
+          continue;
+        if (!sameValue(data[f], line[f])) (changed as Record<string, unknown>)[f] = data[f];
+      }
+      if (Object.keys(changed).length > 0) updates.push({ line, data: changed });
     });
     const removed = order.service_items.filter((l) => !kept.has(l.id));
     const busy = removed.filter(dayInUse);
     if (busy.length > 0) {
       throw new AppError(
-        `Hari ${busy.map((l) => wibDayLabel(l.service_date)).join(", ")} tidak bisa dihapus dari order karena sudah ada driver, perjalanan, laporan, biaya, atau tagihan. Batalkan hari itu lewat Edit Hari di menu Trip.`,
+        `Hari ${busy.map((l) => wibShortDay(l.service_date) || "tanpa tanggal").join(", ")} tidak bisa dihapus dari order karena sudah ada driver, mobil, perjalanan, laporan, biaya, uang jalan, tagihan, atau konfirmasi. Batalkan hari itu lewat Edit Hari di menu Trip.`,
         409,
       );
     }
     days = { updates, creates, deletes: removed.map((l) => l.id) };
-  }
-
-  // The order total as rollupOrderFinance will compute it after the edit:
-  // days that are not cancelled + billable charges.
-  let newFinalPrice: number | undefined = updateData.final_price;
-  if (days) {
-    const rental =
-      days.updates
-        .filter((u) => !u.cancelled)
-        .reduce((s, u) => s + Number(u.data.total_price ?? 0), 0) +
-      days.creates.reduce((s, d) => s + Number(d.total_price ?? 0), 0);
-    const charges = order.adjustments.reduce(
-      (s, a) => s + Number(a.amount ?? 0) * (a.quantity ?? 1),
-      0,
-    );
-    newFinalPrice = round2(rental + charges);
-  }
-  const priceChanged =
-    newFinalPrice !== undefined &&
-    round2(Number(newFinalPrice)) !== round2(Number(order.final_price));
-
-  if (priceChanged && !change_reason?.trim()) {
-    throw new AppError(
-      "change_reason is required when changing final_price",
-      400,
-    );
-  }
-
-  if (priceChanged) {
-    const activeInvoiceTotal = await prisma.invoice.aggregate({
-      where: {
-        order_id: id,
-        status: { notIn: ["REVISED", "CANCELLED"] },
-      },
-      _sum: { amount: true },
-    });
-    const invoicedTotal = Number(activeInvoiceTotal._sum.amount ?? 0);
-    if (Number(newFinalPrice) < invoicedTotal) {
-      throw new AppError(
-        `final_price cannot be lower than active invoice total (${invoicedTotal}). Revise/cancel invoices first.`,
-        409,
-      );
-    }
   }
 
   // With service days the total always follows them (rollupOrderFinance).
@@ -945,6 +938,50 @@ export async function updateOrder(id: string, input: UpdateOrderInput) {
 
   return prisma.$transaction(
     async (tx) => {
+      // Days first, then the order row: the same lock order as the driver
+      // app and Edit Hari (day → order), so they cannot deadlock.
+      if (days) {
+        if (days.deletes.length > 0) {
+          // Re-checked inside the transaction: a day assigned (or reported
+          // on) after the check above is kept.
+          const { count } = await tx.orderServiceItem.deleteMany({
+            where: {
+              id: { in: days.deletes },
+              order_id: id,
+              line_status: { in: ["SCHEDULED", "CANCELLED"] },
+              driver_id: null,
+              car_id: null,
+              actual_start_at: null,
+              trip_started_at: null,
+              driver_name_raw: null,
+              driver_phone_raw: null,
+              plate_raw: null,
+              confirmation_sent_at: null,
+              OR: [{ travel_advance: null }, { travel_advance: 0 }],
+              payable: { is: null },
+              reports: { none: {} },
+              expenses: { none: {} },
+            },
+          });
+          if (count !== days.deletes.length) {
+            throw new AppError(
+              "Hari yang mau dihapus baru saja ditugaskan atau punya laporan. Muat ulang halaman lalu coba lagi.",
+              409,
+            );
+          }
+        }
+        for (const u of days.updates) {
+          await tx.orderServiceItem.update({ where: { id: u.line.id }, data: u.data });
+          // Revenue or date changed on a day whose money is already tracked
+          // (driver or payable): margin and payable follow. Untracked days
+          // stay as createOrder leaves them until they are assigned.
+          const moneyChanged = "total_price" in u.data || "service_date" in u.data;
+          if (moneyChanged && (u.line.driver_id || u.line.payable)) {
+            await recomputeLineMoney(tx, u.line.id);
+          }
+        }
+      }
+
       const updated = await tx.order.update({
         where: { id },
         data: {
@@ -973,73 +1010,64 @@ export async function updateOrder(id: string, input: UpdateOrderInput) {
       });
 
       if (days) {
-        if (days.deletes.length > 0) {
-          // Re-checked inside the transaction: a driver assigned (or a report
-          // sent) after the check above keeps the day.
-          const { count } = await tx.orderServiceItem.deleteMany({
-            where: {
-              id: { in: days.deletes },
-              order_id: id,
-              driver_id: null,
-              actual_start_at: null,
-              trip_started_at: null,
-              line_status: { in: ["SCHEDULED", "CANCELLED"] },
-              payable: { is: null },
-              reports: { none: {} },
-              expenses: { none: {} },
-            },
-          });
-          if (count !== days.deletes.length) {
-            throw new AppError(
-              "Hari yang mau dihapus baru saja ditugaskan atau punya laporan. Muat ulang halaman lalu coba lagi.",
-              409,
-            );
-          }
-        }
-        for (const u of days.updates) {
-          await tx.orderServiceItem.update({ where: { id: u.id }, data: u.data });
-        }
-        const created: string[] = [];
+        // A new day is a partner day only on an order made for a partner
+        // (it has a vendor); a mixed order's new days start internal.
+        const partner = !!updated.external_vendor_id;
         for (const d of days.creates) {
-          const line = await tx.orderServiceItem.create({
+          await tx.orderServiceItem.create({
             data: {
               ...d,
               order_id: id,
               line_status: "SCHEDULED",
-              is_external: updated.is_external,
-              external_vendor_id: updated.is_external
-                ? updated.external_vendor_id
-                : null,
-              external_car_id: updated.is_external
-                ? updated.external_car_id
-                : null,
+              is_external: partner,
+              external_vendor_id: partner ? updated.external_vendor_id : null,
+              external_car_id: partner ? updated.external_car_id : null,
               ops_cost: 0,
             },
           });
-          created.push(line.id);
         }
-        // Prices may have changed: margins, payables, order totals, status.
-        for (const lineId of [...days.updates.map((u) => u.id), ...created]) {
-          await recomputeLineMoney(tx, lineId);
+        if (days.updates.length || days.creates.length || days.deletes.length) {
+          await rollupOrderFinance(tx, id);
+          await deriveAndSetOrderStatus(tx, id);
         }
-        await rollupOrderFinance(tx, id);
-        await deriveAndSetOrderStatus(tx, id);
       }
 
+      // The total as stored now (days + billable charges, by the rollup).
+      const after = await tx.order.findUniqueOrThrow({ where: { id } });
+      const priceChanged =
+        Math.round(Number(after.final_price) * 100) !==
+        Math.round(Number(order.final_price) * 100);
       if (priceChanged) {
+        if (!change_reason?.trim()) {
+          throw new AppError(
+            "change_reason is required when changing final_price",
+            400,
+          );
+        }
+        const active = await tx.invoice.aggregate({
+          where: { order_id: id, status: { notIn: ["REVISED", "CANCELLED"] } },
+          _sum: { amount: true },
+        });
+        const invoicedTotal = Number(active._sum.amount ?? 0);
+        if (Number(after.final_price) < invoicedTotal) {
+          throw new AppError(
+            `final_price cannot be lower than active invoice total (${invoicedTotal}). Revise/cancel invoices first.`,
+            409,
+          );
+        }
         await tx.orderChangeLog.create({
           data: {
             order_id: id,
             field: "final_price",
             old_value: String(order.final_price),
-            new_value: String(newFinalPrice),
+            new_value: String(after.final_price),
             note: change_reason,
             actor: "ADMIN",
           },
         });
       }
 
-      return tx.order.findUniqueOrThrow({ where: { id } });
+      return after;
     },
     { maxWait: 15000, timeout: 30000 },
   );

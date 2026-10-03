@@ -28,7 +28,7 @@ Express 4 + Prisma 5 (Postgres on Supabase) + Supabase Storage, TypeScript. Sour
 
 ## Local end-to-end testing
 Postgres 16 binaries are in `/usr/lib/postgresql/16/bin`. Typical recipe: `initdb` a data dir under `/var/tmp`, start on port 5433 (`-k /var/tmp`), `DATABASE_URL=DIRECT_URL=postgresql://postgres@localhost:5433/arasya?host=/var/tmp npx prisma migrate deploy`, run `node dist/src/server.js` with `PORT`, `JWT_SECRET`, fake `SUPABASE_URL/KEY`, `CONFIRMATION_SWEEP_ENABLED=false`, `EXPO_PUSH_URL` pointing at a local mock. Create an admin with a bcrypt hash directly in `users`. Stop processes by PID (never `pkill -f` patterns that match your own shell).
-`scripts/e2e/run-local.sh` does all of that and runs ~130 checks of the dashboard and driver-app flows (see `scripts/e2e/README.md`); run it before pushing API changes and add checks for new behaviour.
+`scripts/e2e/run-local.sh` does all of that and runs ~140 checks of the dashboard and driver-app flows (see `scripts/e2e/README.md`); run it before pushing API changes and add checks for new behaviour.
 `.github/workflows/api-smoke.yml` (manual) checks the live API read-only.
 
 ## Deploy

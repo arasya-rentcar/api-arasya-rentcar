@@ -1,6 +1,7 @@
 import type { Prisma, ExpenseType, OrderAdjustmentType } from "@prisma/client";
 import { computeLineMargin, MARGIN_FORMULA_VERSION } from "../../utils/margin";
 import { syncPayableForLine } from "../payables/payables.service";
+import { wibShortDay } from "../../utils/wib";
 
 /**
  * Driver pay + trip costs for ONE day-line (2026-10-03). Call after anything
@@ -75,15 +76,6 @@ const COST_LABEL: Record<ExpenseType, string> = {
   OTHER: "Biaya lain",
 };
 
-function wibDay(d: Date | null): string {
-  if (!d) return "";
-  return d.toLocaleDateString("id-ID", {
-    timeZone: "Asia/Jakarta",
-    day: "numeric",
-    month: "short",
-  });
-}
-
 async function syncBilledAdjustment(
   tx: Prisma.TransactionClient,
   line: { order_id: string; service_date: Date | null },
@@ -106,7 +98,7 @@ async function syncBilledAdjustment(
     return;
   }
   const description = [
-    `${COST_LABEL[e.type]} ${wibDay(line.service_date)}`.trim(),
+    `${COST_LABEL[e.type]} ${wibShortDay(line.service_date)}`.trim(),
     e.note?.trim() || null,
   ]
     .filter(Boolean)
