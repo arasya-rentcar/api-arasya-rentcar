@@ -154,18 +154,22 @@ export async function dashboardAnalytics(opts: RangeOpts = {}) {
     }),
   ]);
 
-  // Billable adjustments per order (pure-markup revenue/margin), so the
-  // order-level margin here matches OrderFinalFinance after rollup.
+  // Billable adjustments per order, so the order-level revenue and margin
+  // here match OrderFinalFinance after rollup: every billable charge is
+  // revenue, but a trip cost billed to the customer is pass-through (its cost
+  // is the reimbursement or the company's payment), so only the other charges
+  // (overtime, extra stop…) add to the margin.
   const adjustmentRows = await prisma.orderAdjustment.findMany({
     where: { is_billable: true, order: { order_status: { not: 'CANCELLED' } } },
-    select: { order_id: true, amount: true, quantity: true },
+    select: { order_id: true, amount: true, quantity: true, expense: { select: { id: true } } },
   });
-  const adjByOrder = new Map<string, number>();
+  const adjByOrder = new Map<string, { revenue: number; margin: number }>();
   for (const a of adjustmentRows) {
-    adjByOrder.set(
-      a.order_id,
-      (adjByOrder.get(a.order_id) ?? 0) + n(a.amount) * (a.quantity ?? 1),
-    );
+    const amt = n(a.amount) * (a.quantity ?? 1);
+    const cur = adjByOrder.get(a.order_id) ?? { revenue: 0, margin: 0 };
+    cur.revenue += amt;
+    if (!a.expense) cur.margin += amt;
+    adjByOrder.set(a.order_id, cur);
   }
 
   // Map invoices by order
@@ -237,9 +241,9 @@ export async function dashboardAnalytics(opts: RangeOpts = {}) {
   }
   const marginRows = [...marginByOrder.entries()].map(([oid, v]) => {
     const o = orderMap.get(oid)!;
-    const adj = adjByOrder.get(oid) ?? 0;
-    const revenue = v.revenue + adj;
-    const margin = v.margin + adj;
+    const adj = adjByOrder.get(oid);
+    const revenue = v.revenue + (adj?.revenue ?? 0);
+    const margin = v.margin + (adj?.margin ?? 0);
     return {
       order_id: oid,
       order_code: o.order_code,
@@ -847,8 +851,11 @@ export async function revenueReport(opts: RevenueOpts = {}) {
 //   ACCRUAL (basis = OrderServiceItem.service_date, WIB calendar in range)
 //     revenue       = Σ OrderServiceItem.total_price (order/line ≠ CANCELLED)
 //     ops_cost      = Σ OrderServiceItem.ops_cost
-//     driver_cost   = Σ Payable.total_amount WHERE kind=DRIVER
-//     vendor_cost   = Σ Payable.total_amount WHERE kind=VENDOR
+//     driver_cost   = Σ (driver_fee + payable extras) of internal days
+//     vendor_cost   = Σ (rtr_amount + payable extras) of partner days
+//                     (not Payable.total_amount: a driver payable also holds
+//                     reimbursed trip costs, already counted in ops_cost or
+//                     passed on to the customer)
 //     margin        = revenue − ops_cost − driver_cost − vendor_cost
 //     margin_pct    = margin / revenue (null if revenue=0)
 //

@@ -13,7 +13,7 @@ Needs the Postgres 16 binaries (`PG_BIN`, default `/usr/lib/postgresql/16/bin`).
 
 Output: one line per check. `PASS`/`FAIL` count towards the exit code. `KNOWN` is a documented issue that does not fail the run; it turns into `FIXED` once the behaviour is corrected, and should then become a normal `check`. The run exits 1 when any check fails.
 
-What is covered (about 195 checks):
+What is covered (about 205 checks):
 
 | Group | Covers |
 |---|---|
@@ -29,6 +29,7 @@ What is covered (about 195 checks):
 | J | phone clock clamp, XOPS billing, day-H cancellation, old open trips ("Belum ditutup") |
 | K | input limits: GPS pairs, file type/size, `client_ref` reuse, push tokens, unassigning |
 | L | admin notification feed (one per real driver action, resends add none; TRIP_COST for receipts; per-admin read state, unread count), e-toll requests (idempotent, already_open, done once with push), `location_name`, `etoll_card` |
+| M | trip costs: "Dibayar oleh" decides what the driver is owed, "Ditagih ke pelanggan" only moves the cost to the invoice (pass-through, margin unchanged); admin Biaya Tambahan never touches the payable; `/analytics/dashboard` margin matches the order card |
 
 Safety: `lib.mjs` refuses to run unless both the API and the database are on localhost (`E2E_ALLOW_REMOTE=1` overrides it, for a disposable copy only). The checks create users, drivers, orders and payments.
 

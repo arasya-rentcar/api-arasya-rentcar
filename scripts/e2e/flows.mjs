@@ -764,6 +764,85 @@ await section('L. Admin notifications, driver requests, location names', async (
   check('L42 admin list by status DONE', doneList.data.items.some((x) => x.id === q1.data.request.id) && !doneList.data.items.some((x) => x.id === q4.data.request.id));
 });
 
+// ── M. Trip costs billed to the customer vs money owed to the driver (F3) ──
+// Rule: "Dibayar oleh" decides whether the driver is owed (DRIVER = own money
+// or uang jalan, reimbursed through the payable; COMPANY = e-toll/company
+// card, nothing owed). "Ditagih ke pelanggan" decides who finally bears the
+// cost (Invoice Tambahan, pass-through: no effect on the margin).
+await section('M. Trip costs: billed to the customer vs owed to the driver', async () => {
+  const d4 = await makeDriver(5);
+  // An old order date, so the order can be picked out alone in /analytics/dashboard.
+  const orderDate = new Date('2021-03-10T10:00:00+07:00').toISOString();
+  const o = await makeOrder('M', { startDay: 0, extra: { order_date: orderDate } });
+  await payDp(o, 300_000);
+  const lineId = o.service_items[0].id;
+  await putLine(lineId, { is_external: false, driver_id: d4.id, line_status: 'ASSIGNED', driver_fee: 200000, travel_advance: 100000 });
+  const money = async () => {
+    const [ord, line, pay, fin] = await Promise.all([
+      order(o.id),
+      prisma.orderServiceItem.findUnique({ where: { id: lineId } }),
+      prisma.payable.findUnique({ where: { service_item_id: lineId } }),
+      prisma.orderFinalFinance.findUnique({ where: { order_id: o.id } }),
+    ]);
+    return {
+      total: Number(ord.final_price), charges: ord.adjustments.filter((a) => a.is_billable).length,
+      reimburse: Number(pay.reimburse_amount), owed: Number(pay.total_amount),
+      ops: Number(line.ops_cost), margin: Number(fin.margin_amount),
+    };
+  };
+  const show = (m) => `total ${m.total}, owed ${m.owed} (reimburse ${m.reimburse}), ops ${m.ops}, margin ${m.margin}`;
+  const cost = async (type, amount, review) => {
+    await report(d4, lineId, { report_type: type, amount });
+    const e = await prisma.expense.findFirst({ where: { order_service_item_id: lineId, type } });
+    const r = await call('PATCH', `/lines/expenses/${e.id}`, { token: admin, body: { status: 'APPROVED', ...review } });
+    if (r.status !== 200) throw new Error(`approve ${type}: ${r.status} ${JSON.stringify(r.json)}`);
+    return e;
+  };
+  let m = await money();
+  check('M1 before costs: owed = fee 200.000 − uang jalan 100.000', m.owed === 100000 && m.total === 1000000 && m.margin === 800000, show(m));
+
+  // The driver paid parking (own money / uang jalan); the customer pays it back.
+  const parking = await cost('PARKING', 50000, { bill_to_customer: true });
+  m = await money();
+  check('M2 driver-paid parking billed to the customer: on the invoice (1.050.000) and reimbursed (owed 150.000), margin unchanged',
+    m.total === 1050000 && m.reimburse === 50000 && m.owed === 150000 && m.ops === 0 && m.margin === 800000, show(m));
+
+  // Toll paid with the company e-toll card, billed to the customer: nothing owed to the driver.
+  await cost('TOLL', 40000, { paid_by: 'COMPANY', bill_to_customer: true });
+  m = await money();
+  check('M3 company-paid toll billed to the customer: not owed to the driver (owed stays 150.000)',
+    m.total === 1090000 && m.owed === 150000 && m.margin === 800000, show(m));
+
+  // Fuel the driver paid and Arasya bears: reimbursed and a cost.
+  await cost('FUEL', 30000, {});
+  m = await money();
+  check('M4 driver-paid fuel Arasya bears: reimbursed (owed 180.000), margin −30.000',
+    m.total === 1090000 && m.owed === 180000 && m.ops === 30000 && m.margin === 770000, show(m));
+
+  // Unticking "Ditagih ke pelanggan" moves the cost from the customer to Arasya;
+  // the driver who paid it is still owed it.
+  await call('PATCH', `/lines/expenses/${parking.id}`, { token: admin, body: { bill_to_customer: false } });
+  m = await money();
+  check('M5 parking no longer billed: off the invoice, still reimbursed, margin −50.000',
+    m.total === 1040000 && m.owed === 180000 && m.ops === 80000 && m.margin === 720000, show(m));
+  await call('PATCH', `/lines/expenses/${parking.id}`, { token: admin, body: { bill_to_customer: true } });
+  m = await money();
+  check('M6 billed again: one invoice line per cost, owed unchanged', m.total === 1090000 && m.charges === 2 && m.owed === 180000 && m.margin === 770000, show(m));
+
+  // Admin "Biaya Tambahan" (overtime) is income from the customer only.
+  await call('POST', `/orders/${o.id}/adjustments`, { token: admin, body: { type: 'OVERTIME', description: 'Overtime 2 jam', amount: 60000, quantity: 1, is_billable: true } });
+  m = await money();
+  check('M7 admin Biaya Tambahan never touches the driver payable; counts as income',
+    m.total === 1150000 && m.owed === 180000 && m.margin === 830000, show(m));
+
+  // The analytics margin list treats billed trip costs as pass-through too.
+  const q = `date_from=${encodeURIComponent('2021-03-10T00:00:00+07:00')}&date_to=${encodeURIComponent('2021-03-10T23:59:59+07:00')}`;
+  const an = await call('GET', `/analytics/dashboard?${q}`, { token: admin });
+  const row = an.data?.margin?.top?.find((r) => r.order_id === o.id);
+  check('M8 /analytics/dashboard order margin = order card margin (billed trip costs not counted as profit)',
+    row && row.margin === m.margin && row.revenue === m.total, JSON.stringify(row));
+});
+
 const failed = summary();
 await prisma.$disconnect();
 process.exit(failed ? 1 : 0);
