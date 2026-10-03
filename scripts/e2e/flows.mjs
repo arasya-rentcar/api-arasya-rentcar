@@ -690,7 +690,7 @@ await section('K. Validation edges', async () => {
 
 // ── L. Admin notifications, e-toll requests, location names (F1, F4–F6) ────
 await section('L. Admin notifications, driver requests, location names', async () => {
-  const d4 = await makeDriver(4, { etoll_card: 'Mandiri 6032 ••••1234' });
+  const d4 = await makeDriver(6, { etoll_card: 'Mandiri 6032 ••••1234' });
   const me = async () => (await call('GET', '/driver/me', { token: d4.token })).data;
   check('L1 driver created with etoll_card; /driver/me returns it', (await me())?.etoll_card === 'Mandiri 6032 ••••1234');
   const upd = await call('PUT', `/drivers/${d4.id}`, { token: admin, body: { etoll_card: 'BCA Flazz ••••9876' } });
@@ -718,7 +718,7 @@ await section('L. Admin notifications, driver requests, location names', async (
   await act(d4, lineId, 'start', { client_ref: sref });
   await act(d4, lineId, 'start');
   const started = await notes('TRIP_STARTED');
-  check('L6 start, resend, second start → one TRIP_STARTED linked to the order', started.length === 1 && started[0].link === `/dashboard/orders/${o.id}` && started[0].order_code === o.order_code && started[0].driver_id === d4.id && started[0].title.includes(`Driver 4 ${tag}`), started[0]?.title);
+  check('L6 start, resend, second start → one TRIP_STARTED linked to the order', started.length === 1 && started[0].link === `/dashboard/orders/${o.id}` && started[0].order_code === o.order_code && started[0].driver_id === d4.id && started[0].title.includes(`Driver 6 ${tag}`), started[0]?.title);
   const loc = { latitude: -6.5971, longitude: 106.806, location_accuracy_m: 9, location_mocked: false, location_name: 'Jl. Pajajaran, Bogor' };
   check('L7 location_name over 200 characters refused (400)', (await act(d4, lineId, 'arrive', { ...loc, location_name: 'x'.repeat(201) })).status === 400);
   const aref = uuid();
