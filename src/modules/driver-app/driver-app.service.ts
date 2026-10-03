@@ -80,6 +80,9 @@ function toTrip(l: LineWithTrip) {
     order_id: l.order_id,
     order_code: l.order.order_code,
     status: l.line_status,
+    // Accepted ("Terima tugas") only when this is set; ASSIGNED is not
+    // acceptance. accepted_at is the older name of the same value.
+    driver_accepted_at: l.driver_accepted_at,
     accepted_at: l.driver_accepted_at,
     service_date: l.service_date,
     start_at: l.start_at,

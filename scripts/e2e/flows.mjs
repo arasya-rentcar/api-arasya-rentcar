@@ -1,7 +1,7 @@
 // End-to-end checks of the API: what the dashboard and the driver app do,
 // against the real API and a throwaway database. Run through run-local.sh.
 // Case ids in the output match dashboard-arasya-rentcar/docs/TEST-PLAN.md.
-import { call, check, knownIssue, section, summary, ensureAdmin, prisma, jpeg, wibIso, uuid, sleep, pushes, BASE } from './lib.mjs';
+import { call, check, section, summary, ensureAdmin, prisma, jpeg, wibIso, uuid, sleep, pushes, BASE } from './lib.mjs';
 
 const admin = await ensureAdmin();
 const tag = Date.now().toString(36).slice(-5);
@@ -102,7 +102,8 @@ function editBody(o, { days, reason, notes } = {}) {
 const d1 = await makeDriver(1);
 const d2 = await makeDriver(2);
 const d3 = await makeDriver(3);
-const [car1, car2, car3, car4, car5] = [await makeCar('Avanza'), await makeCar('Innova'), await makeCar('Xpander'), await makeCar('Zenix'), await makeCar('Hiace')];
+const d4 = await makeDriver(4);
+const [car1, car2, car3, car4, car5, car6] = [await makeCar('Avanza'), await makeCar('Innova'), await makeCar('Xpander'), await makeCar('Zenix'), await makeCar('Hiace'), await makeCar('Fortuner')];
 
 // ── A. Payment status follows money, not invoices (T2) ─────────────────────
 await section('A. Invoice revision and payment_status (T2)', async () => {
@@ -133,40 +134,91 @@ await section('A. Invoice revision and payment_status (T2)', async () => {
   check('A10 back to the paid amount → PAID', (await order(o3.id)).payment_status === 'PAID');
 });
 
-// ── B. Assignment paths (T4: current behaviour, update when decided) ───────
-await section('B. Assignment paths', async () => {
+// ── B. One way to assign (T4, owner decision 4 Okt) ───────────────────────
+await section('B. Assignment paths (T4: one way to assign)', async () => {
+  const st = async (drv) => (await prisma.driver.findUnique({ where: { id: drv.id } })).status;
+  const cs = async (car) => (await prisma.car.findUnique({ where: { id: car.id } })).status;
   const oB1 = await makeOrder('B1', { startDay: 2 });
   const inv = await invoice(oB1.id, 'DP', 200_000);
   const paid = await markPaid(oB1.id, inv.data.id);
   check('B1 DP marked paid', paid.status === 200, `status ${paid.status}`);
   check('B2 payment_status DP_PAID', (await order(oB1.id)).payment_status === 'DP_PAID');
-  const r = await putLine(oB1.service_items[0].id, { is_external: false, driver_id: d1.id, car_id: car1.id, line_status: 'SCHEDULED' });
-  check('B3 per-day assign accepted', r.status === 200, `status ${r.status}`);
+  const day1 = oB1.service_items[0].id;
+  // The day drawer / Edit Hari send the day's current status with the driver.
+  const r = await putLine(day1, { is_external: false, driver_id: d1.id, car_id: car1.id, line_status: 'SCHEDULED' });
+  check('B3 per-day assign accepted', r.status === 200, `status ${r.status} ${r.json?.message ?? ''}`);
   const o = await order(oB1.id);
-  check('B4 [T4] per-day assign keeps the day SCHEDULED and the order CREATED', o.service_items[0].line_status === 'SCHEDULED' && o.order_status === 'CREATED');
+  check('B4 per-day assign makes the day ASSIGNED and the order ASSIGNED', o.service_items[0].line_status === 'ASSIGNED' && o.order_status === 'ASSIGNED', `${o.service_items[0].line_status} / ${o.order_status}`);
+  check('B5 assigning is not accepting (driver_accepted_at empty)', o.service_items[0].driver_accepted_at === null);
   check('B6 default fee from the table (12H = 200.000)', Number(o.service_items[0].driver_fee) === 200000, String(o.service_items[0].driver_fee));
-  const pay = await prisma.payable.findUnique({ where: { service_item_id: oB1.service_items[0].id } });
+  const pay = await prisma.payable.findUnique({ where: { service_item_id: day1 } });
   check('B7 payable created UNPAID for the driver', pay?.status === 'UNPAID' && Number(pay.total_amount) === 200000);
-  const t = (await call('GET', '/driver/trips?scope=active', { token: d1.token })).data.find((x) => x.id === oB1.service_items[0].id);
-  check('B8 app gets the trip SCHEDULED, not accepted', t?.status === 'SCHEDULED' && !t.accepted_at);
+  const t = (await call('GET', '/driver/trips?scope=active', { token: d1.token })).data.find((x) => x.id === day1);
+  check('B8 app lists the trip ASSIGNED with driver_accepted_at null ("Terima tugas" still shown)', t?.status === 'ASSIGNED' && t.driver_accepted_at === null && t.accepted_at === null, JSON.stringify(t && { status: t.status, driver_accepted_at: t.driver_accepted_at }));
   await sleep(500);
   check('B9 driver got "Tugas baru"', (await pushesTo(d1)).some((x) => x.title === 'Tugas baru'));
+  check('B10 trip in 2 days: driver and car stay AVAILABLE', (await st(d1)) === 'AVAILABLE' && (await cs(car1)) === 'AVAILABLE', `${await st(d1)} / ${await cs(car1)}`);
+  const acc = await act(d1, day1, 'accept');
+  const det = await call('GET', `/driver/trips/${day1}`, { token: d1.token });
+  check('B11 accept sets driver_accepted_at (detail too), day stays ASSIGNED', acc.status === 200 && !!acc.data.driver_accepted_at && det.data.driver_accepted_at === acc.data.driver_accepted_at && det.data.status === 'ASSIGNED');
   const reassign = await call('POST', `/orders/${oB1.id}/reassign`, { token: admin, body: { driver_id: d2.id, car_id: car2.id } });
-  check('B10 [T4] "Ganti Semua" refuses a SCHEDULED day (409)', reassign.status === 409);
+  const moved = await prisma.orderServiceItem.findUnique({ where: { id: day1 } });
+  check('B12 "Ganti Semua" works on a per-day assigned day; the new driver has to accept again', reassign.status === 200 && moved.driver_id === d2.id && moved.line_status === 'ASSIGNED' && moved.driver_accepted_at === null, `status ${reassign.status} ${reassign.json?.message ?? ''}`);
+  const un = await putLine(day1, { is_external: false, driver_id: null, car_id: null, line_status: 'ASSIGNED' });
+  const ou = await order(oB1.id);
+  check('B13 driver taken off a day not started: back to SCHEDULED, order CREATED', un.status === 200 && ou.service_items[0].line_status === 'SCHEDULED' && ou.order_status === 'CREATED', `${ou.service_items[0].line_status} / ${ou.order_status}`);
 
+  // "Tetapkan untuk Semua" ends in the same state as per-day assign.
   const oB2 = await makeOrder('B2', { days: 2, price: 900_000, startDay: 3 });
   await payDp(oB2, 360_000);
   const bulk = await call('POST', `/orders/${oB2.id}/assign`, { token: admin, body: { driver_id: d2.id, car_id: car2.id } });
-  check('B11 "Tetapkan untuk Semua" accepted', bulk.status === 201, `${bulk.status} ${bulk.json?.message ?? ''}`);
+  check('B14 "Tetapkan untuk Semua" accepted', bulk.status === 201, `${bulk.status} ${bulk.json?.message ?? ''}`);
   const o2 = await order(oB2.id);
-  check('B12 bulk assign: days ASSIGNED, order ASSIGNED', o2.service_items.every((l) => l.line_status === 'ASSIGNED') && o2.order_status === 'ASSIGNED');
+  check('B15 bulk = per-day: days ASSIGNED and not accepted, order ASSIGNED', o2.service_items.every((l) => l.line_status === 'ASSIGNED' && l.driver_accepted_at === null) && o2.order_status === 'ASSIGNED');
   const t2 = (await call('GET', '/driver/trips?scope=active', { token: d2.token })).data.find((x) => x.id === o2.service_items[0].id);
-  check('B13 [T4] app gets ASSIGNED with accepted_at null', t2?.status === 'ASSIGNED' && !t2.accepted_at);
-  check('B14 [T4] driver ON_DUTY days ahead', (await prisma.driver.findUnique({ where: { id: d2.id } })).status === 'ON_DUTY');
+  check('B16 app gets ASSIGNED with driver_accepted_at null', t2?.status === 'ASSIGNED' && t2.driver_accepted_at === null);
+  check('B17 trips in 3-4 days: driver AVAILABLE, car AVAILABLE (not ON_DUTY days ahead)', (await st(d2)) === 'AVAILABLE' && (await cs(car2)) === 'AVAILABLE', `${await st(d2)} / ${await cs(car2)}`);
   const oB3 = await makeOrder('B3', { price: 800_000, startDay: 6 });
   await payFull(oB3);
   const bulk3 = await call('POST', `/orders/${oB3.id}/assign`, { token: admin, body: { driver_id: d2.id, car_id: car1.id } });
-  check('B15 [T4] bulk assign refuses a driver busy on another date (409)', bulk3.status === 409);
+  check('B18 a driver booked on other dates is free (bulk assign 201)', bulk3.status === 201, `${bulk3.status} ${bulk3.json?.message ?? ''}`);
+
+  // Overlapping days: refused the same way on both paths, with a clear message.
+  const oB4 = await makeOrder('B4', { startDay: 3 });
+  await payDp(oB4, 200_000);
+  const b4day = oB4.service_items[0].id;
+  const clash = await putLine(b4day, { is_external: false, driver_id: d2.id, car_id: car3.id, line_status: 'SCHEDULED' });
+  check('B19 per-day assign refused when the driver has an overlapping day (409, names the order)', clash.status === 409 && (clash.json?.message ?? '').includes(o2.order_code), clash.json?.message);
+  const clashBulk = await call('POST', `/orders/${oB4.id}/assign`, { token: admin, body: { driver_id: d2.id, car_id: car3.id } });
+  check('B20 bulk assign refused for the same overlap (409)', clashBulk.status === 409 && /sudah ada tugas lain/.test(clashBulk.json?.message ?? ''), clashBulk.json?.message);
+  const carClash = await putLine(b4day, { is_external: false, driver_id: d4.id, car_id: car2.id });
+  check('B21 a car on an overlapping day refused too (409)', carClash.status === 409 && /^Mobil/.test(carClash.json?.message ?? ''), carClash.json?.message);
+  const late = await putLine(b4day, { is_external: false, start_at: wibIso(3, '20:30'), end_at: wibIso(3, '23:00') });
+  const lateOk = await putLine(b4day, { is_external: false, driver_id: d2.id, car_id: car3.id });
+  check('B22 same date, hours that do not overlap: allowed', late.status === 200 && lateOk.status === 200, lateOk.json?.message);
+
+  // ON_DUTY / IN_USE only on the WIB day of the trip, or while it runs.
+  const oB5 = await makeOrder('B5', { startDay: 0 });
+  await payDp(oB5, 200_000);
+  const b5day = oB5.service_items[0].id;
+  await call('PUT', `/drivers/${d4.id}`, { token: admin, body: { status: 'OFF' } });
+  const off = await putLine(b5day, { is_external: false, driver_id: d4.id, car_id: car6.id });
+  await call('PUT', `/drivers/${d4.id}`, { token: admin, body: { status: 'AVAILABLE' } });
+  check('B23 a driver flagged OFF cannot be given a day (409)', off.status === 409 && /OFF/.test(off.json?.message ?? ''), off.json?.message);
+  const today = await putLine(b5day, { is_external: false, driver_id: d4.id, car_id: car6.id });
+  check('B24 trip today: driver ON_DUTY, car IN_USE', today.status === 200 && (await st(d4)) === 'ON_DUTY' && (await cs(car6)) === 'IN_USE', `${today.status} ${await st(d4)} / ${await cs(car6)}`);
+  const tomorrow = await putLine(b5day, { is_external: false, service_date: wibIso(1, '00:00'), start_at: wibIso(1, '08:00'), end_at: wibIso(1, '20:00') });
+  check('B25 the same trip moved to tomorrow: driver and car AVAILABLE again', tomorrow.status === 200 && (await st(d4)) === 'AVAILABLE' && (await cs(car6)) === 'AVAILABLE', `${await st(d4)} / ${await cs(car6)}`);
+  const moveTo = async (day) =>
+    call('PUT', `/orders/${oB5.id}`, { token: admin, body: editBody(await order(oB5.id), { days: [{ id: b5day, service_date: wibIso(day, '00:00'), start_at: wibIso(day, '08:00'), end_at: wibIso(day, '20:00') }] }) });
+  const back = await moveTo(0);
+  check('B26 Edit Order moving it back to today: ON_DUTY / IN_USE at once', back.status === 200 && (await st(d4)) === 'ON_DUTY' && (await cs(car6)) === 'IN_USE', `${back.status} ${back.json?.message ?? ''}`);
+  const again = await moveTo(1);
+  check('B27 and to tomorrow again: AVAILABLE', again.status === 200 && (await st(d4)) === 'AVAILABLE' && (await cs(car6)) === 'AVAILABLE');
+  const started = await act(d4, b5day, 'start');
+  check('B28 a trip under way keeps driver ON_DUTY and car IN_USE whatever its date', started.status === 200 && (await st(d4)) === 'ON_DUTY' && (await cs(car6)) === 'IN_USE');
+  await putLine(b5day, { is_external: false, line_status: 'CANCELLED' });
+  check('B29 trip closed: driver and car AVAILABLE', (await st(d4)) === 'AVAILABLE' && (await cs(car6)) === 'AVAILABLE');
 });
 
 // ── C. Edit Order keeps the days (T1) ──────────────────────────────────────
@@ -324,7 +376,7 @@ await section('D. Driver flow', async () => {
   const lineId = o.service_items[0].id;
   await putLine(lineId, { is_external: false, driver_id: d2.id, car_id: car1.id, line_status: 'ASSIGNED' });
   const acc = await act(d2, lineId, 'accept');
-  check('D1 accept: accepted_at set, status unchanged', acc.status === 200 && !!acc.data.accepted_at && acc.data.status === 'ASSIGNED');
+  check('D1 accept: driver_accepted_at set, status unchanged', acc.status === 200 && !!acc.data.driver_accepted_at && acc.data.accepted_at === acc.data.driver_accepted_at && acc.data.status === 'ASSIGNED');
   const ref = uuid();
   const s1 = await act(d2, lineId, 'start', { client_ref: ref });
   const s2 = await act(d2, lineId, 'start', { client_ref: ref });
@@ -386,8 +438,11 @@ await section('D. Driver flow', async () => {
   check('D27 inbox keeps every push, all unread', inbox.data.items.length >= 4 && inbox.data.unread === inbox.data.items.length);
   check('D28 mark all read → unread 0', (await call('POST', '/driver/notifications/read', { token: d2.token, body: { all: true } })).data.unread === 0);
   const reopen = await putLine(lineId, { is_external: false, line_status: 'IN_PROGRESS' });
-  knownIssue('T5', 'D29 a day of a finalized order cannot be reopened', reopen.status === 409, `status ${reopen.status}`);
-  if (reopen.status === 200) await putLine(lineId, { is_external: false, line_status: 'DONE' });
+  const kept = await prisma.orderServiceItem.findUnique({ where: { id: lineId } });
+  check('D29 [T5] a day of a finalized order cannot be reopened (409, clear message)', reopen.status === 409 && /sudah selesai/.test(reopen.json?.message ?? '') && kept.line_status === 'DONE', reopen.json?.message);
+  const fee = await putLine(lineId, { is_external: false, driver_fee: 999000 });
+  check('D30 [T5] nor its driver fee changed in Edit Hari (409)', fee.status === 409 && Number((await prisma.orderServiceItem.findUnique({ where: { id: lineId } })).driver_fee) === 200000);
+  check('D31 [T5] "Ganti Semua" on a finalized order refused (409)', (await call('POST', `/orders/${o.id}/reassign`, { token: admin, body: { driver_id: d1.id, car_id: car2.id } })).status === 409);
 });
 
 // ── E. Cancellation ────────────────────────────────────────────────────────
@@ -405,7 +460,10 @@ await section('E. Cancellation', async () => {
   check('E5 cancelling twice refused (409)', (await call('POST', `/orders/${o.id}/cancel`, { token: admin, body: { reason: 'lagi' } })).status === 409);
   check('E6 driver AVAILABLE again', (await prisma.driver.findUnique({ where: { id: d3.id } })).status === 'AVAILABLE');
   const reopen = await putLine(o.service_items[0].id, { is_external: false, line_status: 'SCHEDULED' });
-  knownIssue('T5', 'E7 a day of a cancelled order cannot be reopened', reopen.status === 409, `status ${reopen.status}`);
+  check('E7 [T5] a day of a cancelled order cannot be reopened (409, clear message)', reopen.status === 409 && /sudah dibatalkan/.test(reopen.json?.message ?? ''), reopen.json?.message);
+  const give = await putLine(o.service_items[1].id, { is_external: false, driver_id: d1.id, car_id: car1.id });
+  const e8 = await prisma.orderServiceItem.findUnique({ where: { id: o.service_items[1].id } });
+  check('E8 [T5] nor given a driver again (409, day unchanged)', give.status === 409 && e8.line_status === 'CANCELLED' && !e8.driver_id);
 });
 
 // ── F. Auth ────────────────────────────────────────────────────────────────
@@ -616,7 +674,7 @@ await section('K. Validation edges', async () => {
   n1.append('report_type', 'NOTE');
   n1.append('notes', 'a');
   await call('POST', `/driver/trips/${lineId}/reports`, { token: d2.token, form: n1 });
-  const o2 = await makeOrder('K4', { startDay: 3 });
+  const o2 = await makeOrder('K4', { startDay: 5 });
   await payDp(o2, 200_000);
   await putLine(o2.service_items[0].id, { is_external: false, driver_id: d2.id, line_status: 'ASSIGNED' });
   const n2 = new FormData();

@@ -2,7 +2,10 @@ import { notifyNewTrips } from "../../services/tripNotify";
 import { DriverType, Prisma, ScheduleStatus } from "@prisma/client";
 import prisma from "../../prisma/client";
 import { AppError } from "../../utils/AppError";
-import { assertOrderPaidForDriverAssignment } from "../orders/assignment-guard";
+import {
+  assertOrderOpenForDayChanges,
+  assertOrderPaidForDriverAssignment,
+} from "../orders/assignment-guard";
 import {
   deriveAndSetOrderStatus,
   syncDriverStatus,
@@ -405,25 +408,34 @@ export async function assignBotOrder(
   input: BotAssignInput,
 ) {
   const order = await resolveOrder(orderIdOrCode);
+  assertOrderOpenForDayChanges(order);
   assertOrderPaidForDriverAssignment(order);
   const driver = await findOrCreateDriver(input);
   const car = await findOrCreateCar(input);
 
-  // Merge: assign at the LINE level. Every internal day-line of this order that
-  // has no driver yet inherits this driver+car and flips to ASSIGNED. Order
-  // status + driver/car status are then derived from the lines. For multi-day
-  // orders with per-day drivers, the Schedule page overrides individual days.
+  // Merge: assign at the LINE level. Every open internal day-line of this
+  // order that has no driver yet inherits this driver+car and flips to
+  // ASSIGNED (a cancelled or finished day stays as it is). Order status +
+  // driver/car status are then derived from the lines. For multi-day orders
+  // with per-day drivers, the Schedule page overrides individual days.
+  const unassigned: Prisma.OrderServiceItemWhereInput = {
+    order_id: order.id,
+    is_external: false,
+    driver_id: null,
+    line_status: { in: ["SCHEDULED", "ASSIGNED"] },
+  };
   const newLines = await prisma.orderServiceItem.findMany({
-    where: { order_id: order.id, is_external: false, driver_id: null },
+    where: unassigned,
     select: { id: true },
   });
   const result = await prisma.$transaction(async (tx) => {
     await tx.orderServiceItem.updateMany({
-      where: { order_id: order.id, is_external: false, driver_id: null },
+      where: { ...unassigned, id: { in: newLines.map((l) => l.id) } },
       data: {
         driver_id: driver.id,
         car_id: car.id,
         line_status: "ASSIGNED",
+        driver_accepted_at: null,
       },
     });
     // If no unassigned internal line existed (e.g. order had no service items),

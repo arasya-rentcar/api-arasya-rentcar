@@ -2,6 +2,7 @@ import { notifyNewTrips, notifyTripsRemoved } from '../../services/tripNotify';
 import prisma from '../../prisma/client';
 import { AppError } from '../../utils/AppError';
 import {
+  assertOrderOpenForDayChanges,
   assertOrderPaidForDriverAssignment,
   netPaid,
   paymentStatusFor,
@@ -15,10 +16,11 @@ import { paidPayableBlockingChange } from '../payables/payables.service';
 import { recomputeLineMoney } from './line-money.service';
 import {
   deriveAndSetOrderStatus,
-  syncDriverStatus,
-  syncCarStatus,
+  refreshCarStatuses,
+  refreshDriverStatuses,
   tripTimestampsForLine,
 } from './order-derive.service';
+import { assertUnitsFree } from './availability';
 import {
   deriveState,
   maybeAutoSendOnAssign,
@@ -190,11 +192,13 @@ export async function assignScheduleLine(
   const line = await prisma.orderServiceItem.findUnique({
     where: { id },
     include: {
-      order: { select: { payment_status: true } },
+      order: { select: { payment_status: true, order_status: true } },
       payable: { select: { status: true, kind: true } },
     },
   });
   if (!line) throw new AppError('Schedule line not found', 404);
+  // T5: the days of a finished or cancelled order are closed.
+  assertOrderOpenForDayChanges(line.order);
 
   const isExternal = input.is_external ?? line.is_external;
 
@@ -204,11 +208,12 @@ export async function assignScheduleLine(
     assertOrderPaidForDriverAssignment(line.order);
   }
 
-
   // Validate referenced entities exist (and respect internal/external mode).
   // These reads are independent, so run them concurrently — over the Supabase
   // pooler each serial round-trip costs ~1s, so parallelising the existence
   // checks shaves real latency off every assign.
+  let newDriver: { id: string; name: string; status: string } | null = null;
+  let newCar: { id: string; plate_number: string; status: string } | null = null;
   if (!isExternal) {
     const [d, c] = await Promise.all([
       input.driver_id
@@ -220,6 +225,9 @@ export async function assignScheduleLine(
     ]);
     if (input.driver_id && !d) throw new AppError('Driver not found', 404);
     if (input.car_id && !c) throw new AppError('Car not found', 404);
+    // Only a unit newly given to this day is checked for clashes.
+    if (d && d.id !== line.driver_id) newDriver = d;
+    if (c && c.id !== line.car_id) newCar = c;
   } else {
     const [v, ec] = await Promise.all([
       input.external_vendor_id
@@ -358,10 +366,23 @@ export async function assignScheduleLine(
     if (input.driver_id !== undefined) data.driver_id = input.driver_id;
     if (input.car_id !== undefined) data.car_id = input.car_id;
   }
-  if (input.line_status !== undefined) {
-    data.line_status = input.line_status;
-    // The line IS the trip: derive journey timestamps from the status change.
-    const ts = tripTimestampsForLine(input.line_status, {
+  // T4 (owner, Oct 2026): one way to assign. An internal day that has a
+  // driver is ASSIGNED, whatever status the form sent (the day drawer and Edit
+  // Hari send the day's current status, SCHEDULED, with the new driver);
+  // taking the driver off a day not started yet puts it back to SCHEDULED.
+  // Accepting is separate (driver_accepted_at) and never changes the status.
+  // Partner days keep the status the admin chooses.
+  const requested = input.line_status ?? line.line_status;
+  let nextStatus: ScheduleStatus = requested;
+  if (!isExternal && nextDriverId && requested === 'SCHEDULED') nextStatus = 'ASSIGNED';
+  if (!isExternal && !nextDriverId && requested === 'ASSIGNED' && !started)
+    nextStatus = 'SCHEDULED';
+  if (input.line_status !== undefined || nextStatus !== line.line_status) {
+    data.line_status = nextStatus;
+    // The line IS the trip: derive journey timestamps from the status change
+    // (an admin reset to SCHEDULED clears them even when a driver keeps it
+    // ASSIGNED).
+    const ts = tripTimestampsForLine(requested === 'SCHEDULED' ? requested : nextStatus, {
       trip_started_at: line.trip_started_at,
       trip_finished_at: line.trip_finished_at,
     });
@@ -369,6 +390,9 @@ export async function assignScheduleLine(
     if (ts.trip_finished_at !== undefined)
       data.trip_finished_at = ts.trip_finished_at;
   }
+  // A different driver (or none) has not accepted this day yet: the app shows
+  // "Terima tugas" again. A day under way keeps its record.
+  if (nextDriverId !== line.driver_id && !started) data.driver_accepted_at = null;
   if (input.service_date !== undefined)
     data.service_date = input.service_date ? new Date(input.service_date) : null;
   if (input.start_at !== undefined)
@@ -377,47 +401,57 @@ export async function assignScheduleLine(
     data.end_at = input.end_at ? new Date(input.end_at) : null;
   if (input.notes !== undefined) data.notes = input.notes;
 
+  // A driver or car newly given to an open day must be free at that time
+  // (same rule as "Tetapkan untuk Semua" / "Ganti Semua").
+  if ((newDriver || newCar) && ['SCHEDULED', 'ASSIGNED', 'IN_PROGRESS'].includes(nextStatus)) {
+    await assertUnitsFree(prisma, { driver: newDriver, car: newCar }, [
+      {
+        id,
+        service_date:
+          input.service_date !== undefined ? (data.service_date as Date | null) : line.service_date,
+        start_at: input.start_at !== undefined ? (data.start_at as Date | null) : line.start_at,
+        end_at: input.end_at !== undefined ? (data.end_at as Date | null) : line.end_at,
+      },
+    ]);
+  }
+
   // Capture the line's resource links BEFORE the update so a reassignment can
-  // also release the previously-linked driver/car if they are now idle.
+  // also release the previously-linked driver/car.
   const prevDriverId = line.driver_id;
   const prevCarId = line.car_id;
+  const driversToSync = [...new Set([prevDriverId, nextDriverId].filter((x): x is string => !!x))];
+  const nextCarId = isExternal
+    ? null
+    : input.car_id !== undefined
+      ? input.car_id
+      : line.car_id;
+  const carsToSync = [...new Set([prevCarId, nextCarId].filter((x): x is string => !!x))];
 
   const updated = await prisma.$transaction(async (tx) => {
     await tx.orderServiceItem.update({ where: { id }, data });
     // Costs, margin and the payable follow the day; then the order totals.
     await recomputeLineMoney(tx, id);
     await rollupOrderFinance(tx, line.order_id);
+    // T5 again, under the order lock rollupOrderFinance took: a finalize or
+    // cancel that committed meanwhile wins and this save is rolled back.
+    assertOrderOpenForDayChanges(
+      await tx.order.findUniqueOrThrow({
+        where: { id: line.order_id },
+        select: { order_status: true },
+      }),
+    );
 
-    // Batch 2: keep order status derived from the lines inside this same
-    // transaction so order_status / awaiting_finalization never drift.
+    // Order, driver and car status follow the days, in this same transaction.
+    // The driver/car updates are two conditional statements each (no reads).
     await deriveAndSetOrderStatus(tx, line.order_id);
+    await refreshDriverStatuses(tx, driversToSync);
+    await refreshCarStatuses(tx, carsToSync);
 
     return tx.orderServiceItem.findUniqueOrThrow({
       where: { id },
       include: lineInclude,
     });
   }, { timeout: 20000, maxWait: 10000 });
-
-  // Driver/car ON_DUTY/AVAILABLE status is NOT on the critical path: the
-  // schedule timeline + stock derive free/busy from the lines themselves and
-  // only read driver.status for the hard OFF / MAINTENANCE down-flag (which
-  // these syncs never touch). So defer them to fire-and-forget AFTER commit,
-  // in parallel — each was several serial pooler round-trips (~1s each) and
-  // was the bulk of the assign latency. Idempotent, so a later run is safe.
-  const driversToSync = new Set<string>();
-  const carsToSync = new Set<string>();
-  if (prevDriverId) driversToSync.add(prevDriverId);
-  if (updated.driver_id) driversToSync.add(updated.driver_id);
-  if (prevCarId) carsToSync.add(prevCarId);
-  if (updated.car_id) carsToSync.add(updated.car_id);
-  if (driversToSync.size || carsToSync.size) {
-    void Promise.all([
-      ...[...driversToSync].map((d) => syncDriverStatus(prisma, d)),
-      ...[...carsToSync].map((c) => syncCarStatus(prisma, c)),
-    ]).catch((err) =>
-      console.error('deferred resource status sync failed', { lineId: id, err }),
-    );
-  }
 
   // Driver app: tell the new driver (and a replaced one) about the change.
   if (!updated.is_external && updated.driver_id && updated.driver_id !== prevDriverId) {

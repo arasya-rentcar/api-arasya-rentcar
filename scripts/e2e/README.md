@@ -13,15 +13,15 @@ Needs the Postgres 16 binaries (`PG_BIN`, default `/usr/lib/postgresql/16/bin`).
 
 Output: one line per check. `PASS`/`FAIL` count towards the exit code. `KNOWN` is a documented issue that does not fail the run; it turns into `FIXED` once the behaviour is corrected, and should then become a normal `check`. The run exits 1 when any check fails.
 
-What is covered (about 205 checks):
+What is covered (about 220 checks):
 
 | Group | Covers |
 |---|---|
 | A | `payment_status` follows money received against the order total: revisions never change it, a new total does |
-| B | per-day assignment vs "Tetapkan untuk Semua" (current behaviour, T4) |
+| B | one way to assign (T4): per-day assign makes the day ASSIGNED but not accepted (`driver_accepted_at` stays empty in the app until "Terima tugas"), "Ganti Semua" after a per-day assign, taking the driver off → SCHEDULED, "Tetapkan untuk Semua" ends in the same state, overlapping days and OFF drivers refused on both paths, a driver booked on other dates is free, ON_DUTY / IN_USE only on the trip's WIB day or while it runs |
 | C | Edit Order keeps days, drivers, payables, receipts and reports; refuses to delete days in use; new days on mixed orders start internal; Edit Order and a driver action at the same moment; double saves; moving a day tells the driver; removing the last open day refused |
-| D | the full driver flow: accept, start (idempotent), arrive + GPS photo, pay-in-full gate, odometer order, receipts, finish, cost review, finalize, fee paid once, inbox |
-| E | cancellation tier 1, releasing drivers, cancellation-fee invoice |
+| D | the full driver flow: accept, start (idempotent), arrive + GPS photo, pay-in-full gate, odometer order, receipts, finish, cost review, finalize, fee paid once, inbox; the days of a finalized order are locked (T5) |
+| E | cancellation tier 1, releasing drivers, cancellation-fee invoice; the days of a cancelled order are locked (T5) |
 | F | login with any phone format, roles, duplicate phone numbers |
 | G | DP/settlement/full rules, one receipt per payment (also on a double click), two invoices paid at once, pay vs revise at once, money kept after a cancellation (also on the statement), kwitansi PDF, one "lunas" push, invalid dates, overpayment and refund |
 | H | website leads: idempotent intake, honeypot, sendBeacon, lead code as order code |
