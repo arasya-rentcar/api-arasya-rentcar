@@ -16,7 +16,9 @@ export function assertOrderPaidForDriverAssignment(order: {
   );
 }
 
-// Owner rule (3 Oct 2026): a trip starts only when the order is paid in full.
+// Owner rule (3 Oct 2026): the trip with the customer begins only when the
+// order is paid in full. The driver may still leave the garage and record the
+// arrival at the pickup; "Mulai perjalanan" (customer on board) is what waits.
 // "In full" = the money received (paid_to_date, which only moves when an
 // invoice is marked paid) covers the rental price of every day that is not
 // cancelled. Extra charges (overtime, parking/fuel billed to the customer…)
@@ -42,7 +44,7 @@ export function startPayment(
 export function assertOrderPaidForTripStart(state: StartPayment): void {
   if (state.ready) return;
   throw new AppError(
-    "Order belum lunas. Trip baru bisa dimulai setelah pelunasan tercatat (invoice ditandai terbayar). Hubungi admin.",
+    "Order belum lunas. Perjalanan dengan pelanggan baru bisa dimulai setelah pelunasan tercatat (invoice ditandai terbayar). Hubungi admin.",
     409,
   );
 }

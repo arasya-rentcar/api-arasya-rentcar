@@ -471,13 +471,17 @@ model OrderServiceItem {
   // finish_reported_at = when the driver reported finishing this line. The line
   // moves to DONE from the dropoff report, but the ORDER stays IN_PROGRESS
   // (awaiting admin finalization) regardless.
-  actual_start_at    DateTime?
-  actual_pickup_at   DateTime?
-  finish_reported_at DateTime?
+  actual_start_at     DateTime?
+  actual_pickup_at    DateTime?
+  // The customer got in and the trip with them began ("Mulai perjalanan" in
+  // the driver app, 2026-10-03). Owner rule: only once the order is paid in
+  // full; driving to the pickup (actual_start_at) is allowed before that.
+  customer_onboard_at DateTime?
+  finish_reported_at  DateTime?
   // Driver app: when the driver accepted the trip ("Terima tugas"). Recorded
   // only; it does not change line_status (so drivers are not marked ON_DUTY
   // days ahead).
-  driver_accepted_at DateTime?
+  driver_accepted_at  DateTime?
 
   // --- #A1/#A2 trip-confirmation messaging (additive, 2026-06-20) ---
   // confirmation_* = message sent to the CUSTOMER ("Data tim bertugas").

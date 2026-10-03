@@ -67,6 +67,8 @@ export const reportSchema = z
     amount: z.coerce.number().int().min(0).max(100_000_000).optional(),
     occurred_at: occurredAt,
     ...locationFields,
+    // The app's GPS camera already burned the time/GPS stamp into the photo.
+    stamped: z.preprocess((v) => v === "true" || v === true, z.boolean()).optional(),
   })
   .refine(bothOrNone, { message: "latitude and longitude go together", path: ["longitude"] });
 export type ReportInput = z.infer<typeof reportSchema>;

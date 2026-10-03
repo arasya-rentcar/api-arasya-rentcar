@@ -13,6 +13,7 @@ import {
   acceptTrip,
   addReport,
   arriveTrip,
+  boardTrip,
   driverForUser,
   finishTrip,
   getTrip,
@@ -62,6 +63,8 @@ router.post("/trips/:id/arrive", h((req, id) => {
   const b = actionSchema.parse(req.body ?? {});
   return arriveTrip(id, req.params.id, { occurredAt: b.occurred_at, clientRef: b.client_ref, location: b });
 }));
+// Customer on board: the trip begins (needs the order paid in full).
+router.post("/trips/:id/board", h((req, id) => boardTrip(id, req.params.id, opts(req))));
 router.post("/trips/:id/finish", h((req, id) => {
   const b = finishSchema.parse(req.body ?? {});
   return finishTrip(id, req.params.id, { notes: b.notes, occurredAt: b.occurred_at, clientRef: b.client_ref });

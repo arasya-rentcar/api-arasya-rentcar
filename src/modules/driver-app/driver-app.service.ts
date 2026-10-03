@@ -49,7 +49,7 @@ export async function driverForUser(userId: string) {
 
 // Rows written by the trip actions themselves (app applyOnce or the bot), not
 // sent by the driver; the app may hide them in the report list.
-const SYSTEM_REPORTS = ["START", "ARRIVE_CUSTOMER", "FINISH", "DROP"];
+const SYSTEM_REPORTS = ["START", "ARRIVE_CUSTOMER", "ONBOARD", "FINISH", "DROP"];
 
 const tripInclude = {
   car: { select: { plate_number: true, model: true } },
@@ -95,9 +95,11 @@ function toTrip(l: LineWithTrip) {
     car: l.car,
     actual_start_at: l.actual_start_at,
     actual_pickup_at: l.actual_pickup_at,
+    customer_onboard_at: l.customer_onboard_at,
     trip_finished_at: l.trip_finished_at,
     report_count: l._count.reports,
-    // Owner rule: the trip may start only once the order is paid in full.
+    // Owner rule: the trip with the customer ("Mulai perjalanan") may begin only
+    // once the order is paid in full. Driving to the pickup is always allowed.
     payment_ready: startPayment(l.order, l.order.service_items).ready,
   };
 }
@@ -220,13 +222,10 @@ function locationData(loc: LocationInput = {}) {
   };
 }
 
-/** Not departed yet (the paid-in-full rule applies to the first move). */
-function notStarted(line: LineWithTrip) {
-  return (
-    (line.line_status === "SCHEDULED" || line.line_status === "ASSIGNED") &&
-    !line.actual_start_at &&
-    !line.trip_started_at
-  );
+/** Paid-in-full rule for beginning the trip with the customer (see boardTrip). */
+async function assertPaidToBoard(line: LineWithTrip, clientRef?: string) {
+  if (line.customer_onboard_at || (await alreadyApplied(clientRef))) return;
+  assertOrderPaidForTripStart(startPayment(line.order, line.order.service_items));
 }
 
 const TERMINAL: ScheduleStatus[] = ["DONE", "CANCELLED"];
@@ -258,8 +257,6 @@ export async function startTrip(driverId: string, lineId: string, opts: ActionOp
   const line = await ownLine(driverId, lineId);
   if (TERMINAL.includes(line.line_status))
     throw new AppError(`Trip is already ${line.line_status === "DONE" ? "finished" : "cancelled"}`, 409);
-  if (notStarted(line) && !(await alreadyApplied(opts.clientRef)))
-    assertOrderPaidForTripStart(startPayment(line.order, line.order.service_items));
   const now = eventTime(opts.occurredAt);
   const applied = await applyOnce(line, driverId, {
     guard: { line_status: { in: ["SCHEDULED", "ASSIGNED"] } },
@@ -310,6 +307,38 @@ export async function arriveTrip(
   return toTrip(await ownLine(driverId, lineId));
 }
 
+/**
+ * The customer got in: the trip with them begins ("Mulai perjalanan"). Owner
+ * rule (3 Oct 2026): only when the order is paid in full; the driver may drive
+ * to the pickup and record the arrival before that. A driver who skipped
+ * "Berangkat" is marked departed now as well.
+ */
+export async function boardTrip(driverId: string, lineId: string, opts: ActionOpts = {}) {
+  const line = await ownLine(driverId, lineId);
+  if (TERMINAL.includes(line.line_status))
+    throw new AppError(`Trip is already ${line.line_status === "DONE" ? "finished" : "cancelled"}`, 409);
+  await assertPaidToBoard(line, opts.clientRef);
+  const now = eventTime(opts.occurredAt);
+  await applyOnce(line, driverId, {
+    guard: { customer_onboard_at: null, line_status: { notIn: TERMINAL } },
+    data: {
+      customer_onboard_at: now,
+      line_status: "IN_PROGRESS",
+      driver_accepted_at: line.driver_accepted_at ?? now,
+      ...(line.trip_started_at ? {} : { trip_started_at: now }),
+      ...(line.actual_start_at ? {} : { actual_start_at: now }),
+    },
+    derive: line.line_status !== "IN_PROGRESS",
+    report: {
+      type: "ONBOARD",
+      notes: "Pelanggan naik, perjalanan dimulai (aplikasi driver)",
+      at: now,
+      clientRef: opts.clientRef,
+    },
+  });
+  return toTrip(await ownLine(driverId, lineId));
+}
+
 /** Drop-off / done, like the bot's #finish (order then awaits finalization). */
 export async function finishTrip(
   driverId: string,
@@ -318,9 +347,9 @@ export async function finishTrip(
 ) {
   const line = await ownLine(driverId, lineId);
   if (line.line_status === "CANCELLED") throw new AppError("Trip was cancelled", 409);
-  // Finishing a trip that never departed also starts it: same payment rule.
-  if (notStarted(line) && !(await alreadyApplied(opts.clientRef)))
-    assertOrderPaidForTripStart(startPayment(line.order, line.order.service_items));
+  // Finishing a trip the customer never "boarded" in the app (older app
+  // versions have no such step) needs the same full payment.
+  await assertPaidToBoard(line, opts.clientRef);
   const now = eventTime(opts.occurredAt);
   const applied = await applyOnce(line, driverId, {
     guard: { line_status: { in: ["SCHEDULED", "ASSIGNED", "IN_PROGRESS"] } },
@@ -470,7 +499,9 @@ export async function addReport(
   let fileMime: string | null = null;
   if (photo) {
     let file = assertValidUpload(photo);
-    if (isArrival) file = await stampArrival(file, line, driverId, input);
+    // Older apps send a plain photo: the server adds the stamp. The GPS camera
+    // in newer apps stamps on the phone (stamped=true), so it is not doubled.
+    if (isArrival && !input.stamped) file = await stampArrival(file, line, driverId, input);
     const up = await uploadFile(file, {
       bucket: TRIP_BUCKET,
       prefix: `trip-reports/${lineId}`,

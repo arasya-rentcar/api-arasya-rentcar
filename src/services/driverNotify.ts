@@ -84,7 +84,7 @@ export async function notifyPayablesPaid(payableIds: string[]): Promise<void> {
 
 /**
  * The order just became paid in full: tell each internal driver whose day has
- * not started yet that they may depart (the app unlocks "Berangkat").
+ * not begun with the customer yet (the app unlocks "Mulai perjalanan").
  */
 export async function notifyOrderPaidInFull(orderId: string): Promise<void> {
   try {
@@ -104,8 +104,7 @@ export async function notifyOrderPaidInFull(orderId: string): Promise<void> {
             service_date: true,
             start_at: true,
             pickup_location: true,
-            actual_start_at: true,
-            trip_started_at: true,
+            customer_onboard_at: true,
           },
         },
       },
@@ -115,9 +114,9 @@ export async function notifyOrderPaidInFull(orderId: string): Promise<void> {
       (l) =>
         !l.is_external &&
         l.driver_id &&
-        (l.line_status === "SCHEDULED" || l.line_status === "ASSIGNED") &&
-        !l.actual_start_at &&
-        !l.trip_started_at,
+        l.line_status !== "DONE" &&
+        l.line_status !== "CANCELLED" &&
+        !l.customer_onboard_at,
     );
     const seen = new Set<string>();
     for (const l of waiting) {
@@ -125,7 +124,7 @@ export async function notifyOrderPaidInFull(orderId: string): Promise<void> {
       seen.add(l.driver_id!);
       await pushToDriver(l.driver_id!, {
         title: `Order ${order.order_code ?? ""} sudah lunas`.replace("  ", " "),
-        body: `Anda bisa berangkat sesuai jadwal: ${day(l.service_date ?? l.start_at)} ${time(l.start_at)} · ${l.pickup_location}`.trim(),
+        body: `Perjalanan bisa dimulai saat pelanggan naik: ${day(l.service_date ?? l.start_at)} ${time(l.start_at)} · ${l.pickup_location}`.trim(),
         data: { type: "order_paid", line_id: l.id, order_id: orderId },
       });
     }

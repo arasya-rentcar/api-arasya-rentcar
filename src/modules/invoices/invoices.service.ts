@@ -695,8 +695,8 @@ export async function markInvoicePaid(
   reportLeadPurchase(invoice.order_id).catch((err) =>
     console.error("GA4 purchase report failed:", err),
   );
-  // Paid in full just now: the assigned drivers may depart (app unlocks
-  // "Berangkat" and they get a notification).
+  // Paid in full just now: the assigned drivers may begin the trip with the
+  // customer (app unlocks "Mulai perjalanan") and get a notification.
   if (!startPayment(invoice.order, invoice.order.service_items).ready) {
     void notifyOrderPaidInFull(invoice.order_id);
   }

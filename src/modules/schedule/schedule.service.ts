@@ -3,7 +3,6 @@ import prisma from '../../prisma/client';
 import { AppError } from '../../utils/AppError';
 import {
   assertOrderPaidForDriverAssignment,
-  assertOrderPaidForTripStart,
   startPayment,
   startPaymentSelect,
 } from '../orders/assignment-guard';
@@ -52,8 +51,8 @@ const lineInclude = {
 } satisfies Prisma.OrderServiceItemInclude;
 
 /**
- * order.start_ready = the order is paid in full, so the trip may start (owner
- * rule; the driver app and the IN_PROGRESS edit enforce it). The order's day
+ * order.start_ready = the order is paid in full, so the trip with the customer
+ * may begin (owner rule; the driver app's "Mulai perjalanan" enforces it). The order's day
  * list loaded to compute it is dropped from the response.
  */
 function withStartReady<
@@ -189,7 +188,7 @@ export async function assignScheduleLine(
   const line = await prisma.orderServiceItem.findUnique({
     where: { id },
     include: {
-      order: { select: { payment_status: true, ...startPaymentSelect } },
+      order: { select: { payment_status: true } },
       payable: { select: { status: true, kind: true } },
     },
   });
@@ -202,18 +201,7 @@ export async function assignScheduleLine(
   if (!isExternal && input.driver_id && input.driver_id !== line.driver_id) {
     assertOrderPaidForDriverAssignment(line.order);
   }
-  // Marking an internal trip as started needs the order paid in full, like
-  // "Berangkat" in the driver app. Partner days are run from the dashboard and
-  // are not held back (same as the DP rule).
-  if (
-    !isExternal &&
-    input.line_status === 'IN_PROGRESS' &&
-    (line.line_status === 'SCHEDULED' || line.line_status === 'ASSIGNED') &&
-    !line.actual_start_at &&
-    !line.trip_started_at
-  ) {
-    assertOrderPaidForTripStart(startPayment(line.order, line.order.service_items));
-  }
+
 
   // Validate referenced entities exist (and respect internal/external mode).
   // These reads are independent, so run them concurrently — over the Supabase

@@ -1,4 +1,7 @@
 -- AlterTable
+ALTER TABLE "order_service_items" ADD COLUMN     "customer_onboard_at" TIMESTAMP(3);
+
+-- AlterTable
 ALTER TABLE "trip_reports" ADD COLUMN     "latitude" DOUBLE PRECISION,
 ADD COLUMN     "location_accuracy_m" INTEGER,
 ADD COLUMN     "location_at" TIMESTAMP(3),
