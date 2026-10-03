@@ -13,7 +13,7 @@ Needs the Postgres 16 binaries (`PG_BIN`, default `/usr/lib/postgresql/16/bin`).
 
 Output: one line per check. `PASS`/`FAIL` count towards the exit code. `KNOWN` is a documented issue that does not fail the run; it turns into `FIXED` once the behaviour is corrected, and should then become a normal `check`. The run exits 1 when any check fails.
 
-What is covered (about 220 checks):
+What is covered (about 224 checks):
 
 | Group | Covers |
 |---|---|
