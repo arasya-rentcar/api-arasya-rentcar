@@ -8,6 +8,7 @@ import {
 } from './payables.validation';
 import { recomputeLineMoney } from '../schedule/line-money.service';
 import { rollupOrderFinance } from '../schedule/schedule.service';
+import { notifyPayablesPaid } from '../../services/driverNotify';
 
 const payableInclude = {
   order: {
@@ -340,14 +341,16 @@ export async function markPayablePaid(id: string, input: MarkPayablePaidInput) {
   if (existing.status === 'PAID')
     throw new AppError('Payable is already paid', 409);
 
-  await prisma.payable.update({
-    where: { id },
+  // Conditional, so a double click pays (and notifies the driver) once.
+  const { count } = await prisma.payable.updateMany({
+    where: { id, status: 'UNPAID' },
     data: {
       status: 'PAID',
       paid_at: input.paid_at ? new Date(input.paid_at) : new Date(),
       payment_method: (input.payment_method as PaymentMethod) ?? null,
     },
   });
+  if (count === 1) void notifyPayablesPaid([id]);
   return prisma.payable.findUnique({ where: { id }, include: payableInclude });
 }
 
@@ -371,11 +374,24 @@ export async function markPayableUnpaid(id: string) {
 export async function bulkMarkPaid(ids: string[], paidAt?: string) {
   if (!ids.length) throw new AppError('No payable ids provided', 400);
   const when = paidAt ? new Date(paidAt) : new Date();
-  const res = await prisma.payable.updateMany({
+  // Row by row and conditional, so only the payables this call actually
+  // flipped are announced to their drivers.
+  const due = await prisma.payable.findMany({
     where: { id: { in: ids }, status: 'UNPAID' },
-    data: { status: 'PAID', paid_at: when },
+    select: { id: true },
   });
-  return { updated: res.count };
+  const paid: string[] = [];
+  await prisma.$transaction(async (tx) => {
+    for (const p of due) {
+      const { count } = await tx.payable.updateMany({
+        where: { id: p.id, status: 'UNPAID' },
+        data: { status: 'PAID', paid_at: when },
+      });
+      if (count === 1) paid.push(p.id);
+    }
+  }, { maxWait: 15000, timeout: 30000 });
+  void notifyPayablesPaid(paid);
+  return { updated: paid.length };
 }
 
 /** Payable history + rollup for one driver (used by Driver Detail page). */

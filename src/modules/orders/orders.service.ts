@@ -1,7 +1,7 @@
 import prisma from "../../prisma/client";
 import type { ScheduleStatus } from "@prisma/client";
 import { AppError } from "../../utils/AppError";
-import { assertOrderPaidForDriverAssignment } from "./assignment-guard";
+import { assertOrderPaidForDriverAssignment, startPayment } from "./assignment-guard";
 import {
   CreateOrderInput,
   UpdateOrderInput,
@@ -633,7 +633,8 @@ export async function getOrderById(id: string) {
   });
 
   if (!order) throw new AppError("Order not found", 404);
-  return order;
+  // Paid in full = trips may start (driver app "Berangkat"); see startPayment.
+  return { ...order, start_payment: startPayment(order, order.service_items) };
 }
 
 // Terminal orders are READ-ONLY for structural data. DONE and CANCELLED orders

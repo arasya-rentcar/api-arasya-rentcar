@@ -169,18 +169,19 @@ model User {
 }
 
 model Driver {
-  id             String             @id @default(uuid())
-  user_id        String             @unique
-  user           User               @relation(fields: [user_id], references: [id])
+  id             String               @id @default(uuid())
+  user_id        String               @unique
+  user           User                 @relation(fields: [user_id], references: [id])
   name           String
   phone          String
   email          String?
   location       String?
-  type           DriverType         @default(INTERNAL)
-  status         DriverStatus       @default(AVAILABLE)
+  type           DriverType           @default(INTERNAL)
+  status         DriverStatus         @default(AVAILABLE)
   reports        TripReport[]
   schedule_lines OrderServiceItem[]
   payables       Payable[]
+  notifications  DriverNotification[]
 
   @@index([phone])
   @@index([type])
@@ -746,6 +747,15 @@ model TripReport {
   amount                Decimal?          @db.Decimal(12, 2)
   created_at            DateTime          @default(now())
   expense               Expense?
+  // Where the phone was (2026-10-03): the arrival photo and the "sampai di
+  // lokasi jemput" step carry the GPS fix so the office can check the driver
+  // was really there. accuracy in metres; mocked = Android reported a fake
+  // (mock) location app; location_at = when the fix was taken.
+  latitude              Float?
+  longitude             Float?
+  location_accuracy_m   Int?
+  location_at           DateTime?
+  location_mocked       Boolean?
 
   @@index([order_id])
   @@index([order_service_item_id])
@@ -895,6 +905,24 @@ model WebLead {
 /// Expo push tokens of the mobile app installs, one row per device. Used to
 /// notify drivers (new trip, H-1 reminder) and admins (new website lead,
 /// trip started/finished). Tokens Expo reports as unregistered are deleted.
+/// Driver app inbox (2026-10-03): every push sent to a driver is also kept
+/// here, so the app can list it (new trip, reassigned, reminder, order paid in
+/// full, trip cost reviewed, fee paid) even when the push itself was missed.
+model DriverNotification {
+  id         String    @id @default(uuid())
+  driver_id  String
+  driver     Driver    @relation(fields: [driver_id], references: [id], onDelete: Cascade)
+  type       String
+  title      String
+  body       String
+  data       Json?
+  read_at    DateTime?
+  created_at DateTime  @default(now())
+
+  @@index([driver_id, created_at])
+  @@map("driver_notifications")
+}
+
 model DeviceToken {
   id           String   @id @default(uuid())
   user_id      String

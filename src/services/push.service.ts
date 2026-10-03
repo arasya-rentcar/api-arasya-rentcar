@@ -1,3 +1,4 @@
+import { Prisma } from "@prisma/client";
 import prisma from "../prisma/client";
 import { logger } from "../config/logger";
 
@@ -58,10 +59,29 @@ export async function pushToUsers(userIds: string[], msg: PushMessage): Promise<
   }
 }
 
+/**
+ * Push to a driver's phones and keep it in the app inbox (DriverNotification),
+ * so it can still be read when the push was missed (no signal, notifications
+ * off, phone replaced). `data.type` is the notification type.
+ */
 export async function pushToDriver(driverId: string, msg: PushMessage): Promise<void> {
   try {
     const driver = await prisma.driver.findUnique({ where: { id: driverId }, select: { user_id: true } });
-    if (driver) await pushToUsers([driver.user_id], msg);
+    if (!driver) return;
+    const type = typeof msg.data?.type === "string" ? msg.data.type : "info";
+    const row = await prisma.driverNotification.create({
+      data: {
+        driver_id: driverId,
+        type,
+        title: msg.title,
+        body: msg.body,
+        data: (msg.data ?? {}) as Prisma.InputJsonValue,
+      },
+    });
+    await pushToUsers([driver.user_id], {
+      ...msg,
+      data: { ...(msg.data ?? {}), notification_id: row.id },
+    });
   } catch (err) {
     logger.error({ err }, "push to driver failed");
   }

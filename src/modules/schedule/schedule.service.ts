@@ -1,7 +1,12 @@
 import { notifyNewTrips, notifyTripsRemoved } from '../../services/tripNotify';
 import prisma from '../../prisma/client';
 import { AppError } from '../../utils/AppError';
-import { assertOrderPaidForDriverAssignment } from '../orders/assignment-guard';
+import {
+  assertOrderPaidForDriverAssignment,
+  assertOrderPaidForTripStart,
+  startPayment,
+  startPaymentSelect,
+} from '../orders/assignment-guard';
 import { MARGIN_FORMULA_VERSION } from '../../utils/margin';
 import { staleTripCutoff } from '../../utils/wib';
 import { defaultDriverFee } from '../../utils/driverFee';
@@ -34,6 +39,8 @@ const lineInclude = {
       customer_name: true,
       order_status: true,
       payment_status: true,
+      // For order.start_ready (withStartReady): paid in full → may depart.
+      ...startPaymentSelect,
     },
   },
   driver: { select: { id: true, name: true, phone: true } },
@@ -43,6 +50,26 @@ const lineInclude = {
   // Extras on the day's payable also come off the margin (Edit Hari preview).
   payable: { select: { status: true, extras_amount: true } },
 } satisfies Prisma.OrderServiceItemInclude;
+
+/**
+ * order.start_ready = the order is paid in full, so the trip may start (owner
+ * rule; the driver app and the IN_PROGRESS edit enforce it). The order's day
+ * list loaded to compute it is dropped from the response.
+ */
+function withStartReady<
+  T extends {
+    order: {
+      paid_to_date: unknown;
+      service_items: { total_price: unknown; line_status: string }[];
+    };
+  },
+>(line: T) {
+  const { service_items, ...order } = line.order;
+  return {
+    ...line,
+    order: { ...order, start_ready: startPayment(line.order, service_items).ready },
+  };
+}
 
 const WIB_OFFSET_MS = 7 * 60 * 60 * 1000; // Asia/Jakarta is UTC+7, no DST.
 
@@ -133,7 +160,7 @@ export async function listSchedule(query: ListScheduleQuery) {
 
   // Attach the derived #A1/#A2 confirmation badge state to each line.
   const items = rawItems.map((it) => ({
-    ...it,
+    ...withStartReady(it),
     confirmation_state: deriveState(it),
   }));
 
@@ -162,7 +189,7 @@ export async function assignScheduleLine(
   const line = await prisma.orderServiceItem.findUnique({
     where: { id },
     include: {
-      order: { select: { payment_status: true } },
+      order: { select: { payment_status: true, ...startPaymentSelect } },
       payable: { select: { status: true, kind: true } },
     },
   });
@@ -174,6 +201,18 @@ export async function assignScheduleLine(
   // driver or re-saving the same one (editing notes/times/costs) stays allowed.
   if (!isExternal && input.driver_id && input.driver_id !== line.driver_id) {
     assertOrderPaidForDriverAssignment(line.order);
+  }
+  // Marking an internal trip as started needs the order paid in full, like
+  // "Berangkat" in the driver app. Partner days are run from the dashboard and
+  // are not held back (same as the DP rule).
+  if (
+    !isExternal &&
+    input.line_status === 'IN_PROGRESS' &&
+    (line.line_status === 'SCHEDULED' || line.line_status === 'ASSIGNED') &&
+    !line.actual_start_at &&
+    !line.trip_started_at
+  ) {
+    assertOrderPaidForTripStart(startPayment(line.order, line.order.service_items));
   }
 
   // Validate referenced entities exist (and respect internal/external mode).
@@ -413,7 +452,7 @@ export async function assignScheduleLine(
     void maybeAutoSendOnAssign(id);
   }
 
-  return { ...updated, confirmation_state: deriveState(updated) };
+  return { ...withStartReady(updated), confirmation_state: deriveState(updated) };
 }
 
 /**
@@ -1005,6 +1044,12 @@ export async function tripHistory(query: TripHistoryQuery) {
         amount: true,
         source: true,
         created_at: true,
+        // GPS fix of the arrival photo / "sampai di lokasi jemput".
+        latitude: true,
+        longitude: true,
+        location_accuracy_m: true,
+        location_at: true,
+        location_mocked: true,
       },
       orderBy: { created_at: 'asc' as const },
     },

@@ -1,7 +1,14 @@
 import { Router, Request, Response, NextFunction } from "express";
 import multer from "multer";
 import { verifyTokenMiddleware, requireRole } from "../../middleware/auth.middleware";
-import { actionSchema, finishSchema, reportSchema, tripsQuerySchema } from "./driver-app.validation";
+import {
+  actionSchema,
+  finishSchema,
+  notificationsQuerySchema,
+  readNotificationsSchema,
+  reportSchema,
+  tripsQuerySchema,
+} from "./driver-app.validation";
 import {
   acceptTrip,
   addReport,
@@ -9,7 +16,9 @@ import {
   driverForUser,
   finishTrip,
   getTrip,
+  listNotifications,
   listTrips,
+  markNotificationsRead,
   startTrip,
 } from "./driver-app.service";
 
@@ -49,7 +58,10 @@ const opts = (req: Request) => {
 };
 router.post("/trips/:id/accept", h((req, id) => acceptTrip(id, req.params.id, opts(req).occurredAt)));
 router.post("/trips/:id/start", h((req, id) => startTrip(id, req.params.id, opts(req))));
-router.post("/trips/:id/arrive", h((req, id) => arriveTrip(id, req.params.id, opts(req))));
+router.post("/trips/:id/arrive", h((req, id) => {
+  const b = actionSchema.parse(req.body ?? {});
+  return arriveTrip(id, req.params.id, { occurredAt: b.occurred_at, clientRef: b.client_ref, location: b });
+}));
 router.post("/trips/:id/finish", h((req, id) => {
   const b = finishSchema.parse(req.body ?? {});
   return finishTrip(id, req.params.id, { notes: b.notes, occurredAt: b.occurred_at, clientRef: b.client_ref });
@@ -59,5 +71,9 @@ router.post(
   upload.single("photo"),
   h((req, id) => addReport(id, req.params.id, reportSchema.parse(req.body), req.file ?? undefined)),
 );
+
+// Inbox: every push sent to this driver, newest first, plus the unread count.
+router.get("/notifications", h((req, id) => listNotifications(id, notificationsQuerySchema.parse(req.query))));
+router.post("/notifications/read", h((req, id) => markNotificationsRead(id, readNotificationsSchema.parse(req.body ?? {}))));
 
 export default router;

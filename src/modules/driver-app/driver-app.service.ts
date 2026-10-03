@@ -15,8 +15,15 @@ import {
   assertValidUpload,
   type UploadedFile,
 } from "../../services/storage.service";
-import type { ReportInput } from "./driver-app.validation";
+import type { ActionInput, ReportInput } from "./driver-app.validation";
 import { staleTripCutoff } from "../../utils/wib";
+import { stampPhoto } from "../../utils/photoStamp";
+import { logger } from "../../config/logger";
+import {
+  assertOrderPaidForTripStart,
+  startPayment,
+  startPaymentSelect,
+} from "../orders/assignment-guard";
 
 /**
  * Driver app: everything a driver does on their own trips (service-day lines
@@ -55,6 +62,8 @@ const tripInclude = {
       notes: true,
       passenger_count: true,
       customers: { select: { name: true, phone: true, is_primary: true } },
+      // Paid in full? (the driver sees only yes/no, never amounts)
+      ...startPaymentSelect,
     },
   },
   // Only what the driver sent (photos, receipts, notes), not the system rows.
@@ -88,6 +97,8 @@ function toTrip(l: LineWithTrip) {
     actual_pickup_at: l.actual_pickup_at,
     trip_finished_at: l.trip_finished_at,
     report_count: l._count.reports,
+    // Owner rule: the trip may start only once the order is paid in full.
+    payment_ready: startPayment(l.order, l.order.service_items).ready,
   };
 }
 
@@ -168,7 +179,10 @@ export async function getTrip(driverId: string, lineId: string) {
       type: e.type,
       amount: Number(e.amount),
       note: e.note,
+      // PENDING until the office checks the receipt; review_note says why a
+      // cost was rejected.
       status: e.status,
+      review_note: e.review_note,
       created_at: e.created_at,
     })),
   };
@@ -183,7 +197,36 @@ function toReport(r: Prisma.TripReportGetPayload<object>) {
     amount: r.amount == null ? null : Number(r.amount),
     created_at: r.created_at,
     is_system: SYSTEM_REPORTS.includes(r.report_type),
+    latitude: r.latitude,
+    longitude: r.longitude,
+    location_accuracy_m: r.location_accuracy_m,
   };
+}
+
+type LocationInput = Pick<
+  ActionInput,
+  "latitude" | "longitude" | "location_accuracy_m" | "location_at" | "location_mocked"
+>;
+
+/** GPS fix fields for a trip_reports row (all null when the phone sent none). */
+function locationData(loc: LocationInput = {}) {
+  if (loc.latitude == null || loc.longitude == null) return {};
+  return {
+    latitude: loc.latitude,
+    longitude: loc.longitude,
+    location_accuracy_m: loc.location_accuracy_m ?? null,
+    location_at: loc.location_at ? eventTime(loc.location_at) : null,
+    location_mocked: loc.location_mocked ?? null,
+  };
+}
+
+/** Not departed yet (the paid-in-full rule applies to the first move). */
+function notStarted(line: LineWithTrip) {
+  return (
+    (line.line_status === "SCHEDULED" || line.line_status === "ASSIGNED") &&
+    !line.actual_start_at &&
+    !line.trip_started_at
+  );
 }
 
 const TERMINAL: ScheduleStatus[] = ["DONE", "CANCELLED"];
@@ -215,6 +258,8 @@ export async function startTrip(driverId: string, lineId: string, opts: ActionOp
   const line = await ownLine(driverId, lineId);
   if (TERMINAL.includes(line.line_status))
     throw new AppError(`Trip is already ${line.line_status === "DONE" ? "finished" : "cancelled"}`, 409);
+  if (notStarted(line) && !(await alreadyApplied(opts.clientRef)))
+    assertOrderPaidForTripStart(startPayment(line.order, line.order.service_items));
   const now = eventTime(opts.occurredAt);
   const applied = await applyOnce(line, driverId, {
     guard: { line_status: { in: ["SCHEDULED", "ASSIGNED"] } },
@@ -238,8 +283,15 @@ export async function startTrip(driverId: string, lineId: string, opts: ActionOp
   return toTrip(await ownLine(driverId, lineId));
 }
 
-/** Arrived at the pickup point. */
-export async function arriveTrip(driverId: string, lineId: string, opts: ActionOpts = {}) {
+/**
+ * Arrived at the pickup point. The app sends the phone's GPS fix with it (and
+ * an ARRIVAL_PHOTO report), kept on the ARRIVE_CUSTOMER row for the office.
+ */
+export async function arriveTrip(
+  driverId: string,
+  lineId: string,
+  opts: ActionOpts & { location?: LocationInput } = {},
+) {
   const line = await ownLine(driverId, lineId);
   if (TERMINAL.includes(line.line_status))
     throw new AppError(`Trip is already ${line.line_status === "DONE" ? "finished" : "cancelled"}`, 409);
@@ -252,6 +304,7 @@ export async function arriveTrip(driverId: string, lineId: string, opts: ActionO
       notes: "Tiba di lokasi jemput (aplikasi driver)",
       at: now,
       clientRef: opts.clientRef,
+      location: opts.location,
     },
   });
   return toTrip(await ownLine(driverId, lineId));
@@ -265,6 +318,9 @@ export async function finishTrip(
 ) {
   const line = await ownLine(driverId, lineId);
   if (line.line_status === "CANCELLED") throw new AppError("Trip was cancelled", 409);
+  // Finishing a trip that never departed also starts it: same payment rule.
+  if (notStarted(line) && !(await alreadyApplied(opts.clientRef)))
+    assertOrderPaidForTripStart(startPayment(line.order, line.order.service_items));
   const now = eventTime(opts.occurredAt);
   const applied = await applyOnce(line, driverId, {
     guard: { line_status: { in: ["SCHEDULED", "ASSIGNED", "IN_PROGRESS"] } },
@@ -301,6 +357,11 @@ export interface ActionOpts {
   clientRef?: string;
 }
 
+/** A resend of an action the server already recorded (answered as a no-op). */
+async function alreadyApplied(clientRef?: string) {
+  return !!clientRef && !!(await prisma.tripReport.findUnique({ where: { client_ref: clientRef } }));
+}
+
 function isUniqueViolation(err: unknown): boolean {
   return err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002";
 }
@@ -323,7 +384,13 @@ async function applyOnce(
     guard: Prisma.OrderServiceItemWhereInput;
     data: Prisma.OrderServiceItemUncheckedUpdateManyInput;
     derive?: boolean;
-    report?: { type: string; notes: string; at: Date; clientRef?: string };
+    report?: {
+      type: string;
+      notes: string;
+      at: Date;
+      clientRef?: string;
+      location?: LocationInput;
+    };
   },
 ): Promise<boolean> {
   const clientRef = step.report?.clientRef;
@@ -352,6 +419,7 @@ async function applyOnce(
             status: "MATCHED",
             created_at: step.report.at,
             client_ref: clientRef ?? null,
+            ...locationData(step.report.location),
           },
         });
       }
@@ -388,10 +456,21 @@ export async function addReport(
   const line = await ownLine(driverId, lineId);
   if (line.line_status === "CANCELLED") throw new AppError("Trip was cancelled", 409);
 
+  const costType = COST_TYPES[input.report_type];
+  // amount = rupiah for cost receipts, or the km reading for odometer photos.
+  const isOdometer = input.report_type.startsWith("ODOMETER");
+  const amount = (costType || isOdometer) && input.amount ? input.amount : null;
+  if (isOdometer) await assertOdometerOrder(lineId, input.report_type, amount, !!photo);
+  const isArrival = input.report_type === "ARRIVAL_PHOTO";
+  if (isArrival && (!photo || input.latitude == null)) {
+    throw new AppError("Foto sampai lokasi perlu foto dan lokasi GPS.", 400);
+  }
+
   let fileUrl: string | null = null;
   let fileMime: string | null = null;
   if (photo) {
-    const file = assertValidUpload(photo);
+    let file = assertValidUpload(photo);
+    if (isArrival) file = await stampArrival(file, line, driverId, input);
     const up = await uploadFile(file, {
       bucket: TRIP_BUCKET,
       prefix: `trip-reports/${lineId}`,
@@ -400,10 +479,6 @@ export async function addReport(
     fileUrl = up.publicUrl;
     fileMime = file.mimetype;
   }
-  const costType = COST_TYPES[input.report_type];
-  // amount = rupiah for cost receipts, or the km reading for odometer photos.
-  const isOdometer = input.report_type.startsWith("ODOMETER");
-  const amount = (costType || isOdometer) && input.amount ? input.amount : null;
 
   const at = eventTime(input.occurred_at);
   let report;
@@ -426,6 +501,7 @@ export async function addReport(
         source: "API",
         status: "MATCHED",
         created_at: at,
+        ...locationData(input),
       },
     });
     if (costType && amount) {
@@ -456,4 +532,122 @@ export async function addReport(
   }
   await refreshOrderSummary(line.order_id);
   return toReport(report);
+}
+
+/**
+ * Odometer photos come in order: one start reading, then one end reading that
+ * is not lower. The app enforces the same; this keeps resends from another
+ * phone or an old app version honest.
+ */
+async function assertOdometerOrder(
+  lineId: string,
+  type: string,
+  km: number | null,
+  hasPhoto: boolean,
+) {
+  if (!hasPhoto || km == null) {
+    throw new AppError("Foto odometer perlu foto dan angka kilometer.", 400);
+  }
+  const sent = await prisma.tripReport.findMany({
+    where: { order_service_item_id: lineId, report_type: { in: ["ODOMETER_START", "ODOMETER_END"] } },
+    select: { report_type: true, amount: true },
+  });
+  const start = sent.find((r) => r.report_type === "ODOMETER_START");
+  if (type === "ODOMETER_START") {
+    if (start) throw new AppError("Foto odometer awal sudah terkirim untuk tugas ini.", 409);
+    return;
+  }
+  if (!start) throw new AppError("Kirim foto odometer awal dulu, baru odometer akhir.", 409);
+  if (sent.some((r) => r.report_type === "ODOMETER_END")) {
+    throw new AppError("Foto odometer akhir sudah terkirim untuk tugas ini.", 409);
+  }
+  if (start.amount != null && km < Number(start.amount)) {
+    throw new AppError(
+      `Angka odometer akhir (${km} km) lebih kecil dari odometer awal (${Number(start.amount)} km).`,
+      409,
+    );
+  }
+}
+
+const WIB_STAMP: Intl.DateTimeFormatOptions = {
+  timeZone: "Asia/Jakarta",
+  weekday: "short",
+  day: "numeric",
+  month: "short",
+  year: "numeric",
+  hour: "2-digit",
+  minute: "2-digit",
+};
+
+/**
+ * Burns driver, order, WIB time and GPS fix into the arrival photo. If the
+ * photo cannot be decoded it is stored as sent (the GPS fix is on the row
+ * anyway), so a driver is never blocked by it.
+ */
+async function stampArrival(
+  file: UploadedFile,
+  line: LineWithTrip,
+  driverId: string,
+  input: ReportInput,
+): Promise<UploadedFile> {
+  try {
+    const driver = await prisma.driver.findUnique({ where: { id: driverId }, select: { name: true } });
+    const at = eventTime(input.location_at ?? input.occurred_at);
+    const acc = input.location_accuracy_m != null ? ` (akurasi ${input.location_accuracy_m} m)` : "";
+    const buffer = await stampPhoto(file.buffer, [
+      `SAMPAI DI LOKASI JEMPUT | ${line.order.order_code ?? ""}`,
+      `Driver: ${driver?.name ?? "-"}`,
+      `${at.toLocaleString("id-ID", WIB_STAMP)} WIB`,
+      `GPS ${input.latitude!.toFixed(6)}, ${input.longitude!.toFixed(6)}${acc}`,
+      `Jemput: ${line.pickup_location}`,
+    ]);
+    return { ...file, buffer, size: buffer.length, mimetype: "image/jpeg" };
+  } catch (err) {
+    logger.warn({ err, lineId: line.id }, "arrival photo stamp failed; stored unstamped");
+    return file;
+  }
+}
+
+/** The driver's inbox, newest first (page with `before` = last created_at). */
+export async function listNotifications(
+  driverId: string,
+  q: { before?: string; limit: number },
+) {
+  const [items, unread] = await Promise.all([
+    prisma.driverNotification.findMany({
+      where: { driver_id: driverId, ...(q.before ? { created_at: { lt: new Date(q.before) } } : {}) },
+      orderBy: { created_at: "desc" },
+      take: q.limit,
+    }),
+    prisma.driverNotification.count({ where: { driver_id: driverId, read_at: null } }),
+  ]);
+  return {
+    unread,
+    items: items.map((n) => ({
+      id: n.id,
+      type: n.type,
+      title: n.title,
+      body: n.body,
+      data: n.data,
+      read: !!n.read_at,
+      created_at: n.created_at,
+    })),
+  };
+}
+
+/** Mark some (ids) or all of the driver's notifications as read. */
+export async function markNotificationsRead(
+  driverId: string,
+  input: { ids?: string[]; all?: boolean },
+) {
+  const { count } = await prisma.driverNotification.updateMany({
+    where: {
+      driver_id: driverId,
+      read_at: null,
+      ...(input.all ? {} : { id: { in: input.ids ?? [] } }),
+    },
+    data: { read_at: new Date() },
+  });
+  const unread = await prisma.driverNotification.count({ where: { driver_id: driverId, read_at: null } });
+  return { updated: count, unread };
 }

@@ -1,4 +1,6 @@
 import { waLink, waManual } from "../../utils/waManual";
+import { startPayment } from "../orders/assignment-guard";
+import { notifyOrderPaidInFull } from "../../services/driverNotify";
 import { reportLeadPurchase } from "../../services/ga4.service";
 import prisma from "../../prisma/client";
 import { AppError } from "../../utils/AppError";
@@ -693,6 +695,11 @@ export async function markInvoicePaid(
   reportLeadPurchase(invoice.order_id).catch((err) =>
     console.error("GA4 purchase report failed:", err),
   );
+  // Paid in full just now: the assigned drivers may depart (app unlocks
+  // "Berangkat" and they get a notification).
+  if (!startPayment(invoice.order, invoice.order.service_items).ready) {
+    void notifyOrderPaidInFull(invoice.order_id);
+  }
 
   return paid;
 }

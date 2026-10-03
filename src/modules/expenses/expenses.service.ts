@@ -2,6 +2,7 @@ import prisma from '../../prisma/client';
 import { AppError } from '../../utils/AppError';
 import { billedToCustomerByPackage } from '../../utils/driverFee';
 import { recomputeLineMoney } from '../schedule/line-money.service';
+import { notifyExpenseRejected } from '../../services/driverNotify';
 import { rollupOrderFinance } from '../schedule/schedule.service';
 import { CreateExpenseInput, UpdateExpenseInput } from './expenses.validation';
 
@@ -142,7 +143,7 @@ export async function updateExpense(
   }
 
   const reviewer = await reviewerName(userId);
-  return prisma.$transaction(
+  const updated = await prisma.$transaction(
     async (tx) => {
       await tx.expense.update({
         where: { id: expenseId },
@@ -169,6 +170,12 @@ export async function updateExpense(
     },
     { maxWait: 15000, timeout: 30000 },
   );
+  // The driver hears about a rejected receipt (approvals show up as the
+  // reimbursement in the fee payment).
+  if (input.status === 'REJECTED' && e.status !== 'REJECTED') {
+    void notifyExpenseRejected(expenseId);
+  }
+  return updated;
 }
 
 /** Delete a cost the admin added. Driver reports are rejected, not deleted. */
