@@ -48,3 +48,24 @@ export async function notifyTripsRemoved(driverId: string, lineIds: string[]): P
     console.error("notifyTripsRemoved failed", err);
   }
 }
+
+/** The admin moved the date, time or place of trips already given to a driver. */
+export async function notifyTripsChanged(driverId: string, lineIds: string[]): Promise<void> {
+  try {
+    if (!lineIds.length) return;
+    const lines = await prisma.orderServiceItem.findMany({
+      where: { id: { in: lineIds }, driver_id: driverId, is_external: false },
+      orderBy: [{ service_date: "asc" }, { start_at: "asc" }],
+      select: { id: true, service_date: true, start_at: true, pickup_location: true },
+    });
+    if (!lines.length) return;
+    const first = lines[0];
+    await pushToDriver(driverId, {
+      title: lines.length === 1 ? "Jadwal tugas diubah" : `${lines.length} jadwal tugas diubah`,
+      body: `${when(first.service_date, first.start_at)} · jemput di ${first.pickup_location}. Buka tugas untuk melihat perubahan.`,
+      data: { type: "trip_changed", line_id: first.id },
+    });
+  } catch (err) {
+    console.error("notifyTripsChanged failed", err);
+  }
+}

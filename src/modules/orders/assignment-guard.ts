@@ -54,3 +54,20 @@ export const startPaymentSelect = {
   paid_to_date: true,
   service_items: { select: { total_price: true, line_status: true } },
 } as const;
+
+/**
+ * payment_status from the money received and the order total: PAID once the
+ * total is covered, DP_PAID while some money is in, UNPAID otherwise. The one
+ * rule for every place that changes either number (payments, the order total
+ * after days or charges change, cancellation).
+ */
+export function paymentStatusFor(
+  paidToDate: unknown,
+  orderTotal: unknown,
+): "UNPAID" | "DP_PAID" | "PAID" {
+  const paid = Number(paidToDate ?? 0);
+  const total = Number(orderTotal ?? 0);
+  if (total > 0 && paid >= total) return "PAID";
+  if (paid > 0) return "DP_PAID";
+  return "UNPAID";
+}

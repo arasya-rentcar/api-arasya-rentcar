@@ -124,6 +124,13 @@ await section('A. Invoice revision and payment_status (T2)', async () => {
   const full = await invoice(o2.id, 'FULL', 1_000_000);
   await call('POST', `/orders/${o2.id}/invoice/${full.data.id}/revise`, { token: admin, body: { amount: 900_000 } });
   check('A8 revising an unpaid FULL invoice keeps UNPAID', (await order(o2.id)).payment_status === 'UNPAID');
+  const o3 = await makeOrder('A9');
+  await payFull(o3);
+  const up = await call('PUT', `/orders/${o3.id}`, { token: admin, body: editBody(o3, { reason: 'naik harga', days: [{ id: o3.service_items[0].id, unit_price: 1_200_000 }] }) });
+  const a9 = await order(o3.id);
+  check('A9 Edit Order raises the total of a paid order → DP_PAID', up.status === 200 && a9.payment_status === 'DP_PAID' && Number(a9.final_price) === 1200000, a9.payment_status);
+  await call('PUT', `/orders/${o3.id}`, { token: admin, body: editBody(a9, { reason: 'kembali', days: [{ id: o3.service_items[0].id, unit_price: 1_000_000 }] }) });
+  check('A10 back to the paid amount → PAID', (await order(o3.id)).payment_status === 'PAID');
 });
 
 // ── B. Assignment paths (T4: current behaviour, update when decided) ───────
@@ -249,6 +256,38 @@ await section('C. Edit Order on a running order (T1)', async () => {
   const raceLine = (await order(race.id)).service_items[0];
   check('C25 Edit Order + "Berangkat" at once: both succeed, day kept and started', er.status === 200 && sr.status === 200 && raceLine.line_status === 'IN_PROGRESS' && raceLine.pickup_location === 'Gerbang Tol Bogor', `${er.status}/${sr.status}`);
   await act(d3, ro.service_items[0].id, 'finish');
+
+  // The same "add a day" save sent twice at once: one day, not two.
+  const dbl = await makeOrder('C26', { startDay: 9 });
+  const dblBody = editBody(dbl, { reason: 'tambah hari', days: [{ id: dbl.service_items[0].id }, { service_date: wibIso(10, '00:00'), start_at: wibIso(10, '08:00'), end_at: wibIso(10, '20:00'), unit_price: 1_000_000 }] });
+  const [s1, s2] = await Promise.all([
+    call('PUT', `/orders/${dbl.id}`, { token: admin, body: dblBody }),
+    call('PUT', `/orders/${dbl.id}`, { token: admin, body: dblBody }),
+  ]);
+  check('C26 double "add a day" save: one 200, one 409, one new day', [s1.status, s2.status].sort().join() === '200,409' && (await order(dbl.id)).service_items.length === 2, `${s1.status}/${s2.status}`);
+
+  // Moving a day already given to a driver: driver told, confirmation to resend.
+  const mv = await order(o.id);
+  await call('POST', `/schedule/lines/${lineId}/send-confirmation`, { token: admin, body: {} });
+  const before = await prisma.orderServiceItem.findUnique({ where: { id: lineId } });
+  const moved = await call('PUT', `/orders/${o.id}`, { token: admin, body: editBody(mv, { days: [{ id: lineId, start_at: wibIso(0, '10:30') }] }) });
+  await sleep(600);
+  const afterMove = await prisma.orderServiceItem.findUnique({ where: { id: lineId } });
+  check('C27 moving a driver\'s day: confirmation reset, driver told "Jadwal tugas diubah"', moved.status === 200 && !!before.confirmation_sent_at && !afterMove.confirmation_sent_at && (await pushesTo(d1)).some((x) => x.title === 'Jadwal tugas diubah'), moved.json?.message);
+
+  // Removing the last open day would cancel the order: use Batalkan Pesanan.
+  const lc = await makeOrder('C28', { days: 2, startDay: 11 });
+  await putLine(lc.service_items[0].id, { is_external: false, line_status: 'CANCELLED' });
+  const lcRes = await call('PUT', `/orders/${lc.id}`, { token: admin, body: editBody(await order(lc.id), { reason: 'hapus', days: [{ id: lc.service_items[0].id }] }) });
+  check('C28 removing the last open day refused (409), order not cancelled', lcRes.status === 409 && (await order(lc.id)).order_status !== 'CANCELLED', lcRes.json?.message);
+
+  // A cancelled day that kept its driver stays on the order, with a clear message.
+  const cd = await makeOrder('C29', { days: 2, startDay: 12 });
+  await payDp(cd, 400_000);
+  await putLine(cd.service_items[0].id, { is_external: false, driver_id: d3.id, line_status: 'ASSIGNED' });
+  await putLine(cd.service_items[0].id, { is_external: false, line_status: 'CANCELLED' });
+  const cdRes = await call('PUT', `/orders/${cd.id}`, { token: admin, body: editBody(await order(cd.id), { reason: 'hapus', days: [{ id: cd.service_items[1].id }] }) });
+  check('C29 cancelled day with a driver cannot be removed; message says it stays', cdRes.status === 409 && /sudah dibatalkan/.test(cdRes.json?.message ?? ''), cdRes.json?.message);
 });
 
 // ── D. Full driver flow ────────────────────────────────────────────────────
@@ -408,6 +447,22 @@ await section('G. Payments (T3)', async () => {
   await markPaid(o5.id, fee.id, { amount_received: 50_000 });
   const ord5 = await order(o5.id);
   check('G15 paid_to_date keeps the DP of a cancelled order (200.000 + 50.000)', c5.status === 200 && Number(ord5.paid_to_date) === 250000, String(ord5.paid_to_date));
+  const stmt = await call('POST', `/orders/${o5.id}/statement`, { token: admin, body: {} });
+  check('G16 statement counts the same money (250.000)', stmt.status === 200 && Number(stmt.data.total_received) === 250000, JSON.stringify(stmt.data ?? stmt.json).slice(0, 120));
+  const o6 = await makeOrder('G17');
+  const i6 = await invoice(o6.id, 'DP', 200_000);
+  check('G17 invalid paid_at refused (400), nothing recorded', (await markPaid(o6.id, i6.data.id, { paid_at: '03/10/2026 abc' })).status === 400 && (await prisma.receipt.count({ where: { invoice_id: i6.data.id } })) === 0);
+  // Two payments that together make the order paid in full: one "lunas" push.
+  const o7 = await makeOrder('G18', { startDay: 1 });
+  await payDp(o7, 200_000);
+  await putLine(o7.service_items[0].id, { is_external: false, driver_id: d3.id, line_status: 'ASSIGNED' });
+  const s7a = await invoice(o7.id, 'SETTLEMENT', 400_000);
+  const s7b = await invoice(o7.id, 'SETTLEMENT', 400_000);
+  await Promise.all([markPaid(o7.id, s7a.data.id), markPaid(o7.id, s7b.data.id)]);
+  await sleep(800);
+  const code7 = (await order(o7.id)).order_code;
+  const lunas = (await pushesTo(d3)).filter((x) => x.title.includes(code7) && /sudah lunas/.test(x.title));
+  check('G18 two payments completing the order at once: one "sudah lunas" push', lunas.length === 1, `pushes ${lunas.length}`);
 });
 
 // ── H. Website leads ───────────────────────────────────────────────────────
@@ -480,7 +535,7 @@ await section('J. Phone clock, stale trips, packages, cancel on day H', async ()
   await call('PATCH', `/lines/expenses/${e.id}`, { token: admin, body: { status: 'APPROVED' } });
   const oa = await order(o.id);
   check('J4 approved XOPS fuel → billable charge, final_price 1.300.000', oa.adjustments.some((x) => x.created_by === 'Biaya perjalanan') && Number(oa.final_price) === 1300000);
-  check('J5 [N2] payment_status not recomputed when charges raise final_price', oa.payment_status === 'PAID' && oa.start_payment.ready === true);
+  check('J5 billed charge raises the total: payment_status back to DP_PAID, trip stays unlocked', oa.payment_status === 'DP_PAID' && oa.start_payment.ready === true, oa.payment_status);
   const edit = await call('PUT', `/orders/${o.id}`, { token: admin, body: editBody(oa, { notes: 'x' }) });
   check('J5b Edit Order with charges: no reason needed, total stays 1.300.000', edit.status === 200 && Number((await order(o.id)).final_price) === 1300000, `${edit.status} ${edit.json?.message ?? ''}`);
   check('J6 deleting a driver receipt refused (409)', (await call('DELETE', `/lines/expenses/${e.id}`, { token: admin })).status === 409);
