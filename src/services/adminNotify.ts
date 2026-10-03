@@ -39,7 +39,8 @@ const join = (parts: (string | null | undefined)[]) => parts.filter((p) => p && 
 
 export const rupiah = (n: number) => `Rp ${Math.round(Math.abs(n)).toLocaleString("id-ID")}`;
 export const orderLink = (orderId: string) => `/dashboard/orders/${orderId}`;
-export const driverLink = (driverId: string) => `/dashboard/drivers/${driverId}`;
+// Driver requests are handled ("Tandai sudah top-up") on the notifications page.
+export const requestsLink = "/dashboard/notifications";
 
 export async function notifyAdmins(n: AdminNotice): Promise<void> {
   try {
@@ -204,7 +205,7 @@ export async function notifyDriverRequest(r: {
         "Tanpa keterangan",
       driver_id: r.driver_id,
       driver_request_id: r.id,
-      link: driverLink(r.driver_id),
+      link: requestsLink,
     });
   } catch (err) {
     logger.error({ err, requestId: r.id }, "driver request notification failed");
