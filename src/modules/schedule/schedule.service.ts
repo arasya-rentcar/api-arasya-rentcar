@@ -161,7 +161,10 @@ export async function assignScheduleLine(
 ) {
   const line = await prisma.orderServiceItem.findUnique({
     where: { id },
-    include: { order: { select: { payment_status: true } } },
+    include: {
+      order: { select: { payment_status: true } },
+      payable: { select: { status: true, kind: true } },
+    },
   });
   if (!line) throw new AppError('Schedule line not found', 404);
 
@@ -208,14 +211,19 @@ export async function assignScheduleLine(
   }
 
   // ── Driver pay (2026-10-03) ───────────────────────────────────────────
-  // undefined = leave as is. Older dashboards send "Biaya Ops", which was the
-  // driver's pay, so it stands in for driver_fee on internal days.
+  // undefined = leave as is. Older dashboards send "Biaya Ops" on every save,
+  // prefilled with the line's ops_cost (now Arasya's share of the approved
+  // trip costs). Only a value the admin actually changed stands in for
+  // driver_fee (it used to be the driver's pay); sending the shown value back
+  // must not wipe the fee.
+  const legacyFee =
+    !isExternal &&
+    input.ops_cost !== undefined &&
+    input.ops_cost !== Number(line.ops_cost ?? 0)
+      ? input.ops_cost
+      : undefined;
   let fee: number | null | undefined =
-    input.driver_fee !== undefined
-      ? input.driver_fee
-      : !isExternal && input.ops_cost !== undefined
-        ? input.ops_cost
-        : undefined;
+    input.driver_fee !== undefined ? input.driver_fee : legacyFee;
   let feeNote: string | null | undefined = input.driver_fee_note;
   let rtr: number | null | undefined = input.rtr_amount;
   const feeGiven = fee !== undefined;
@@ -257,12 +265,33 @@ export async function assignScheduleLine(
   const becomesCancelled =
     input.line_status === 'CANCELLED' && line.line_status !== 'CANCELLED';
   const started = !!(line.actual_start_at || line.trip_started_at);
+  const paidPayable =
+    line.payable?.status === 'PAID' ? line.payable.kind : null;
   if (becomesCancelled && !started) {
-    if (!isExternal && !feeGiven) {
+    // A day already paid out keeps its amounts (history); the admin marks it
+    // unpaid first in Utang if the money has to come back.
+    if (!isExternal && !feeGiven && paidPayable !== 'DRIVER') {
       fee = 0;
       feeNote = 'Dibatalkan sebelum berangkat';
     }
-    if (isExternal && input.rtr_amount === undefined) rtr = 0;
+    if (isExternal && input.rtr_amount === undefined && paidPayable !== 'VENDOR')
+      rtr = 0;
+  }
+
+  // The amounts of a day already paid out are frozen, like its payable.
+  const changes = (next: number | null | undefined, cur: unknown) =>
+    next !== undefined && Number(next ?? 0) !== Number(cur ?? 0);
+  if (
+    (paidPayable === 'DRIVER' &&
+      !isExternal &&
+      (changes(fee, line.driver_fee) ||
+        changes(input.travel_advance, line.travel_advance))) ||
+    (paidPayable === 'VENDOR' && isExternal && changes(rtr, line.rtr_amount))
+  ) {
+    throw new AppError(
+      'Hari ini sudah dibayar. Tandai belum terbayar dulu di menu Utang bila fee, uang jalan atau RTR-nya berubah.',
+      409,
+    );
   }
 
   const data: Prisma.OrderServiceItemUncheckedUpdateInput = {
