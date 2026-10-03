@@ -8,6 +8,9 @@ const orderCustomerSchema = z.object({
 
 const orderServiceItemSchema = z
   .object({
+    // Edit Order: the existing day this row is (absent = a new day). Ignored
+    // when creating an order.
+    id: z.string().uuid().optional(),
     service_date: z.string().datetime().optional(),
     start_at: z.string().datetime().optional(),
     end_at: z.string().datetime().optional(),
@@ -90,7 +93,8 @@ export const updateOrderSchema = z
     is_external: z.boolean().optional(),
     external_vendor_id: z.string().uuid().optional(),
     external_car_id: z.string().uuid().optional(),
-    payment_status: z.enum(["UNPAID", "DP_PAID", "PAID"]).optional(),
+    // payment_status is not editable here: it follows the money recorded on
+    // invoices (markInvoicePaid), which the owner's DP rule depends on.
     change_reason: z.string().optional(),
   })
   .refine(
