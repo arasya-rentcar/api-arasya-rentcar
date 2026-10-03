@@ -3,6 +3,7 @@ import prisma from '../../prisma/client';
 import { AppError } from '../../utils/AppError';
 import {
   assertOrderPaidForDriverAssignment,
+  netPaid,
   paymentStatusFor,
   startPayment,
   startPaymentSelect,
@@ -450,6 +451,10 @@ export async function rollupOrderFinance(
   tx: Prisma.TransactionClient,
   orderId: string,
 ) {
+  // Lock the order row (day → order, like every caller) so a payment
+  // recorded meanwhile cannot slip between reading the money and writing
+  // payment_status below.
+  await tx.$queryRaw`SELECT id FROM "orders" WHERE id = ${orderId} FOR NO KEY UPDATE`;
   const order = await tx.order.findUnique({
     where: { id: orderId },
     select: {
@@ -457,6 +462,8 @@ export async function rollupOrderFinance(
       final_price: true,
       paid_to_date: true,
       payment_status: true,
+      is_refunded: true,
+      refund_amount: true,
       invoices: {
         where: {
           invoice_type: 'CANCELLATION_FEE',
@@ -516,8 +523,13 @@ export async function rollupOrderFinance(
 
   // payment_status follows the money received against the (new) total, so an
   // order whose total grows (a day added, a charge billed) is no longer shown
-  // as paid. A cancelled order's status is set by cancelOrder.
-  const paymentStatus = paymentStatusFor(order.paid_to_date, finalPrice);
+  // as paid. A cancelled order's status is set by cancelOrder. Orders whose
+  // payment was recorded without paid_to_date (sheet imports) keep theirs.
+  const legacyPaid =
+    Number(order.paid_to_date ?? 0) === 0 && order.payment_status !== "UNPAID";
+  const paymentStatus = legacyPaid
+    ? order.payment_status
+    : paymentStatusFor(netPaid(order), finalPrice);
   await tx.order.update({
     where: { id: orderId },
     data: cancelledOrder

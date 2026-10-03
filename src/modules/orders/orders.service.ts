@@ -1,7 +1,12 @@
 import prisma from "../../prisma/client";
 import { Prisma, type ScheduleStatus } from "@prisma/client";
 import { AppError } from "../../utils/AppError";
-import { assertOrderPaidForDriverAssignment, paymentStatusFor, startPayment } from "./assignment-guard";
+import {
+  assertOrderPaidForDriverAssignment,
+  netPaid,
+  paymentStatusFor,
+  startPayment,
+} from "./assignment-guard";
 import {
   CreateOrderInput,
   UpdateOrderInput,
@@ -839,11 +844,28 @@ const dayForEditSelect = {
 } as const;
 
 type DayForEdit = Prisma.OrderServiceItemGetPayload<{ select: typeof dayForEditSelect }>;
+// Compile-time guard: every content field is read (else it would look changed).
+const _everyContentFieldSelected: Record<
+  Exclude<(typeof DAY_CONTENT_FIELDS)[number], keyof typeof dayForEditSelect>,
+  never
+> = {};
+void _everyContentFieldSelected;
 
-function sameValue(a: unknown, b: unknown): boolean {
+const wibYmd = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Jakarta" });
+
+/**
+ * Same value for the order form? A service date is the WIB calendar day (the
+ * form sends WIB midnight; older days may hold another hour of that day);
+ * times are compared to the minute (the form has no seconds).
+ */
+function sameValue(field: string, a: unknown, b: unknown): boolean {
   if (a == null || b == null) return a == null && b == null;
-  if (a instanceof Date || b instanceof Date)
-    return new Date(a as Date).getTime() === new Date(b as Date).getTime();
+  if (a instanceof Date || b instanceof Date) {
+    const x = new Date(a as Date);
+    const y = new Date(b as Date);
+    if (field === "service_date") return wibYmd.format(x) === wibYmd.format(y);
+    return Math.floor(x.getTime() / 60000) === Math.floor(y.getTime() / 60000);
+  }
   if (typeof a === "object" || typeof b === "object") return Number(a) === Number(b); // Decimal
   return a === b;
 }
@@ -909,7 +931,7 @@ export async function updateOrder(id: string, input: UpdateOrderInput) {
       for (const f of DAY_CONTENT_FIELDS) {
         if (f === "driver_origin_location" && service_items[i].driver_origin_location === undefined)
           continue;
-        if (!sameValue(data[f], line[f])) (changed as Record<string, unknown>)[f] = data[f];
+        if (!sameValue(f, data[f], line[f])) (changed as Record<string, unknown>)[f] = data[f];
       }
       if (Object.keys(changed).length > 0) {
         updates.push({
@@ -948,8 +970,30 @@ export async function updateOrder(id: string, input: UpdateOrderInput) {
     days = { updates, creates, deletes: removed.map((l) => l.id) };
   }
 
-  // With service days the total always follows them (rollupOrderFinance).
+  // The total follows the days and billable charges (rollupOrderFinance); it
+  // is changed through the days' prices, never set on its own.
   const { final_price: requestedPrice, ...orderFields } = updateData;
+  if (!days && requestedPrice !== undefined && order.service_items.length > 0) {
+    throw new AppError(
+      "Harga order mengikuti harga per hari. Ubah harga di baris hari layanan.",
+      400,
+    );
+  }
+  // Did the admin change prices? (What the form asks a reason for: a day's
+  // price, or a priced day added or removed.)
+  const pricesChanged =
+    !!days &&
+    (days.updates.some((u) => "total_price" in u.data && u.line.line_status !== "CANCELLED") ||
+      days.creates.some((d) => Number(d.total_price ?? 0) !== 0) ||
+      order.service_items.some(
+        (l) =>
+          days!.deletes.includes(l.id) &&
+          l.line_status !== "CANCELLED" &&
+          Number(l.total_price ?? 0) !== 0,
+      ));
+  if (pricesChanged && !change_reason?.trim()) {
+    throw new AppError("change_reason is required when changing final_price", 400);
+  }
   // Drivers to tell about a moved day (sent after the transaction commits).
   const movedForDriver = new Map<string, string[]>();
 
@@ -1097,13 +1141,7 @@ export async function updateOrder(id: string, input: UpdateOrderInput) {
       const priceChanged =
         Math.round(Number(after.final_price) * 100) !==
         Math.round(Number(order.final_price) * 100);
-      if (priceChanged) {
-        if (!change_reason?.trim()) {
-          throw new AppError(
-            "change_reason is required when changing final_price",
-            400,
-          );
-        }
+      if (pricesChanged) {
         const active = await tx.invoice.aggregate({
           where: { order_id: id, status: { notIn: ["REVISED", "CANCELLED"] } },
           _sum: { amount: true },
@@ -1123,6 +1161,19 @@ export async function updateOrder(id: string, input: UpdateOrderInput) {
             new_value: String(after.final_price),
             note: change_reason,
             actor: "ADMIN",
+          },
+        });
+      } else if (priceChanged) {
+        // No price was edited, but the stored total was out of date (e.g.
+        // charges an older edit left out); the rollup corrected it.
+        await tx.orderChangeLog.create({
+          data: {
+            order_id: id,
+            field: "final_price",
+            old_value: String(order.final_price),
+            new_value: String(after.final_price),
+            note: "Dihitung ulang dari hari layanan dan biaya tambahan",
+            actor: "SYSTEM",
           },
         });
       }
@@ -1835,12 +1886,12 @@ export async function cancelOrder(
     //    payment_status against the new total (money received is unchanged).
     // Money received, read now: the invoices are locked by step 1, so a
     // payment recorded while the fee PDF was being built is included.
-    const { paid_to_date } = await tx.order.findUniqueOrThrow({
+    const money = await tx.order.findUniqueOrThrow({
       where: { id: orderId },
-      select: { paid_to_date: true },
+      select: { paid_to_date: true, is_refunded: true, refund_amount: true },
     });
-    const paidToDate = Number(paid_to_date ?? 0);
-    const paymentStatus = paymentStatusFor(paidToDate, penalty);
+    const paidToDate = Number(money.paid_to_date ?? 0);
+    const paymentStatus = paymentStatusFor(netPaid(money), penalty);
 
     await tx.order.update({
       where: { id: orderId },

@@ -1,9 +1,10 @@
 import { waLink, waManual } from "../../utils/waManual";
-import { paymentStatusFor, startPayment } from "../orders/assignment-guard";
+import { netPaid, paymentStatusFor, startPayment } from "../orders/assignment-guard";
 import { notifyOrderPaidInFull } from "../../services/driverNotify";
 import { reportLeadPurchase } from "../../services/ga4.service";
 import type { Prisma } from "@prisma/client";
 import prisma from "../../prisma/client";
+import { env } from "../../config/env";
 import { AppError } from "../../utils/AppError";
 import { nextInvoiceNumber, nextReceiptNumber } from "../../utils/codes";
 import {
@@ -47,8 +48,6 @@ function fmtAdjustmentDate(d: Date | string | null | undefined): string | null {
   });
 }
 
-// Turn a billable adjustment into a PDF line item, appending the date to the
-// description (e.g. "overtime 2 jam - Senin, 22 Juni 2026").
 const INVOICE_TYPE_LABEL: Record<string, string> = {
   DP: "Down Payment",
   SETTLEMENT: "Settlement Payment",
@@ -126,6 +125,33 @@ function paymentLines(
   }));
 }
 
+/** One service day as a PDF line item (invoice, kwitansi, statement). */
+function serviceItemToLineItem(item: {
+  service_date: Date | null;
+  description: string | null;
+  service_kind: string | null;
+  service_package: string | null;
+  pickup_location: string;
+  dropoff_location: string;
+  quantity: number;
+  unit_price: unknown;
+  total_price: unknown;
+}) {
+  return {
+    serviceDate: item.service_date,
+    description: item.description,
+    serviceKind: item.service_kind,
+    servicePackage: item.service_package,
+    pickupLocation: item.pickup_location,
+    dropoffLocation: item.dropoff_location,
+    quantity: item.quantity,
+    unitPrice: Number(item.unit_price),
+    totalPrice: Number(item.total_price),
+  };
+}
+
+// Turn a billable adjustment into a PDF line item, appending the date to the
+// description (e.g. "overtime 2 jam - Senin, 22 Juni 2026").
 function adjustmentToLineItem(a: {
   description: string;
   amount: unknown;
@@ -382,17 +408,7 @@ export async function generateInvoice(
   //  - ADDITIONAL bills ONLY the billable adjustments (no rental day lines).
   //  - everything else (DP / SETTLEMENT / FULL / COMBINED) lists the rental
   //    service days; COMBINED also appends additionalItems above.
-  const rentalLineItems = order.service_items.map((item) => ({
-    serviceDate: item.service_date,
-    description: item.description,
-    serviceKind: item.service_kind,
-    servicePackage: item.service_package,
-    pickupLocation: item.pickup_location,
-    dropoffLocation: item.dropoff_location,
-    quantity: item.quantity,
-    unitPrice: Number(item.unit_price),
-    totalPrice: Number(item.total_price),
-  }));
+  const rentalLineItems = order.service_items.map(serviceItemToLineItem);
   const additionalLineItems = billableAdjustments.map(adjustmentToLineItem);
   const pdfItems =
     input.invoice_type === "ADDITIONAL" ? additionalLineItems : rentalLineItems;
@@ -500,8 +516,7 @@ export async function getPaymentProofUrl(invoiceId: string) {
   return { url, expires_in: 3600 };
 }
 
-// Mark an invoice PAID -> it now prints as a Kwitansi/Receipt.
-// Mark an invoice paid: money received, kwitansi, order payment status.
+// Mark an invoice paid: money received, kwitansi (receipt PDF), order payment status.
 export async function markInvoicePaid(
   invoiceId: string,
   input: {
@@ -572,8 +587,10 @@ export async function markInvoicePaid(
           },
         });
         if (count === 0) return null;
-        const [locked] = await tx.$queryRaw<{ final_price: unknown; paid_to_date: unknown }[]>`
-          SELECT final_price, paid_to_date FROM "orders" WHERE id = ${invoice.order_id} FOR NO KEY UPDATE`;
+        const [locked] = await tx.$queryRaw<
+          { final_price: unknown; paid_to_date: unknown; is_refunded: boolean; refund_amount: unknown }[]
+        >`SELECT final_price, paid_to_date, is_refunded, refund_amount
+          FROM "orders" WHERE id = ${invoice.order_id} FOR NO KEY UPDATE`;
 
         if (customer) {
           const { number: receiptNumber, seq: receiptSeq } = await nextReceiptNumber(
@@ -608,7 +625,10 @@ export async function markInvoicePaid(
         await tx.order.update({
           where: { id: invoice.order_id },
           data: {
-            payment_status: paymentStatusFor(paidTotal, locked.final_price),
+            payment_status: paymentStatusFor(
+              netPaid({ ...locked, paid_to_date: paidTotal }),
+              locked.final_price,
+            ),
             paid_to_date: paidTotal,
           },
         });
@@ -686,17 +706,7 @@ async function attachReceiptPdf(
   // an Additional Charges section. An ADDITIONAL receipt lists ONLY the
   // additional charges; every other type lists the rental service days.
   const billable = order.adjustments.filter((a) => a.is_billable);
-  const rentalItems = order.service_items.map((item) => ({
-    serviceDate: item.service_date,
-    description: item.description,
-    serviceKind: item.service_kind,
-    servicePackage: item.service_package,
-    pickupLocation: item.pickup_location,
-    dropoffLocation: item.dropoff_location,
-    quantity: item.quantity,
-    unitPrice: Number(item.unit_price),
-    totalPrice: Number(item.total_price),
-  }));
+  const rentalItems = order.service_items.map(serviceItemToLineItem);
   const items =
     invoice.invoice_type === "ADDITIONAL" ? billable.map(adjustmentToLineItem) : rentalItems;
   const additionalItems =
@@ -713,8 +723,11 @@ async function attachReceiptPdf(
   });
   const previouslyPaid = Number(priorAgg._sum.amount ?? 0);
 
-  // "Payments received" lines: every payment on the order so far, then this one.
-  const others = await paymentsOnOrder(prisma, invoice.order_id, invoice.id);
+  // "Payments received" lines: the payments made up to this one (a later one,
+  // recorded before this PDF was built, belongs on its own kwitansi), then this.
+  const all = await paymentsOnOrder(prisma, invoice.order_id, invoice.id);
+  const earlier = all.items.filter((p) => !p.paid_at || p.paid_at.getTime() <= pay.paidAt.getTime());
+  const others = { items: earlier, total: earlier.reduce((s, p) => s + p.received, 0) };
   const paymentsReceived = paymentLines([
     ...others.items,
     { invoice_type: invoice.invoice_type, paid_at: pay.paidAt, issue_date: invoice.issue_date, received: pay.amountReceived },
@@ -789,17 +802,7 @@ export async function generateOrderStatement(
   const finalPrice = Number(order.final_price);
 
   // Service-day line items.
-  const items = order.service_items.map((item) => ({
-    serviceDate: item.service_date,
-    description: item.description,
-    serviceKind: item.service_kind,
-    servicePackage: item.service_package,
-    pickupLocation: item.pickup_location,
-    dropoffLocation: item.dropoff_location,
-    quantity: item.quantity,
-    unitPrice: Number(item.unit_price),
-    totalPrice: Number(item.total_price),
-  }));
+  const items = order.service_items.map(serviceItemToLineItem);
 
   // Billable additional charges (overtime/parking/etc.).
   const additionalItems = order.adjustments
@@ -922,17 +925,7 @@ export async function reviseInvoice(
   const reviseAdjustmentItems = reviseBillableAdjustments.map(
     adjustmentToLineItem,
   );
-  const reviseRentalItems = invoice.order.service_items.map((item) => ({
-    serviceDate: item.service_date,
-    description: item.description,
-    serviceKind: item.service_kind,
-    servicePackage: item.service_package,
-    pickupLocation: item.pickup_location,
-    dropoffLocation: item.dropoff_location,
-    quantity: item.quantity,
-    unitPrice: Number(item.unit_price),
-    totalPrice: Number(item.total_price),
-  }));
+  const reviseRentalItems = invoice.order.service_items.map(serviceItemToLineItem);
   const reviseItems =
     invoice.invoice_type === "ADDITIONAL"
       ? reviseAdjustmentItems
@@ -962,50 +955,69 @@ export async function reviseInvoice(
   const fileName = `${invoiceNumber}-${Date.now().toString(36)}.pdf`;
   const fileUrl = await uploadInvoicePDF(pdfBuffer, fileName);
 
-  const revised = await prisma.$transaction(async (tx) => {
-    // Conditional: an invoice paid (or revised) by someone else since it was
-    // read above is left alone (the revision would bill the customer twice).
-    const { count } = await tx.invoice.updateMany({
-      where: { id: invoice.id, status: { notIn: ["PAID", "REVISED", "CANCELLED"] } },
-      data: { status: "REVISED" },
-    });
-    if (count === 0) {
-      throw new AppError(
-        "Invoice ini baru saja dibayar atau direvisi. Muat ulang halaman lalu coba lagi.",
-        409,
-      );
-    }
-    const revised = await tx.invoice.create({
-      data: {
-        order_id: invoice.order_id,
-        invoice_number: invoiceNumber,
-        invoice_type: invoice.invoice_type,
-        payment_method: paymentMethod,
-        issue_date: issueDate,
-        amount,
-        note: input.note || invoice.note,
-        file_url: fileUrl,
-        status: "ISSUED",
-        revision: invoice.revision + 1,
-        parent_id: invoice.parent_id || invoice.id,
-      },
-    });
-    // payment_status is NOT recomputed here: it follows the money received
-    // (markInvoicePaid), never the amount billed. Revising an unpaid invoice
-    // must not mark the order paid (the owner's DP rule and GA4 rely on it).
+  let revised;
+  try {
+    revised = await prisma.$transaction(async (tx) => {
+      // Conditional: an invoice paid (or revised) by someone else since it was
+      // read above is left alone (the revision would bill the customer twice).
+      const { count } = await tx.invoice.updateMany({
+        where: { id: invoice.id, status: { notIn: ["PAID", "REVISED", "CANCELLED"] } },
+        data: { status: "REVISED" },
+      });
+      if (count === 0) {
+        throw new AppError(
+          "Invoice ini baru saja dibayar atau direvisi. Muat ulang halaman lalu coba lagi.",
+          409,
+        );
+      }
+      const revised = await tx.invoice.create({
+        data: {
+          order_id: invoice.order_id,
+          invoice_number: invoiceNumber,
+          invoice_type: invoice.invoice_type,
+          payment_method: paymentMethod,
+          issue_date: issueDate,
+          amount,
+          note: input.note || invoice.note,
+          file_url: fileUrl,
+          status: "ISSUED",
+          revision: invoice.revision + 1,
+          parent_id: invoice.parent_id || invoice.id,
+        },
+      });
+      // payment_status is NOT recomputed here: it follows the money received
+      // (markInvoicePaid), never the amount billed. Revising an unpaid invoice
+      // must not mark the order paid (the owner's DP rule and GA4 rely on it).
 
-    await tx.orderChangeLog.create({
-      data: {
-        order_id: invoice.order_id,
-        field: "invoice_revision",
-        old_value: `${invoice.invoice_number}: ${invoice.amount}`,
-        new_value: `${invoiceNumber}: ${input.amount}`,
-        note: input.note,
-        actor: "ADMIN",
-      },
+      await tx.orderChangeLog.create({
+        data: {
+          order_id: invoice.order_id,
+          field: "invoice_revision",
+          old_value: `${invoice.invoice_number}: ${invoice.amount}`,
+          new_value: `${invoiceNumber}: ${input.amount}`,
+          note: input.note,
+          actor: "ADMIN",
+        },
+      });
+      // Keep total_billed = sum of active invoices (G9): the old amount is
+      // replaced by the new one.
+      if (invoice.order.customer_id) {
+        const delta = amount - Number(invoice.amount);
+        if (delta !== 0) {
+          await tx.customer.update({
+            where: { id: invoice.order.customer_id },
+            data: { total_billed: { increment: delta } },
+          });
+        }
+      }
+      return revised;
     });
-    return revised;
-  });
+  } catch (err) {
+    // Not recorded: the revision PDF (customer name, amounts) must not stay
+    // behind in the public bucket.
+    void removeFile(env.SUPABASE_STORAGE_BUCKET, `invoices/${fileName}`);
+    throw err;
+  }
   return revised;
 }
 
