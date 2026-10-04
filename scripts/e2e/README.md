@@ -13,12 +13,12 @@ Needs the Postgres 16 binaries (`PG_BIN`, default `/usr/lib/postgresql/16/bin`).
 
 Output: one line per check. `PASS`/`FAIL` count towards the exit code. `KNOWN` is a documented issue that does not fail the run; it turns into `FIXED` once the behaviour is corrected, and should then become a normal `check`. The run exits 1 when any check fails.
 
-What is covered (about 227 checks):
+What is covered (about 230 checks):
 
 | Group | Covers |
 |---|---|
 | A | `payment_status` follows money received against the order total: revisions never change it, a new total does |
-| B | one way to assign (T4): per-day assign makes the day ASSIGNED but not accepted (`driver_accepted_at` stays empty in the app until "Terima tugas"), "Ganti Semua" after a per-day assign, taking the driver off → SCHEDULED, "Tetapkan untuk Semua" ends in the same state, overlapping days (also two days of one order given to one driver or car) and OFF drivers refused on both paths, a driver booked on other dates is free, ON_DUTY / IN_USE only on the trip's WIB day or while it runs |
+| B | one way to assign (T4): per-day assign makes the day ASSIGNED but not accepted (`driver_accepted_at` stays empty in the app until "Terima tugas"), "Ganti Semua" after a per-day assign, taking the driver off → SCHEDULED, "Tetapkan untuk Semua" ends in the same state, overlapping days (also two days of one order given to one driver or car, and two admins assigning one driver at the same moment) and OFF drivers refused on both paths, a driver booked on other dates is free, ON_DUTY / IN_USE only on the trip's WIB day or while it runs |
 | C | Edit Order keeps days, drivers, payables, receipts and reports; refuses to delete days in use; new days on mixed orders start internal; Edit Order and a driver action at the same moment; double saves; moving a day tells the driver; removing the last open day refused |
 | D | the full driver flow: accept, start (idempotent), arrive + GPS photo, pay-in-full gate, odometer order, receipts, finish, cost review, finalize, fee paid once, inbox; the days of a finalized order are locked (T5) |
 | E | cancellation tier 1, releasing drivers, cancellation-fee invoice; the days of a cancelled order are locked (T5) |
@@ -28,7 +28,7 @@ What is covered (about 227 checks):
 | I | partner days: allowed before DP, VENDOR payable, WhatsApp confirmation links |
 | J | phone clock clamp, XOPS billing, day-H cancellation, old open trips ("Belum ditutup") |
 | K | input limits: GPS pairs, file type/size, `client_ref` reuse, push tokens, unassigning |
-| L | admin notification feed (one per real driver action, resends add none; TRIP_COST for receipts; per-admin read state, unread count), e-toll requests (idempotent, already_open, done once with push), `location_name`, `etoll_card` |
+| L | admin notification feed (one per real driver action, resends add none; TRIP_COST for receipts; per-admin read state, unread count), e-toll requests (idempotent, already_open, done once with push), `location_name`, `etoll_card`, server stamp on checkpoint photos the phone did not stamp |
 | M | trip costs: "Dibayar oleh" decides what the driver is owed, "Ditagih ke pelanggan" only moves the cost to the invoice (pass-through, margin unchanged); admin Biaya Tambahan never touches the payable; `/analytics/dashboard` margin matches the order card |
 
 Safety: `lib.mjs` refuses to run unless both the API and the database are on localhost (`E2E_ALLOW_REMOTE=1` overrides it, for a disposable copy only). The checks create users, drivers, orders and payments.
