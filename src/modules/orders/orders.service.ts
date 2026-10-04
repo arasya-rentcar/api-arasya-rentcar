@@ -22,7 +22,7 @@ import { defaultDriverFee } from "../../utils/driverFee";
 import { computeMargin, MARGIN_FORMULA_VERSION } from "../../utils/margin";
 import { recomputeLineMoney } from "../schedule/line-money.service";
 import { rollupOrderFinance } from "../schedule/schedule.service";
-import { assertUnitsFree } from "../schedule/availability";
+import { assertUnitsFree, lockUnits } from "../schedule/availability";
 import { nextOrderCode } from "../../utils/codes";
 import { wibShortDay } from "../../utils/wib";
 import { buildCancellationFeePdf } from "../invoices/invoices.service";
@@ -1244,9 +1244,6 @@ export async function assignOrder(orderId: string, input: AssignOrderInput) {
       end_at: true,
     },
   });
-  // Free on these days' dates and times (not by Driver/Car status: a driver
-  // booked for another date is free here).
-  await assertUnitsFree(prisma, { driver, car }, newLines);
   let got = newLines;
   const updated = await prisma.$transaction(
     async (tx) => {
@@ -1283,6 +1280,12 @@ export async function assignOrder(orderId: string, input: AssignOrderInput) {
         await recomputeLineMoney(tx, l.id);
       }
       await rollupOrderFinance(tx, orderId);
+      // Free on these days' dates and times (not by Driver/Car status: a
+      // driver booked for another date is free here). Checked under the order
+      // and unit locks, so a concurrent assign of the same driver or car to an
+      // overlapping day waits and is then refused.
+      await lockUnits(tx, [input.driver_id], [input.car_id]);
+      await assertUnitsFree(tx, { driver, car }, got);
       await deriveAndSetOrderStatus(tx, orderId);
       await syncDriverStatus(tx, input.driver_id);
       await syncCarStatus(tx, input.car_id);
@@ -1353,11 +1356,10 @@ export async function reassignOrder(
   if (!car) throw new AppError("Car not found", 409);
   // The new driver / car must be free at the times of the days they take
   // over (by date and time, not by Driver/Car status). Days that keep the
-  // same driver or car are not checked again.
+  // same driver or car are not checked again. Checked in the transaction
+  // below, under the order and unit locks.
   const driverDays = eligibleLines.filter((l) => l.driver_id !== input.driver_id);
   const carDays = eligibleLines.filter((l) => l.car_id !== input.car_id);
-  if (driverDays.length) await assertUnitsFree(prisma, { driver }, driverDays);
-  if (carDays.length) await assertUnitsFree(prisma, { car }, carDays);
 
   // A day already paid to its driver cannot move to another driver.
   const paidDays = await prisma.payable.findMany({
@@ -1410,6 +1412,12 @@ export async function reassignOrder(
     // The unpaid driver payables follow the days to the new driver.
     for (const l of eligibleLines) await recomputeLineMoney(tx, l.id);
     await rollupOrderFinance(tx, orderId);
+    // Old and new units locked in id order (no deadlock with a concurrent
+    // swap the other way); a concurrent assign of the new driver or car to
+    // an overlapping day waits here and is then refused.
+    await lockUnits(tx, [input.driver_id, ...oldDriverIds], [input.car_id, ...oldCarIds]);
+    if (driverDays.length) await assertUnitsFree(tx, { driver }, driverDays);
+    if (carDays.length) await assertUnitsFree(tx, { car }, carDays);
     await deriveAndSetOrderStatus(tx, orderId);
     // Release the old resources first, then mark the new ones busy.
     for (const id of oldDriverIds) await syncDriverStatus(tx, id);

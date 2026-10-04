@@ -20,7 +20,7 @@ import {
   refreshDriverStatuses,
   tripTimestampsForLine,
 } from './order-derive.service';
-import { assertUnitsFree } from './availability';
+import { assertUnitsFree, lockUnits } from './availability';
 import {
   deriveState,
   maybeAutoSendOnAssign,
@@ -402,18 +402,17 @@ export async function assignScheduleLine(
   if (input.notes !== undefined) data.notes = input.notes;
 
   // A driver or car newly given to an open day must be free at that time
-  // (same rule as "Tetapkan untuk Semua" / "Ganti Semua").
-  if ((newDriver || newCar) && ['SCHEDULED', 'ASSIGNED', 'IN_PROGRESS'].includes(nextStatus)) {
-    await assertUnitsFree(prisma, { driver: newDriver, car: newCar }, [
-      {
-        id,
-        service_date:
-          input.service_date !== undefined ? (data.service_date as Date | null) : line.service_date,
-        start_at: input.start_at !== undefined ? (data.start_at as Date | null) : line.start_at,
-        end_at: input.end_at !== undefined ? (data.end_at as Date | null) : line.end_at,
-      },
-    ]);
-  }
+  // (same rule as "Tetapkan untuk Semua" / "Ganti Semua"). Checked inside the
+  // transaction below, under the order and unit locks.
+  const checkUnits =
+    (newDriver || newCar) && ['SCHEDULED', 'ASSIGNED', 'IN_PROGRESS'].includes(nextStatus);
+  const dayTimes = {
+    id,
+    service_date:
+      input.service_date !== undefined ? (data.service_date as Date | null) : line.service_date,
+    start_at: input.start_at !== undefined ? (data.start_at as Date | null) : line.start_at,
+    end_at: input.end_at !== undefined ? (data.end_at as Date | null) : line.end_at,
+  };
 
   // Capture the line's resource links BEFORE the update so a reassignment can
   // also release the previously-linked driver/car.
@@ -440,6 +439,12 @@ export async function assignScheduleLine(
         select: { order_status: true },
       }),
     );
+    if (checkUnits) {
+      // Another admin giving the same driver / car an overlapping day at the
+      // same moment waits on these locks and is then refused.
+      await lockUnits(tx, driversToSync, carsToSync);
+      await assertUnitsFree(tx, { driver: newDriver, car: newCar }, [dayTimes]);
+    }
 
     // Order, driver and car status follow the days, in this same transaction.
     // The driver/car updates are two conditional statements each (no reads).
