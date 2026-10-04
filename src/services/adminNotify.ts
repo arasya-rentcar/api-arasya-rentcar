@@ -18,7 +18,9 @@ export type AdminNotificationType =
   | "TRIP_FINISHED"
   | "TRIP_REPORT"
   | "TRIP_COST"
-  | "DRIVER_REQUEST";
+  | "DRIVER_REQUEST"
+  // A driver took or returned an office e-toll card.
+  | "ETOLL_CARD";
 
 export interface AdminNotice {
   type: AdminNotificationType;
@@ -190,13 +192,19 @@ export async function notifyDriverRequest(r: {
   id: string;
   driver_id: string;
   type: string;
+  card_id?: string | null;
   card_label: string | null;
   balance: number | null;
   note: string | null;
 }): Promise<void> {
   try {
     const driver = await prisma.driver.findUnique({ where: { id: r.driver_id }, select: { name: true } });
-    const card = r.card_label ? (/^kartu\b/i.test(r.card_label) ? r.card_label : `Kartu ${r.card_label}`) : null;
+    // An office card's label ("BCA Flazz · Kartu 3 ••••5678") reads as it is.
+    const card = r.card_label
+      ? r.card_id || /^kartu\b/i.test(r.card_label)
+        ? r.card_label
+        : `Kartu ${r.card_label}`
+      : null;
     await notifyAdmins({
       type: "DRIVER_REQUEST",
       title: `${driver?.name ?? "Driver"} ${REQUEST_TITLE[r.type] ?? "mengirim permintaan"}`,

@@ -92,6 +92,8 @@ export const readNotificationsSchema = z
 // Requests to the office (e-toll top-up). client_ref makes a resend a no-op.
 export const createDriverRequestSchema = z.object({
   type: z.enum(["ETOLL_TOPUP"]),
+  // The office e-toll card (newer app versions); card_label is then ignored.
+  card_id: z.preprocess(blank, z.string().uuid().optional()),
   card_label: z
     .string()
     .trim()
