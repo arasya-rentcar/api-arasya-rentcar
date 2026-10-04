@@ -512,9 +512,13 @@ export async function addReport(
   let fileMime: string | null = null;
   if (photo) {
     let file = assertValidUpload(photo);
-    // Older apps send a plain photo: the server adds the stamp. The GPS camera
-    // in newer apps stamps on the phone (stamped=true), so it is not doubled.
-    if (isArrival && !input.stamped) file = await stampArrival(file, line, driverId, input);
+    // Older apps send a plain photo, and the phone's own stamp can fail: the
+    // server then adds the stamp. The GPS camera stamps on the phone
+    // (stamped=true), so it is not doubled. Arrival and checkpoint photos
+    // ("Foto / Catatan") only; receipts and odometer photos stay as taken.
+    const isCheckpoint = input.report_type === "PHOTO" || input.report_type === "NOTE";
+    if ((isArrival || isCheckpoint) && !input.stamped)
+      file = await stampReportPhoto(file, line, driverId, input, isArrival ? "arrival" : "checkpoint");
     const up = await uploadFile(file, {
       bucket: TRIP_BUCKET,
       prefix: `trip-reports/${lineId}`,
@@ -637,31 +641,35 @@ const WIB_STAMP: Intl.DateTimeFormatOptions = {
 };
 
 /**
- * Burns driver, order, WIB time and GPS fix into the arrival photo. If the
- * photo cannot be decoded it is stored as sent (the GPS fix is on the row
- * anyway), so a driver is never blocked by it.
+ * Burns driver, order, WIB time, place name and GPS fix into an arrival or
+ * checkpoint photo the phone did not stamp. If the photo cannot be decoded it
+ * is stored as sent (the GPS fix is on the row anyway), so a driver is never
+ * blocked by it.
  */
-async function stampArrival(
+async function stampReportPhoto(
   file: UploadedFile,
   line: LineWithTrip,
   driverId: string,
   input: ReportInput,
+  kind: "arrival" | "checkpoint",
 ): Promise<UploadedFile> {
   try {
     const driver = await prisma.driver.findUnique({ where: { id: driverId }, select: { name: true } });
     const at = eventTime(input.location_at ?? input.occurred_at);
     const acc = input.location_accuracy_m != null ? ` (akurasi ${input.location_accuracy_m} m)` : "";
     const buffer = await stampPhoto(file.buffer, [
-      `SAMPAI DI LOKASI JEMPUT | ${line.order.order_code ?? ""}`,
+      `${kind === "arrival" ? "SAMPAI DI LOKASI JEMPUT" : "CHECKPOINT"} | ${line.order.order_code ?? ""}`,
       `Driver: ${driver?.name ?? "-"}`,
       `${at.toLocaleString("id-ID", WIB_STAMP)} WIB`,
       ...(input.location_name ? [`Lokasi: ${input.location_name}`] : []),
-      `GPS ${input.latitude!.toFixed(6)}, ${input.longitude!.toFixed(6)}${acc}`,
-      `Jemput: ${line.pickup_location}`,
+      ...(input.latitude != null && input.longitude != null
+        ? [`GPS ${input.latitude.toFixed(6)}, ${input.longitude.toFixed(6)}${acc}`]
+        : []),
+      ...(kind === "arrival" ? [`Jemput: ${line.pickup_location}`] : []),
     ]);
     return { ...file, buffer, size: buffer.length, mimetype: "image/jpeg" };
   } catch (err) {
-    logger.warn({ err, lineId: line.id }, "arrival photo stamp failed; stored unstamped");
+    logger.warn({ err, lineId: line.id, kind }, "report photo stamp failed; stored unstamped");
     return file;
   }
 }

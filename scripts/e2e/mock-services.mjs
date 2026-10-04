@@ -21,6 +21,13 @@ const server = http.createServer((req, res) => {
     }
     if (url.pathname === '/__pushes') return json(200, pushes);
     if (url.pathname === '/__objects') return json(200, [...objects.keys()]);
+    // The stored bytes of one upload ("<bucket>/<path>"), e.g. to see a stamp.
+    if (url.pathname === '/__object') {
+      const b = objects.get(url.searchParams.get('key') ?? '');
+      if (!b) return json(404, { error: 'not found' });
+      res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
+      return res.end(b);
+    }
     if (url.pathname === '/__reset') {
       pushes.length = 0;
       return json(200, { ok: true });
@@ -29,7 +36,7 @@ const server = http.createServer((req, res) => {
     if (sign) return json(200, { signedURL: `/object/sign/${sign[1]}?token=t` });
     const obj = url.pathname.match(/^\/storage\/v1\/object\/([^/]+)\/(.+)$/);
     if (obj && (req.method === 'POST' || req.method === 'PUT')) {
-      objects.set(`${obj[1]}/${obj[2]}`, body.length);
+      objects.set(`${obj[1]}/${obj[2]}`, body);
       return json(200, { Key: `${obj[1]}/${obj[2]}`, Id: 'id' });
     }
     if (req.method === 'DELETE') return json(200, []);

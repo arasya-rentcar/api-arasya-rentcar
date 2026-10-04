@@ -1,7 +1,7 @@
 // End-to-end checks of the API: what the dashboard and the driver app do,
 // against the real API and a throwaway database. Run through run-local.sh.
 // Case ids in the output match dashboard-arasya-rentcar/docs/TEST-PLAN.md.
-import { call, check, section, summary, ensureAdmin, prisma, jpeg, wibIso, uuid, sleep, pushes, BASE } from './lib.mjs';
+import { call, check, section, summary, ensureAdmin, prisma, jpeg, wibIso, uuid, sleep, pushes, BASE, MOCK } from './lib.mjs';
 
 const admin = await ensureAdmin();
 const tag = Date.now().toString(36).slice(-5);
@@ -868,6 +868,26 @@ await section('L. Admin notifications, driver requests, location names', async (
   const doneList = await call('GET', '/driver-requests?status=done', { token: admin });
   check('L42 admin list by status DONE', doneList.data.items.some((x) => x.id === q1.data.request.id) && !doneList.data.items.some((x) => x.id === q4.data.request.id));
 
+  // A checkpoint photo the phone did not stamp gets the server stamp (dark
+  // caption band at the bottom), like the arrival photo; stamped=true and
+  // receipts are stored as taken. A plain white JPEG shows the difference.
+  const { Jimp } = await import('jimp');
+  const plain = await new Jimp({ width: 320, height: 240, color: 0xffffffff }).getBuffer('image/jpeg');
+  const upload = async (fields) => {
+    const f = new FormData();
+    f.append('client_ref', uuid());
+    for (const [k, v] of Object.entries(fields)) f.append(k, String(v));
+    f.append('photo', new Blob([plain], { type: 'image/jpeg' }), 'c.jpg');
+    const r = await call('POST', `/driver/trips/${lineId}/reports`, { token: d4.token, form: f });
+    const key = decodeURIComponent(new URL(r.data.file_url).pathname.replace(/^.*\/object\/public\//, ''));
+    const img = await Jimp.read(Buffer.from(await (await fetch(`${MOCK}/__object?key=${encodeURIComponent(key)}`)).arrayBuffer()));
+    return { status: r.status, bottom: (img.getPixelColor(2, img.bitmap.height - 2) >>> 24) & 0xff };
+  };
+  const gps = { latitude: -6.61, longitude: 106.82, location_accuracy_m: 10, location_name: 'Tol Jagorawi KM 35' };
+  const unstamped = await upload({ report_type: 'PHOTO', notes: 'Checkpoint 2', ...gps });
+  const phoneStamped = await upload({ report_type: 'PHOTO', notes: 'Checkpoint 3', stamped: 'true', ...gps });
+  const receipt = await upload({ report_type: 'PARKING', amount: 5000 });
+  check('L43 checkpoint photo without the phone stamp gets the server stamp; stamped=true and receipts stored as taken', unstamped.status === 200 && unstamped.bottom < 128 && phoneStamped.status === 200 && phoneStamped.bottom > 200 && receipt.status === 200 && receipt.bottom > 200, JSON.stringify({ unstamped, phoneStamped, receipt }));
 });
 
 // ── M. Trip costs billed to the customer vs money owed to the driver (F3) ──
