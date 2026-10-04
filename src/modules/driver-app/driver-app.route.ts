@@ -25,6 +25,15 @@ import {
   startTrip,
 } from "./driver-app.service";
 import { createDriverRequest, listOwnRequests } from "../driver-requests/driver-requests.service";
+import {
+  cardLabel,
+  driverRecordBalance,
+  driverReturnCard,
+  driverTakeCard,
+  heldCards,
+  listCardsForDriver,
+} from "../etoll-cards/etoll-cards.service";
+import { driverBalanceSchema, driverReturnSchema, driverTakeSchema } from "../etoll-cards/etoll-cards.validation";
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 
@@ -46,9 +55,19 @@ router.use(verifyTokenMiddleware, requireRole("DRIVER"));
 router.get("/me", async (req, res, next) => {
   try {
     const d = await driverForUser(req.user!.user_id);
+    // The office card the driver holds now (old app versions show it on the
+    // top-up request); the old free-text field otherwise.
+    const held = (await heldCards(d.id))[0];
     res.json({
       status: "success",
-      data: { id: d.id, name: d.name, phone: d.phone, status: d.status, type: d.type, etoll_card: d.etoll_card },
+      data: {
+        id: d.id,
+        name: d.name,
+        phone: d.phone,
+        status: d.status,
+        type: d.type,
+        etoll_card: held ? cardLabel(held) : d.etoll_card,
+      },
     });
   } catch (err) {
     next(err);
@@ -97,5 +116,29 @@ router.post("/requests", async (req, res, next) => {
   }
 });
 router.get("/requests", h((req, id) => listOwnRequests(id, driverRequestsQuerySchema.parse(req.query).status)));
+
+// Office e-toll cards: the pool, "Ambil kartu" / "Kembalikan kartu" and the
+// balance the driver read. client_ref makes every resend a no-op; take answers
+// 201 when the driver got the card now, 200 when it was already theirs.
+router.get("/etoll-cards", h((_req, id) => listCardsForDriver(id)));
+router.post("/etoll-cards/:cardId/take", async (req, res, next) => {
+  try {
+    const driver = await driverForUser(req.user!.user_id);
+    const r = await driverTakeCard(driver.id, req.params.cardId, driverTakeSchema.parse(req.body ?? {}));
+    res.status(r.created ? 201 : 200).json({ status: "success", data: { card: r.card } });
+  } catch (err) {
+    next(err);
+  }
+});
+router.post("/etoll-cards/:cardId/return", h((req, id) => driverReturnCard(id, req.params.cardId, driverReturnSchema.parse(req.body ?? {}))));
+router.post("/etoll-cards/:cardId/balance", async (req, res, next) => {
+  try {
+    const driver = await driverForUser(req.user!.user_id);
+    const r = await driverRecordBalance(driver.id, req.params.cardId, driverBalanceSchema.parse(req.body ?? {}));
+    res.status(r.created ? 201 : 200).json({ status: "success", data: { card: r.card } });
+  } catch (err) {
+    next(err);
+  }
+});
 
 export default router;

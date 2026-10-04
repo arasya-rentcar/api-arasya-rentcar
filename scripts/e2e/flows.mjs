@@ -969,6 +969,145 @@ await section('M. Trip costs: billed to the customer vs owed to the driver', asy
     row && row.margin === m.margin && row.revenue === m.total, JSON.stringify(row));
 });
 
+// ── N. Office e-toll cards: pool, handovers, top-ups, history ──────────────
+await section('N. Office e-toll cards', async () => {
+  const dA = await makeDriver(20);
+  const dB = await makeDriver(21);
+  const num = `6032${rnd()}${rnd().slice(0, 5)}`; // 16 digits
+  const c1 = await call('POST', '/etoll-cards', { token: admin, body: { issuer: 'BCA', name: `Flazz ${tag}`, card_number: num.replace(/(\d{4})/g, '$1 ').trim(), balance: 50000 } });
+  const card = c1.data;
+  check('N1 admin adds a card (201): number stored as digits, label, balance 50.000 from the first check',
+    c1.status === 201 && card.card_number === num && card.label === `BCA Flazz · Flazz ${tag} ••••${num.slice(-4)}` && card.balance === 50000 && !!card.balance_at && card.holder === null, JSON.stringify(c1.json));
+  check('N2 same card number again refused (409)', (await call('POST', '/etoll-cards', { token: admin, body: { issuer: 'BCA', name: 'Dobel', card_number: num } })).status === 409);
+  check('N3 card number with letters or too short refused (400)',
+    (await call('POST', '/etoll-cards', { token: admin, body: { issuer: 'BCA', name: 'X', card_number: '6032abcd' } })).status === 400 &&
+    (await call('POST', '/etoll-cards', { token: admin, body: { issuer: 'BCA', name: 'X', card_number: '1234' } })).status === 400);
+  check('N4 driver token cannot use the admin card list (403)', (await call('GET', '/etoll-cards', { token: dA.token })).status === 403);
+  const listA = await call('GET', '/driver/etoll-cards', { token: dA.token });
+  const seen = listA.data?.items?.find((x) => x.id === card.id);
+  check('N5 driver list: last four digits only, never the full number', !!seen && seen.card_last4 === num.slice(-4) && !('card_number' in seen) && !JSON.stringify(listA.json).includes(num), JSON.stringify(seen));
+
+  // "Ambil kartu" (driver), resend, then another driver takes it over.
+  const cardNotes = () => prisma.adminNotification.findMany({ where: { type: 'ETOLL_CARD', link: `/dashboard/etoll-cards/${card.id}` }, orderBy: { created_at: 'asc' } });
+  const takeRef = uuid();
+  const t1 = await call('POST', `/driver/etoll-cards/${card.id}/take`, { token: dA.token, body: { client_ref: takeRef, occurred_at: new Date().toISOString() } });
+  check('N6 driver takes the card → 201, holder mine, admins told once', t1.status === 201 && t1.data?.card?.holder?.mine === true && (await cardNotes()).length === 1 && /mengambil kartu e-toll/.test((await cardNotes())[0].title), JSON.stringify(t1.json));
+  const t1b = await call('POST', `/driver/etoll-cards/${card.id}/take`, { token: dA.token, body: { client_ref: takeRef } });
+  const t1c = await call('POST', `/driver/etoll-cards/${card.id}/take`, { token: dA.token, body: { client_ref: uuid() } });
+  check('N7 resend (same client_ref) and "Ambil" again while holding it → 200, one handover, no new notice',
+    t1b.status === 200 && t1c.status === 200 && (await prisma.etollCardHandover.count({ where: { card_id: card.id } })) === 1 && (await cardNotes()).length === 1);
+  check('N8 /driver/me shows the held card as etoll_card', (await call('GET', '/driver/me', { token: dA.token })).data?.etoll_card === card.label);
+  check('N9 another driver cannot reuse the take client_ref (409)', (await call('POST', `/driver/etoll-cards/${card.id}/take`, { token: dB.token, body: { client_ref: takeRef } })).status === 409);
+
+  // Old app (no card_id): the holder's request is linked to the held card.
+  const oldReq = await call('POST', '/driver/requests', { token: dA.token, body: { type: 'ETOLL_TOPUP', card_label: card.label, balance: 30000, client_ref: uuid() } });
+  let c = (await call('GET', `/etoll-cards/${card.id}`, { token: admin })).data;
+  check('N10 request from an older app is linked to the card the driver holds; balance typed = balance check',
+    oldReq.status === 201 && oldReq.data.request.card_id === card.id && c.card.balance === 30000 && c.transactions.some((t) => t.type === 'BALANCE_CHECK' && t.request_id === oldReq.data.request.id), JSON.stringify(oldReq.json));
+  const newReq = await call('POST', '/driver/requests', { token: dB.token, body: { type: 'ETOLL_TOPUP', card_id: card.id, client_ref: uuid() } });
+  check('N11 one open request per card: another driver asking for the same card → already_open', newReq.status === 200 && newReq.data.already_open === true && newReq.data.request.id === oldReq.data.request.id);
+  check('N12 request for an unknown card → 404', (await call('POST', '/driver/requests', { token: dB.token, body: { type: 'ETOLL_TOPUP', card_id: uuid(), client_ref: uuid() } })).status === 404);
+
+  const t2 = await call('POST', `/driver/etoll-cards/${card.id}/take`, { token: dB.token, body: { client_ref: uuid(), balance: 28000 } });
+  const hs = await prisma.etollCardHandover.findMany({ where: { card_id: card.id }, orderBy: { taken_at: 'asc' } });
+  const notes2 = await cardNotes();
+  check('N13 another driver takes it over: first handover TAKEN_OVER, new holder, notice says who had it',
+    t2.status === 201 && hs.length === 2 && hs[0].return_kind === 'TAKEN_OVER' && !!hs[0].returned_at && hs[1].driver_id === dB.id && !hs[1].returned_at && /sebelumnya dipegang/.test(notes2[notes2.length - 1].body), notes2[notes2.length - 1]?.body);
+  check('N14 /driver/me of the first driver no longer shows the card', (await call('GET', '/driver/me', { token: dA.token })).data?.etoll_card === null);
+  check('N15 the balance typed at "Ambil" is the new estimate (28.000)', (await call('GET', `/etoll-cards/${card.id}`, { token: admin })).data.card.balance === 28000);
+
+  // Admin "Tandai sudah top-up" with the amount.
+  const admReq = (await call('GET', '/driver-requests?status=OPEN', { token: admin })).data.items.find((x) => x.id === oldReq.data.request.id);
+  check('N16 admin request list carries the card (full number for m-banking)', admReq?.card?.id === card.id && admReq.card.card_number === num && admReq.card.balance === 28000);
+  check('N17 top-up amount 0 refused (400)', (await call('POST', `/driver-requests/${oldReq.data.request.id}/done`, { token: admin, body: { amount: 0 } })).status === 400);
+  const done = await call('POST', `/driver-requests/${oldReq.data.request.id}/done`, { token: admin, body: { amount: 100000 } });
+  await sleep(300);
+  c = (await call('GET', `/etoll-cards/${card.id}`, { token: admin })).data;
+  const topPush = (await pushesTo(dA)).filter((x) => x.title === 'Top-up e-toll sudah diproses');
+  check('N18 done with amount: TOPUP on the card, estimate 128.000, last check time unchanged',
+    done.status === 200 && c.card.balance === 128000 && c.transactions.filter((t) => t.type === 'TOPUP' && t.amount === 100000 && t.request_id === oldReq.data.request.id).length === 1 && c.card.balance_at === c.transactions.find((t) => t.note === 'Saat diambil')?.occurred_at, JSON.stringify(c.card));
+  check('N19 driver push names the card and amount and says to update the balance on the card',
+    topPush.length === 1 && topPush[0].body.includes(`••••${num.slice(-4)} sudah diisi Rp 100.000`) && /update saldo/.test(topPush[0].body), topPush[0]?.body);
+  check('N20 second "done" refused (409), no second top-up',
+    (await call('POST', `/driver-requests/${oldReq.data.request.id}/done`, { token: admin, body: { amount: 100000 } })).status === 409 &&
+    (await prisma.etollTransaction.count({ where: { card_id: card.id, type: 'TOPUP' } })) === 1);
+
+  // A request without any card (older app, no card held): the admin picks one.
+  const loose = await call('POST', '/driver/requests', { token: dA.token, body: { type: 'ETOLL_TOPUP', card_label: 'Kartu lama', client_ref: uuid() } });
+  check('N21 amount without a card refused (400 "Pilih kartu")', loose.status === 201 && !loose.data.request.card_id && (await call('POST', `/driver-requests/${loose.data.request.id}/done`, { token: admin, body: { amount: 50000 } })).status === 400);
+  const picked = await call('POST', `/driver-requests/${loose.data.request.id}/done`, { token: admin, body: { amount: 50000, card_id: card.id, balance_after: 180000 } });
+  c = (await call('GET', `/etoll-cards/${card.id}`, { token: admin })).data;
+  check('N22 admin picks the card: request linked, balance after the top-up becomes the known balance (180.000)',
+    picked.status === 200 && picked.data.request.card_id === card.id && c.card.balance === 180000, JSON.stringify(picked.json));
+
+  // Admin entries, void, toll.
+  const toll = await call('POST', `/etoll-cards/${card.id}/transactions`, { token: admin, body: { type: 'TOLL', amount: 24500, note: 'Tol Jagorawi', client_ref: uuid() } });
+  check('N23 admin records a toll → estimate 155.500', toll.status === 201 && toll.data.card.balance === 155500, JSON.stringify(toll.json));
+  const chkRef = uuid();
+  const chk = await call('POST', `/etoll-cards/${card.id}/transactions`, { token: admin, body: { type: 'BALANCE_CHECK', balance_after: 150000, client_ref: chkRef } });
+  const chk2 = await call('POST', `/etoll-cards/${card.id}/transactions`, { token: admin, body: { type: 'BALANCE_CHECK', balance_after: 150000, client_ref: chkRef } });
+  check('N24 balance check resets the estimate (150.000); resend → 200, stored once',
+    chk.status === 201 && chk.data.card.balance === 150000 && chk2.status === 200 && chk2.data.transaction.id === chk.data.transaction.id);
+  check('N25 top-up without amount / check without balance refused (400)',
+    (await call('POST', `/etoll-cards/${card.id}/transactions`, { token: admin, body: { type: 'TOPUP' } })).status === 400 &&
+    (await call('POST', `/etoll-cards/${card.id}/transactions`, { token: admin, body: { type: 'BALANCE_CHECK' } })).status === 400);
+  const v1 = await call('POST', `/etoll-cards/transactions/${chk.data.transaction.id}/void`, { token: admin, body: { reason: 'Salah ketik' } });
+  check('N26 voiding the check brings the estimate back (155.500); second void 409',
+    v1.status === 200 && v1.data.card.balance === 155500 && !!v1.data.transaction.voided_at &&
+    (await call('POST', `/etoll-cards/transactions/${chk.data.transaction.id}/void`, { token: admin, body: {} })).status === 409);
+
+  // Driver balance and "Kembalikan kartu".
+  const balRef = uuid();
+  const b1 = await call('POST', `/driver/etoll-cards/${card.id}/balance`, { token: dB.token, body: { client_ref: balRef, balance: 140000, source: 'NFC' } });
+  const b2 = await call('POST', `/driver/etoll-cards/${card.id}/balance`, { token: dB.token, body: { client_ref: balRef, balance: 140000 } });
+  check('N27 driver records the balance it read (201), resend 200 once; source NFC kept',
+    b1.status === 201 && b1.data.card.balance === 140000 && b2.status === 200 && (await prisma.etollTransaction.count({ where: { client_ref: balRef, source: 'NFC' } })) === 1);
+  const retRef = uuid();
+  const r1 = await call('POST', `/driver/etoll-cards/${card.id}/return`, { token: dB.token, body: { client_ref: retRef, balance: 135000 } });
+  const r2 = await call('POST', `/driver/etoll-cards/${card.id}/return`, { token: dB.token, body: { client_ref: retRef, balance: 135000 } });
+  const r3 = await call('POST', `/driver/etoll-cards/${card.id}/return`, { token: dA.token, body: { client_ref: uuid() } });
+  check('N28 driver returns it: holder empty, balance 135.000; resend and a driver not holding it → 200 no-op',
+    r1.status === 200 && r1.data.returned === true && r1.data.card.holder === null && r1.data.card.balance === 135000 && r2.status === 200 && r2.data.returned === false && r3.status === 200 && r3.data.returned === false &&
+    (await prisma.etollTransaction.count({ where: { card_id: card.id, note: 'Saat dikembalikan' } })) === 1);
+  check('N29 admin "sudah kembali" on a card nobody holds → 409', (await call('POST', `/etoll-cards/${card.id}/return`, { token: admin, body: {} })).status === 409);
+  const give = await call('POST', `/etoll-cards/${card.id}/give`, { token: admin, body: { driver_id: dA.id } });
+  check('N30 admin hands it to a driver; the driver sees it as theirs', give.status === 200 && give.data.card.holder?.driver?.id === dA.id &&
+    (await call('GET', '/driver/etoll-cards', { token: dA.token })).data.items[0]?.id === card.id);
+
+  // History, deactivate, delete.
+  const hist = (await call('GET', `/etoll-cards/${card.id}`, { token: admin })).data;
+  check('N31 history: transactions and handovers newest first, admin emails for who entered what',
+    hist.handovers.length === 3 && hist.handovers[0].driver.id === dA.id && hist.transactions.length >= 8 &&
+    new Date(hist.transactions[0].occurred_at) >= new Date(hist.transactions[hist.transactions.length - 1].occurred_at) && Object.values(hist.users).includes('admin@e2e.local'));
+  const req3 = await call('POST', '/driver/requests', { token: dA.token, body: { type: 'ETOLL_TOPUP', card_id: card.id, client_ref: uuid() } });
+  const off = await call('PATCH', `/etoll-cards/${card.id}`, { token: admin, body: { status: 'INACTIVE', inactive_reason: 'Hilang' } });
+  const req3After = await prisma.driverRequest.findUnique({ where: { id: req3.data.request.id } });
+  check('N32 deactivating a held card: handover closed, its open request cancelled, gone from the driver list',
+    off.status === 200 && off.data.status === 'INACTIVE' && off.data.inactive_reason === 'Hilang' && off.data.holder === null && req3After.status === 'CANCELLED' &&
+    !(await call('GET', '/driver/etoll-cards', { token: dA.token })).data.items.some((x) => x.id === card.id));
+  check('N33 an inactive card cannot be taken (409)', (await call('POST', `/driver/etoll-cards/${card.id}/take`, { token: dA.token, body: { client_ref: uuid() } })).status === 409);
+  check('N34 a card with history cannot be deleted (409)', (await call('DELETE', `/etoll-cards/${card.id}`, { token: admin })).status === 409);
+  const spare = await call('POST', '/etoll-cards', { token: admin, body: { issuer: 'MANDIRI', name: `Typo ${tag}`, card_number: `6032${rnd()}9` } });
+  const del = await call('DELETE', `/etoll-cards/${spare.data.id}`, { token: admin });
+  check('N35 a card without history is deleted', spare.status === 201 && spare.data.balance === null && del.status === 200 && !(await prisma.etollCard.findUnique({ where: { id: spare.data.id } })));
+  const act2 = await call('PATCH', `/etoll-cards/${card.id}`, { token: admin, body: { status: 'ACTIVE', name: `Flazz ${tag} B` } });
+  check('N36 reactivating clears the reason; rename', act2.status === 200 && act2.data.status === 'ACTIVE' && act2.data.inactive_reason === null && act2.data.name === `Flazz ${tag} B`);
+
+  // Two drivers press "Ambil kartu" on a free card at the same moment, and one
+  // phone sends the same take twice at once: one open handover, one per ref.
+  const race = (await call('POST', '/etoll-cards', { token: admin, body: { issuer: 'BRI', name: `Race ${tag}`, card_number: `6013${rnd()}${rnd().slice(0, 5)}` } })).data;
+  const sameRef = uuid();
+  const rs = await Promise.all([
+    call('POST', `/driver/etoll-cards/${race.id}/take`, { token: dA.token, body: { client_ref: sameRef } }),
+    call('POST', `/driver/etoll-cards/${race.id}/take`, { token: dA.token, body: { client_ref: sameRef } }),
+    call('POST', `/driver/etoll-cards/${race.id}/take`, { token: dB.token, body: { client_ref: uuid() } }),
+  ]);
+  const open = await prisma.etollCardHandover.findMany({ where: { card_id: race.id, returned_at: null } });
+  check('N37 takes at the same moment: exactly one open handover, the same client_ref stored once',
+    rs.every((x) => x.status === 200 || x.status === 201) && open.length === 1 && (await prisma.etollCardHandover.count({ where: { client_ref: sameRef } })) === 1,
+    rs.map((x) => x.status).join(','));
+});
+
 const failed = summary();
 await prisma.$disconnect();
 process.exit(failed ? 1 : 0);

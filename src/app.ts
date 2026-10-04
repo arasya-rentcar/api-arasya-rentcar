@@ -26,6 +26,7 @@ import leadsRoutes, { publicLeadsRouter } from './modules/leads/leads.route';
 import devicesRoutes from './modules/devices/devices.route';
 import driverAppRoutes from './modules/driver-app/driver-app.route';
 import driverRequestsRoutes from './modules/driver-requests/driver-requests.route';
+import etollCardsRoutes from './modules/etoll-cards/etoll-cards.route';
 import adminNotificationsRoutes from './modules/admin-notifications/admin-notifications.route';
 
 import { errorMiddleware } from './middleware/error.middleware';
@@ -115,6 +116,8 @@ app.use('/api/v1/devices', devicesRoutes);
 app.use('/api/v1/driver', driverAppRoutes);
 // Admin side of driver requests (e-toll top-up); the driver side is /driver/requests.
 app.use('/api/v1/driver-requests', driverRequestsRoutes);
+// Office e-toll cards (pool, handovers, history); the driver side is /driver/etoll-cards.
+app.use('/api/v1/etoll-cards', etollCardsRoutes);
 // Merge: expenses now hang off service-day lines (the line IS the trip).
 app.use('/api/v1/lines', expensesRoutes);
 app.use('/api/v1/bot', botLimiter, botRoutes);

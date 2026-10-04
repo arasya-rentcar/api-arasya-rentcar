@@ -13,7 +13,7 @@ Needs the Postgres 16 binaries (`PG_BIN`, default `/usr/lib/postgresql/16/bin`).
 
 Output: one line per check. `PASS`/`FAIL` count towards the exit code. `KNOWN` is a documented issue that does not fail the run; it turns into `FIXED` once the behaviour is corrected, and should then become a normal `check`. The run exits 1 when any check fails.
 
-What is covered (about 230 checks):
+What is covered (about 265 checks):
 
 | Group | Covers |
 |---|---|
@@ -30,6 +30,7 @@ What is covered (about 230 checks):
 | K | input limits: GPS pairs, file type/size, `client_ref` reuse, push tokens, unassigning |
 | L | admin notification feed (one per real driver action, resends add none; TRIP_COST for receipts; per-admin read state, unread count), e-toll requests (idempotent, already_open, done once with push), `location_name`, `etoll_card`, server stamp on checkpoint photos the phone did not stamp |
 | M | trip costs: "Dibayar oleh" decides what the driver is owed, "Ditagih ke pelanggan" only moves the cost to the invoice (pass-through, margin unchanged); admin Biaya Tambahan never touches the payable; `/analytics/dashboard` margin matches the order card |
+| N | office e-toll cards: add (digits only, unique number, first balance), driver list without the full number, take/return idempotent on `client_ref`, take-over closes the other driver's handover, two takes at once keep one open handover, older-app requests linked to the held card, one open request per card, "done" with the amount records the top-up (push says to update the balance on the card), admin top-up/toll/balance entries and void, estimate = last known balance ± entries since, deactivate closes the handover and cancels the request, delete only without history |
 
 Safety: `lib.mjs` refuses to run unless both the API and the database are on localhost (`E2E_ALLOW_REMOTE=1` overrides it, for a disposable copy only). The checks create users, drivers, orders and payments.
 
