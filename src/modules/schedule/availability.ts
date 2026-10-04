@@ -1,4 +1,4 @@
-import type { Prisma, ScheduleStatus } from '@prisma/client';
+import { Prisma, type ScheduleStatus } from '@prisma/client';
 import { AppError } from '../../utils/AppError';
 import { wibShortDay, wibStartOfDay } from '../../utils/wib';
 
@@ -11,6 +11,10 @@ import { wibShortDay, wibStartOfDay } from '../../utils/wib';
  * next week is free tomorrow. A unit is taken when another open day
  * (SCHEDULED / ASSIGNED / IN_PROGRESS) of it overlaps one of the days. OFF and
  * MAINTENANCE are manual "not on the road" flags and still refuse.
+ *
+ * Callers check inside the assigning transaction, after the order lock and
+ * lockUnits: two admins giving one driver or car overlapping days of two
+ * orders at the same moment are then serialised, and the second is refused.
  */
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -162,4 +166,27 @@ export async function assertUnitsFree(
         409,
       );
   }
+}
+
+/**
+ * Lock the drivers and cars an assignment touches, in id order (so two
+ * assignments cannot deadlock on them), inside the assigning transaction and
+ * after its order lock: lock order day → order → driver/car, like the status
+ * syncs that update these rows later in the same transaction. A concurrent
+ * assignment of the same driver or car waits here until the first commits,
+ * so its assertUnitsFree sees the first one's days.
+ */
+export async function lockUnits(
+  tx: Prisma.TransactionClient,
+  driverIds: (string | null | undefined)[],
+  carIds: (string | null | undefined)[],
+): Promise<void> {
+  const ids = (xs: (string | null | undefined)[]) =>
+    [...new Set(xs.filter((x): x is string => !!x))].sort();
+  const d = ids(driverIds);
+  const c = ids(carIds);
+  if (d.length)
+    await tx.$queryRaw`SELECT id FROM "drivers" WHERE id IN (${Prisma.join(d)}) ORDER BY id FOR NO KEY UPDATE`;
+  if (c.length)
+    await tx.$queryRaw`SELECT id FROM "cars" WHERE id IN (${Prisma.join(c)}) ORDER BY id FOR NO KEY UPDATE`;
 }

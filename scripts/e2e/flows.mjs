@@ -243,6 +243,29 @@ await section('B. Assignment paths (T4: one way to assign)', async () => {
   const evening = await putLine(u2, { is_external: false, start_at: wibIso(8, '20:30'), end_at: wibIso(8, '23:00') });
   const swap2 = await call('POST', `/orders/${oB6.id}/reassign`, { token: admin, body: { driver_id: d9.id, car_id: car9.id } });
   check('B32 same date, hours that do not overlap: "Ganti Semua" gives both days to one driver', evening.status === 200 && swap2.status === 200 && (await days6()).every((l) => l.driver_id === d9.id && l.car_id === car9.id), `${evening.status} ${swap2.status} ${swap2.json?.message ?? ''}`);
+
+  // Two admins give one driver overlapping days of two orders at the same
+  // moment: the second waits for the first and is refused (not both saved).
+  const d10 = await makeDriver(10);
+  const d11 = await makeDriver(11);
+  const [car10, car11, car12, car13] = [await makeCar('Ertiga'), await makeCar('Terios'), await makeCar('Rush'), await makeCar('Livina')];
+  const racePair = async (name, first, second) => {
+    const oa = await makeOrder(`${name}a`, { startDay: 9 });
+    const ob = await makeOrder(`${name}b`, { startDay: 9 });
+    await payDp(oa, 200_000);
+    await payDp(ob, 200_000);
+    return Promise.all([first(oa), second(ob)]);
+  };
+  const r1 = await racePair('B7',
+    (o) => putLine(o.service_items[0].id, { is_external: false, driver_id: d10.id, car_id: car10.id }),
+    (o) => putLine(o.service_items[0].id, { is_external: false, driver_id: d10.id, car_id: car11.id }));
+  const held10 = await prisma.orderServiceItem.count({ where: { driver_id: d10.id } });
+  check('B33 two per-day assigns of one driver to overlapping days at once: one saved, the other 409', r1.filter((r) => r.status === 409).length === 1 && held10 === 1, r1.map((r) => `${r.status} ${r.json?.message ?? ''}`).join(' | '));
+  const r2 = await racePair('B8',
+    (o) => putLine(o.service_items[0].id, { is_external: false, driver_id: d11.id, car_id: car12.id }),
+    (o) => call('POST', `/orders/${o.id}/assign`, { token: admin, body: { driver_id: d11.id, car_id: car13.id } }));
+  const held11 = await prisma.orderServiceItem.count({ where: { driver_id: d11.id } });
+  check('B34 per-day assign and "Tetapkan untuk Semua" of one driver at once: one saved, the other 409', r2.filter((r) => r.status === 409).length === 1 && held11 === 1, r2.map((r) => `${r.status} ${r.json?.message ?? ''}`).join(' | '));
 });
 
 // ── C. Edit Order keeps the days (T1) ──────────────────────────────────────
@@ -844,6 +867,7 @@ await section('L. Admin notifications, driver requests, location names', async (
   check('L41 driver list (all) newest first', allOwn.data.items.length === 2 && allOwn.data.items[0].id === q4.data.request.id && allOwn.data.items[1].status === 'DONE');
   const doneList = await call('GET', '/driver-requests?status=done', { token: admin });
   check('L42 admin list by status DONE', doneList.data.items.some((x) => x.id === q1.data.request.id) && !doneList.data.items.some((x) => x.id === q4.data.request.id));
+
 });
 
 // ── M. Trip costs billed to the customer vs money owed to the driver (F3) ──
