@@ -219,6 +219,30 @@ await section('B. Assignment paths (T4: one way to assign)', async () => {
   check('B28 a trip under way keeps driver ON_DUTY and car IN_USE whatever its date', started.status === 200 && (await st(d4)) === 'ON_DUTY' && (await cs(car6)) === 'IN_USE');
   await putLine(b5day, { is_external: false, line_status: 'CANCELLED' });
   check('B29 trip closed: driver and car AVAILABLE', (await st(d4)) === 'AVAILABLE' && (await cs(car6)) === 'AVAILABLE');
+
+  // Two units on the same date and hours: one driver / car cannot take both
+  // on the bulk paths either (per-day assign already refuses the second).
+  const [d7, d8, d9] = [await makeDriver(7), await makeDriver(8), await makeDriver(9)];
+  const [car7, car8, car9] = [await makeCar('Alphard'), await makeCar('Calya'), await makeCar('Sigra')];
+  const unit = { service_date: wibIso(8, '00:00'), start_at: wibIso(8, '08:00'), end_at: wibIso(8, '20:00'), pickup_location: 'Bogor Botani Square', dropoff_location: 'Bandara Soetta', service_kind: '12H', service_package: 'ALL-IN', unit_price: 500_000 };
+  const cr = await call('POST', '/orders', {
+    token: admin,
+    body: { customer_name: `TEST B6 ${tag}`, customer_phone: `0857${rnd()}`, pickup_location: 'Bogor Botani Square', dropoff_location: 'Bandara Soetta', order_date: new Date().toISOString(), final_price: 1_000_000, service_items: [unit, { ...unit }] },
+  });
+  const oB6 = await order(cr.data.id);
+  await payDp(oB6, 300_000);
+  const [u1, u2] = oB6.service_items.map((l) => l.id);
+  const days6 = () => prisma.orderServiceItem.findMany({ where: { order_id: oB6.id } });
+  const both = await call('POST', `/orders/${oB6.id}/assign`, { token: admin, body: { driver_id: d7.id, car_id: car7.id } });
+  check('B30 bulk assign refused when two days of the order overlap (409), nothing assigned', both.status === 409 && /dua hari/.test(both.json?.message ?? '') && (await days6()).every((l) => l.driver_id === null), `${both.status} ${both.json?.message ?? ''}`);
+  const p1 = await putLine(u1, { is_external: false, driver_id: d7.id, car_id: car7.id });
+  const p2 = await putLine(u2, { is_external: false, driver_id: d8.id, car_id: car8.id });
+  const swap = await call('POST', `/orders/${oB6.id}/reassign`, { token: admin, body: { driver_id: d9.id, car_id: car9.id } });
+  const kept = await days6();
+  check('B31 "Ganti Semua" refused when one driver would get both overlapping days (409), days unchanged', p1.status === 200 && p2.status === 200 && swap.status === 409 && /dua hari/.test(swap.json?.message ?? '') && kept.some((l) => l.driver_id === d7.id) && kept.some((l) => l.driver_id === d8.id), `${p1.status} ${p2.status} ${swap.status} ${swap.json?.message ?? ''}`);
+  const evening = await putLine(u2, { is_external: false, start_at: wibIso(8, '20:30'), end_at: wibIso(8, '23:00') });
+  const swap2 = await call('POST', `/orders/${oB6.id}/reassign`, { token: admin, body: { driver_id: d9.id, car_id: car9.id } });
+  check('B32 same date, hours that do not overlap: "Ganti Semua" gives both days to one driver', evening.status === 200 && swap2.status === 200 && (await days6()).every((l) => l.driver_id === d9.id && l.car_id === car9.id), `${evening.status} ${swap2.status} ${swap2.json?.message ?? ''}`);
 });
 
 // ── C. Edit Order keeps the days (T1) ──────────────────────────────────────

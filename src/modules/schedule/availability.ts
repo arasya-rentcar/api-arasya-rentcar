@@ -93,10 +93,28 @@ async function firstClash(
 }
 
 /**
+ * Two of the days being given in one request overlap each other ("Tetapkan
+ * untuk Semua" / "Ganti Semua" on an order with two units on the same date):
+ * one driver or car cannot take both, exactly as a per-day assign refuses the
+ * second one. Returns the later day of the first overlapping pair.
+ */
+function overlapWithin(days: DayTimes[]): DayTimes | null {
+  const wins = days
+    .map((d) => ({ d, w: dayWindow(d) }))
+    .filter((x): x is { d: DayTimes; w: [number, number] } => !!x.w)
+    .sort((a, b) => a.w[0] - b.w[0]);
+  for (let i = 1; i < wins.length; i++)
+    for (let j = 0; j < i; j++)
+      if (wins[j].w[0] < wins[i].w[1] && wins[i].w[0] < wins[j].w[1]) return wins[i].d;
+  return null;
+}
+
+/**
  * Refuse (409, Indonesian message) when the driver or car is flagged OFF /
- * MAINTENANCE or already has another open day overlapping `days`. Pass only
- * the units being newly given to these days (re-saving the same driver never
- * fails on an old double booking).
+ * MAINTENANCE, already has another open day overlapping `days`, or would get
+ * two of `days` that overlap each other. Pass only the units being newly
+ * given to these days (re-saving the same driver never fails on an old
+ * double booking).
  */
 export async function assertUnitsFree(
   db: Prisma.TransactionClient,
@@ -115,6 +133,17 @@ export async function assertUnitsFree(
   if (car?.status === 'MAINTENANCE')
     throw new AppError(
       `Mobil ${car.plate_number} sedang MAINTENANCE. Ubah statusnya di menu Mobil dulu bila sudah bisa dipakai.`,
+      409,
+    );
+  const twin = overlapWithin(days);
+  if (twin && driver)
+    throw new AppError(
+      `Driver ${driver.name} tidak bisa memegang dua hari yang waktunya bertabrakan di order ini (${when(twin)}). Atur jamnya dulu atau tetapkan driver per hari.`,
+      409,
+    );
+  if (twin && car)
+    throw new AppError(
+      `Mobil ${car.plate_number} tidak bisa dipakai di dua hari yang waktunya bertabrakan di order ini (${when(twin)}). Atur jamnya dulu atau pilih mobil per hari.`,
       409,
     );
   if (driver) {
