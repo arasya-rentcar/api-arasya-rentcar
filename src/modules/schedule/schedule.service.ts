@@ -192,13 +192,21 @@ export async function assignScheduleLine(
   const line = await prisma.orderServiceItem.findUnique({
     where: { id },
     include: {
-      order: { select: { payment_status: true, order_status: true } },
+      order: { select: { payment_status: true, order_status: true, cancellation_fee: true } },
       payable: { select: { status: true, kind: true } },
     },
   });
   if (!line) throw new AppError('Schedule line not found', 404);
   // T5: the days of a finished or cancelled order are closed.
   assertOrderOpenForDayChanges(line.order);
+  // Cancelled after some days were done: the done days stay editable until
+  // finalize, the cancelled ones are closed (the order total is the fee).
+  if (line.order.cancellation_fee != null && line.line_status === 'CANCELLED') {
+    throw new AppError(
+      'Hari ini sudah dibatalkan bersama sisa order, jadi tidak bisa diubah lagi.',
+      409,
+    );
+  }
 
   const isExternal = input.is_external ?? line.is_external;
 
@@ -432,13 +440,19 @@ export async function assignScheduleLine(
     await recomputeLineMoney(tx, id);
     await rollupOrderFinance(tx, line.order_id);
     // T5 again, under the order lock rollupOrderFinance took: a finalize or
-    // cancel that committed meanwhile wins and this save is rolled back.
-    assertOrderOpenForDayChanges(
-      await tx.order.findUniqueOrThrow({
-        where: { id: line.order_id },
-        select: { order_status: true },
-      }),
-    );
+    // cancel that committed meanwhile wins and this save is rolled back (also
+    // a cancel that kept done days: it may have cancelled this very day).
+    const fresh = await tx.order.findUniqueOrThrow({
+      where: { id: line.order_id },
+      select: { order_status: true, cancellation_fee: true },
+    });
+    assertOrderOpenForDayChanges(fresh);
+    if (fresh.cancellation_fee != null && line.order.cancellation_fee == null) {
+      throw new AppError(
+        'Sisa order ini baru saja dibatalkan. Buka ulang order lalu simpan lagi bila hari ini masih perlu diubah.',
+        409,
+      );
+    }
     if (checkUnits) {
       // Another admin giving the same driver / car an overlapping day at the
       // same moment waits on these locks and is then refused.
@@ -479,12 +493,16 @@ export async function assignScheduleLine(
  * Recompute the order's rolled-up totals + margin from its day-lines.
  *
  *  - final_price = active (non-cancelled) days + all billable charges,
- *    except on a cancelled order, whose price is the cancellation fee.
+ *    except on a cancelled order (cancellation_fee set, also when done days
+ *    keep it open), whose price is the cancellation fee.
  *  - Costs: driver fees, Arasya's trip costs and partner RTR of every day
  *    (a cancelled day can still cost money if the trip had started).
  *  - margin = Σ active day margins − costs of cancelled days + charges that
  *    are real extra income (overtime, extra stop…). Trip costs billed to the
  *    customer are pass-through: income and cost cancel out.
+ *  - A cancellation fee replaces what the cancelled days and the charges
+ *    would have earned: margin += fee − active day prices − all charges
+ *    (same rule as the dashboard's cancellation income).
  */
 export async function rollupOrderFinance(
   tx: Prisma.TransactionClient,
@@ -503,6 +521,7 @@ export async function rollupOrderFinance(
       payment_status: true,
       is_refunded: true,
       refund_amount: true,
+      cancellation_fee: true,
       invoices: {
         where: {
           invoice_type: 'CANCELLATION_FEE',
@@ -553,9 +572,16 @@ export async function rollupOrderFinance(
     charges += amt;
     if (!a.expense) margin += amt;
   }
+  if (order.cancellation_fee != null) {
+    margin += Number(order.cancellation_fee) - revenue - charges;
+  }
 
+  // An active CANCELLATION_FEE invoice marked orders cancelled before
+  // cancellation_fee existed (the migration backfills it; kept as a fallback).
   const cancelledOrder =
-    order.order_status === 'CANCELLED' || order.invoices.length > 0;
+    order.order_status === 'CANCELLED' ||
+    order.cancellation_fee != null ||
+    order.invoices.length > 0;
   const finalPrice = cancelledOrder
     ? Number(order.final_price)
     : revenue + charges;

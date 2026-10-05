@@ -16,10 +16,14 @@
  * The order margin is the sum of its day margins plus billable charges that
  * are not pass-through trip costs (see rollupOrderFinance).
  *
+ * v5 (2026-10-06): a cancelled order's margin includes its cancellation fee
+ * (fee − active day prices − charges), so the order card and the dashboard
+ * agree after a cancellation.
+ *
  * Bump MARGIN_FORMULA_VERSION whenever this logic changes so historical rows
  * remain auditable.
  */
-export const MARGIN_FORMULA_VERSION = 'v4-2026-10-03';
+export const MARGIN_FORMULA_VERSION = 'v5-2026-10-06';
 
 export interface MarginInputs {
   isExternal: boolean;

@@ -466,6 +466,10 @@ export async function dashboardAnalytics(opts: RangeOpts = {}) {
 //   Final     = lines on DONE/finalized orders (realized), and
 //   Estimated = still-open lines (same formula, flagged estimated).
 // "Final" line test: order_status DONE OR line_status DONE.
+// A cancelled day earns nothing; it shows only when it still cost something
+// (a started trip keeps its fee / RTR), as a settled (Final) cost. Extra
+// charges and cancellation fees have no unit: they are in `order_level`, so
+// sections A + B + order_level add up to the Dashboard's Revenue.
 interface RevenueOpts {
   date_from?: string;
   date_to?: string;
@@ -474,11 +478,10 @@ interface RevenueOpts {
 export async function revenueReport(opts: RevenueOpts = {}) {
   const { start, end } = wibMonthBounds(opts.date_from, opts.date_to);
 
-  const lines = await prisma.orderServiceItem.findMany({
+  const orderLevelP = orderLevelSlice(start, end);
+  const linesP = prisma.orderServiceItem.findMany({
     where: {
       service_date: { gte: start, lte: end },
-      order: { order_status: { not: 'CANCELLED' } },
-      line_status: { not: 'CANCELLED' },
     },
     select: {
       id: true,
@@ -510,9 +513,10 @@ export async function revenueReport(opts: RevenueOpts = {}) {
       },
     },
   });
+  const [orderLevel, lines] = await Promise.all([orderLevelP, linesP]);
 
   const isFinal = (l: (typeof lines)[number]) =>
-    l.order?.order_status === 'DONE' || l.line_status === 'DONE';
+    !dayEarns(l) || l.order?.order_status === 'DONE' || l.line_status === 'DONE';
 
   // ── Section A — internal cars, GROUP BY car_id ──────────────────────────────
   type ABucket = {
@@ -569,12 +573,15 @@ export async function revenueReport(opts: RevenueOpts = {}) {
   const bMap = new Map<string, BVendor>();
 
   for (const l of lines) {
-    const billed = n(l.total_price);
+    const earns = dayEarns(l);
+    const extras = n(l.payable?.extras_amount);
+    if (!earns && n(l.ops_cost) + n(l.driver_fee) + n(l.rtr_amount) + extras === 0) continue;
+    const billed = earns ? n(l.total_price) : 0;
     const external = l.is_external || !!l.external_vendor_id || !!l.external_car_id;
 
     if (!external) {
       // Internal car line.
-      internalOrderIds.add(l.order_id);
+      if (earns) internalOrderIds.add(l.order_id);
       const key = l.car_id ?? '__unassigned__';
       if (!aMap.has(key)) {
         aMap.set(key, {
@@ -599,12 +606,18 @@ export async function revenueReport(opts: RevenueOpts = {}) {
       const orderSlot = isFinal(l) ? b.final_order_ids : b.est_order_ids;
       slot.gross += billed;
       slot.ops += n(l.ops_cost);
-      slot.trips += 1;
-      orderSlot.add(l.order_id);
+      if (earns) {
+        slot.trips += 1;
+        orderSlot.add(l.order_id);
+      }
       // Driver fee on this line, accrual basis (the day's fee, not the
       // payable total, which also holds reimbursed trip costs).
-      slot.driver_fee += n(l.driver_fee) + n(l.payable?.extras_amount);
-      if (l.margin_amount != null) {
+      slot.driver_fee += n(l.driver_fee) + extras;
+      if (!earns) {
+        // margin_amount still holds the day's price; a cancelled day only costs.
+        slot.net_margin -= n(l.driver_fee) + n(l.ops_cost) + extras;
+        b.final_margin_known = true;
+      } else if (l.margin_amount != null) {
         slot.net_margin += n(l.margin_amount);
         if (isFinal(l)) b.final_margin_known = true;
         else b.est_margin_known = true;
@@ -635,13 +648,17 @@ export async function revenueReport(opts: RevenueOpts = {}) {
         d.fee_total += amt;
         if (l.payable.status === 'PAID') d.fee_paid += amt;
         else d.fee_pending += amt;
-        d.trips += 1;
-        d.order_ids.add(l.order_id);
+        if (earns) {
+          d.trips += 1;
+          d.order_ids.add(l.order_id);
+        }
       }
     } else {
       // External / vendor line.
-      if (l.external_vendor_id) vendorOrderIds.add(l.order_id);
-      else freelanceOrderIds.add(l.order_id);
+      if (earns) {
+        if (l.external_vendor_id) vendorOrderIds.add(l.order_id);
+        else freelanceOrderIds.add(l.order_id);
+      }
       const vkey = l.external_vendor_id ?? '__freelance__';
       if (!bMap.has(vkey)) {
         bMap.set(vkey, {
@@ -668,8 +685,7 @@ export async function revenueReport(opts: RevenueOpts = {}) {
         });
       }
       const u = v.units.get(ukey)!;
-      const vendorCost =
-        n(l.rtr_amount) + n(l.ops_cost) + n(l.payable?.extras_amount);
+      const vendorCost = n(l.rtr_amount) + n(l.ops_cost) + extras;
       const final = isFinal(l);
       const vSlot = final ? v.final : v.estimated;
       const uSlot = final ? u.final : u.estimated;
@@ -678,13 +694,15 @@ export async function revenueReport(opts: RevenueOpts = {}) {
       vSlot.customer_billed += billed;
       vSlot.vendor_cost += vendorCost;
       vSlot.arasya_margin += billed - vendorCost;
-      vSlot.trips += 1;
-      vOrdSlot.add(l.order_id);
       uSlot.customer_billed += billed;
       uSlot.vendor_cost += vendorCost;
       uSlot.arasya_margin += billed - vendorCost;
-      uSlot.trips += 1;
-      uOrdSlot.add(l.order_id);
+      if (earns) {
+        vSlot.trips += 1;
+        vOrdSlot.add(l.order_id);
+        uSlot.trips += 1;
+        uOrdSlot.add(l.order_id);
+      }
     }
   }
 
@@ -840,6 +858,11 @@ export async function revenueReport(opts: RevenueOpts = {}) {
       rows: sectionC,
       totals: cTotals,
     },
+    order_level: {
+      extra_charges: round(orderLevel.extra_charges),
+      cancellation_income: round(orderLevel.cancellation_income),
+      pass_through: round(orderLevel.pass_through),
+    },
   };
 }
 
@@ -847,17 +870,34 @@ export async function revenueReport(opts: RevenueOpts = {}) {
 // Dashboard v2 — one-page owner/finance view
 //
 // Accounting rules (LOCKED — do not change without bumping the rule set):
+// Rule set v2 (2026-10-06): extra charges, cancellation fees and the costs of
+// cancelled days are in; the order card (rollupOrderFinance) uses the same rule.
 //
-//   ACCRUAL (basis = OrderServiceItem.service_date, WIB calendar in range)
-//     revenue       = Σ OrderServiceItem.total_price (order/line ≠ CANCELLED)
-//     ops_cost      = Σ OrderServiceItem.ops_cost
-//     driver_cost   = Σ (driver_fee + payable extras) of internal days
-//     vendor_cost   = Σ (rtr_amount + payable extras) of partner days
+//   ACCRUAL
+//     day_revenue   = Σ total_price of days in range (by service_date, WIB)
+//                     whose day and order are not CANCELLED
+//     extra_charges = Σ billable OrderAdjustment (amount × quantity) added in
+//                     range (by created_at), except trip costs billed back at
+//                     cost (linked to an Expense) → pass_through, which is
+//                     neither revenue nor cost
+//     cancellation_income = Σ over orders cancelled in range (cancelled_at) of
+//                     cancellation_fee − day prices kept − all billable charges
+//                     (the fee replaces what the cancelled days and charges
+//                     would have earned)
+//     revenue       = day_revenue + extra_charges + cancellation_income
+//     ops_cost      = Σ OrderServiceItem.ops_cost        ┐ every day in range,
+//     driver_cost   = Σ (driver_fee + payable extras)    │ cancelled ones too
+//                     of internal days                   │ (a started trip keeps
+//     vendor_cost   = Σ (rtr_amount + payable extras)    │ its fee / RTR; a day
+//                     of partner days                    ┘ cancelled before it
+//                     started has them zeroed)
 //                     (not Payable.total_amount: a driver payable also holds
 //                     reimbursed trip costs, already counted in ops_cost or
 //                     passed on to the customer)
 //     margin        = revenue − ops_cost − driver_cost − vendor_cost
 //     margin_pct    = margin / revenue (null if revenue=0)
+//     Revenue is the customer price, partner days included (decided 6 Oct 2026);
+//     the partner's RTR is a cost, so the markup shows in the margin.
 //
 //   CASH (basis = payment_date / paid_at WIB in range)
 //     collected     = Σ Receipt.amount        (any payment_method)
@@ -865,12 +905,14 @@ export async function revenueReport(opts: RevenueOpts = {}) {
 //     net_cash      = collected − paid_out
 //
 //   OUTSTANDING (current snapshot; NOT period-scoped)
-//     ar_outstanding = Σ (Order.final_price − Order.paid_to_date)
-//                      WHERE order_status≠CANCELLED AND payment_status≠PAID
+//     ar_outstanding = Σ (Order.final_price − Order.paid_to_date) > 0
+//                      WHERE payment_status≠PAID (a cancelled order's
+//                      final_price is its fee, so an unpaid fee is owed)
 //     ap_outstanding = Σ Payable.total_amount WHERE status=UNPAID
 //
 //     Overdue rule (Arasya: due day-1 of service):
-//       ar overdue = AR rows where MIN(service_items.service_date) ≤ today (WIB)
+//       ar overdue = AR rows where MIN(service_items.service_date) ≤ today (WIB);
+//                    a cancellation fee is due from the cancellation date
 //       ap overdue = Payable rows where service_date ≤ today (WIB)
 //
 //   Δ vs prior period = same calc over a window of identical length placed
@@ -901,8 +943,9 @@ function delta(curr: number, prev: number): number | null {
   return (curr - prev) / Math.abs(prev);
 }
 
-interface AccrualSlice {
+interface AccrualSlice extends OrderLevelSlice {
   revenue: number;
+  day_revenue: number;
   ops_cost: number;
   driver_cost: number;
   vendor_cost: number;
@@ -911,45 +954,141 @@ interface AccrualSlice {
   trips: number;
 }
 
-async function accrualSlice(start: Date, end: Date): Promise<AccrualSlice> {
-  const lines = await prisma.orderServiceItem.findMany({
-    where: {
-      service_date: { gte: start, lte: end },
-      line_status: { not: 'CANCELLED' },
-      order: { order_status: { not: 'CANCELLED' } },
-    },
-    select: {
-      total_price: true,
-      ops_cost: true,
-      driver_fee: true,
-      rtr_amount: true,
-      is_external: true,
-      payable: { select: { extras_amount: true } },
-    },
-  });
-  // Same rule as the order card (margin v4): revenue − driver fees − RTR −
+interface OrderLevelSlice {
+  extra_charges: number;
+  cancellation_income: number;
+  pass_through: number;
+}
+
+// A day earns its price unless it, or its whole order, was cancelled.
+const dayEarns = (l: { line_status: string; order: { order_status: string } | null }) =>
+  l.line_status !== 'CANCELLED' && l.order?.order_status !== 'CANCELLED';
+
+// Order-level income has no unit; it goes to the vendor side only when every
+// day of the order went to a partner.
+const orderChannel = (days: { is_external: boolean }[]): 'internal' | 'vendor' =>
+  days.length > 0 && days.every((d) => d.is_external) ? 'vendor' : 'internal';
+
+// Income that belongs to an order, not to one day (rules in the header):
+// extra charges by the date they were added (a later day edit never moves
+// them to another month), cancellation fees by the cancellation date.
+async function orderLevelSlice(
+  start: Date,
+  end: Date,
+): Promise<OrderLevelSlice & { by_channel: Record<'internal' | 'vendor', number> }> {
+  const [charges, cancelled] = await Promise.all([
+    prisma.orderAdjustment.findMany({
+      where: { is_billable: true, created_at: { gte: start, lte: end } },
+      select: {
+        amount: true,
+        quantity: true,
+        expense: { select: { id: true } },
+        order: { select: { service_items: { select: { is_external: true } } } },
+      },
+    }),
+    prisma.order.findMany({
+      where: { cancellation_fee: { not: null }, cancelled_at: { gte: start, lte: end } },
+      select: {
+        order_status: true,
+        cancellation_fee: true,
+        service_items: {
+          select: { line_status: true, total_price: true, is_external: true },
+        },
+        adjustments: {
+          where: { is_billable: true },
+          select: { amount: true, quantity: true },
+        },
+      },
+    }),
+  ]);
+  const out = {
+    extra_charges: 0,
+    cancellation_income: 0,
+    pass_through: 0,
+    by_channel: { internal: 0, vendor: 0 },
+  };
+  for (const a of charges) {
+    const amt = n(a.amount) * (a.quantity ?? 1);
+    // A trip cost billed back at cost: the customer repays it, Arasya (or the
+    // driver) paid it, so it is neither income nor margin.
+    if (a.expense) {
+      out.pass_through += amt;
+      continue;
+    }
+    out.extra_charges += amt;
+    out.by_channel[orderChannel(a.order.service_items)] += amt;
+  }
+  for (const o of cancelled) {
+    const kept = o.service_items
+      .filter((l) => dayEarns({ line_status: l.line_status, order: o }))
+      .reduce((s, l) => s + n(l.total_price), 0);
+    const charged = o.adjustments.reduce((s, a) => s + n(a.amount) * (a.quantity ?? 1), 0);
+    const income = n(o.cancellation_fee) - kept - charged;
+    out.cancellation_income += income;
+    out.by_channel[orderChannel(o.service_items)] += income;
+  }
+  return out;
+}
+
+type OrderLevel = Awaited<ReturnType<typeof orderLevelSlice>>;
+
+// `orderLevel` may be passed in when the caller already computed it for the
+// same range (dashboardV2 shares one with channelSplit).
+async function accrualSlice(
+  start: Date,
+  end: Date,
+  orderLevelP: Promise<OrderLevel> = orderLevelSlice(start, end),
+): Promise<AccrualSlice> {
+  const [lines, orderLevel] = await Promise.all([
+    prisma.orderServiceItem.findMany({
+      where: { service_date: { gte: start, lte: end } },
+      select: {
+        total_price: true,
+        ops_cost: true,
+        driver_fee: true,
+        rtr_amount: true,
+        is_external: true,
+        line_status: true,
+        order: { select: { order_status: true } },
+        payable: { select: { extras_amount: true } },
+      },
+    }),
+    orderLevelP,
+  ]);
+  // Same rule as the order card (margin v5): revenue − driver fees − RTR −
   // Arasya's share of the approved trip costs. Payables are not used here:
   // a driver payable also carries reimbursed trip costs (already in ops_cost).
-  let revenue = 0;
+  // A cancelled day earns nothing but keeps what it cost.
+  let day_revenue = 0;
+  let trips = 0;
   let ops_cost = 0;
   let driver_cost = 0;
   let vendor_cost = 0;
   for (const l of lines) {
-    revenue += n(l.total_price);
+    if (dayEarns(l)) {
+      day_revenue += n(l.total_price);
+      trips += 1;
+    }
     ops_cost += n(l.ops_cost);
     const extras = n(l.payable?.extras_amount);
     if (l.is_external) vendor_cost += n(l.rtr_amount) + extras;
     else driver_cost += n(l.driver_fee) + extras;
   }
+  const { extra_charges, cancellation_income, pass_through } = orderLevel;
+  const revenue = day_revenue + extra_charges + cancellation_income;
   const margin = revenue - ops_cost - driver_cost - vendor_cost;
   return {
     revenue,
+    day_revenue,
+    extra_charges,
+    cancellation_income,
+    pass_through,
     ops_cost,
     driver_cost,
     vendor_cost,
     margin,
     margin_pct: pct(margin, revenue),
-    trips: lines.length,
+    trips,
   };
 }
 
@@ -970,38 +1109,47 @@ async function cashSlice(start: Date, end: Date) {
 }
 
 // Per-channel accrual (internal vs vendor) for the Channel Split panel.
-async function channelSplit(start: Date, end: Date) {
-  const lines = await prisma.orderServiceItem.findMany({
-    where: {
-      service_date: { gte: start, lte: end },
-      line_status: { not: 'CANCELLED' },
-      order: { order_status: { not: 'CANCELLED' } },
-    },
-    select: {
-      total_price: true,
-      ops_cost: true,
-      is_external: true,
-      driver_fee: true,
-      rtr_amount: true,
-      payable: { select: { extras_amount: true } },
-    },
-  });
+async function channelSplit(
+  start: Date,
+  end: Date,
+  orderLevelP: Promise<OrderLevel> = orderLevelSlice(start, end),
+) {
+  const [lines, orderLevel] = await Promise.all([
+    prisma.orderServiceItem.findMany({
+      where: { service_date: { gte: start, lte: end } },
+      select: {
+        total_price: true,
+        ops_cost: true,
+        is_external: true,
+        driver_fee: true,
+        rtr_amount: true,
+        line_status: true,
+        order: { select: { order_status: true } },
+        payable: { select: { extras_amount: true } },
+      },
+    }),
+    orderLevelP,
+  ]);
   const internal = { revenue: 0, ops_cost: 0, driver_cost: 0, margin: 0, trips: 0 };
   const vendor = { billed: 0, vendor_cost: 0, margin: 0, trips: 0 };
   for (const l of lines) {
-    const price = n(l.total_price);
+    const earns = dayEarns(l);
+    const price = earns ? n(l.total_price) : 0;
     if (l.is_external) {
       vendor.billed += price;
       vendor.vendor_cost +=
         n(l.rtr_amount) + n(l.ops_cost) + n(l.payable?.extras_amount);
-      vendor.trips += 1;
+      if (earns) vendor.trips += 1;
     } else {
       internal.revenue += price;
       internal.ops_cost += n(l.ops_cost);
       internal.driver_cost += n(l.driver_fee) + n(l.payable?.extras_amount);
-      internal.trips += 1;
+      if (earns) internal.trips += 1;
     }
   }
+  // Extra charges and cancellation fees, so the two cards add up to Revenue.
+  internal.revenue += orderLevel.by_channel.internal;
+  vendor.billed += orderLevel.by_channel.vendor;
   internal.margin = internal.revenue - internal.ops_cost - internal.driver_cost;
   vendor.margin = vendor.billed - vendor.vendor_cost;
   return {
@@ -1014,10 +1162,10 @@ async function channelSplit(start: Date, end: Date) {
 async function outstandingSnapshot() {
   const today = wibTodayEnd();
 
-  // AR: orders not paid in full, not cancelled.
+  // AR: orders not paid in full. A cancelled order's final_price is its
+  // cancellation fee, so an unpaid fee is owed too.
   const arOrders = await prisma.order.findMany({
     where: {
-      order_status: { not: 'CANCELLED' },
       payment_status: { not: 'PAID' },
     },
     select: {
@@ -1027,6 +1175,7 @@ async function outstandingSnapshot() {
       final_price: true,
       paid_to_date: true,
       order_date: true,
+      cancelled_at: true,
       service_items: {
         select: { service_date: true },
         orderBy: { service_date: 'asc' },
@@ -1044,9 +1193,10 @@ async function outstandingSnapshot() {
     const due = n(o.final_price) - n(o.paid_to_date);
     if (due <= 0) continue;
     ar_outstanding += due;
-    // Earliest service line determines the due date (Arasya: due day-1).
+    // Earliest service line determines the due date (Arasya: due day-1); a
+    // cancellation fee is due from the cancellation.
     const sd = o.service_items[0]?.service_date ?? null;
-    const ref = sd ?? o.order_date;
+    const ref = o.cancelled_at ?? sd ?? o.order_date;
     if (ref && ref <= today) {
       arOverdue.push({
         id: o.id,
@@ -1147,13 +1297,15 @@ export async function dashboardV2(opts: RangeOpts = {}) {
   const priorEnd = new Date(start.getTime() - 1);
   const priorStart = new Date(priorEnd.getTime() - len);
 
+  // One order-level slice for the current range, shared by both users.
+  const orderLevelCurr = orderLevelSlice(start, end);
   const [accCurr, accPrev, cashCurr, cashPrev, channel, outstanding, trend] =
     await Promise.all([
-      accrualSlice(start, end),
+      accrualSlice(start, end, orderLevelCurr),
       accrualSlice(priorStart, priorEnd),
       cashSlice(start, end),
       cashSlice(priorStart, priorEnd),
-      channelSplit(start, end),
+      channelSplit(start, end, orderLevelCurr),
       outstandingSnapshot(),
       trailing6mTrend(end),
     ]);

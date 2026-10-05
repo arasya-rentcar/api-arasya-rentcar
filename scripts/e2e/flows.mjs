@@ -461,6 +461,8 @@ await section('D. Driver flow', async () => {
   check('D18 another driver cannot report on this trip (404)', (await call('POST', `/driver/trips/${lineId}/reports`, { token: d1.token, form: f })).status === 404);
   const fin = await act(d2, lineId, 'finish', { notes: 'selesai' });
   check('D19 finish → DONE; order awaits finalization', fin.data.status === 'DONE' && (await order(o.id)).awaiting_finalization === true);
+  const cDone = await call('POST', `/orders/${o.id}/cancel`, { token: admin, body: { reason: 'x' } });
+  check('D19b cancel refused once every day is done (409), invoices untouched', cDone.status === 409 && (await order(o.id)).invoices.every((i) => i.status !== 'CANCELLED'), cDone.json?.message);
   check('D20 late receipt after DONE accepted', (await report(d2, lineId, { report_type: 'TOLL', amount: 30000 })).status === 200);
   check('D21 finalize refused while costs are PENDING (409)', (await call('POST', `/orders/${o.id}/finalize`, { token: admin })).status === 409);
   for (const e of await prisma.expense.findMany({ where: { order_service_item_id: lineId } })) {
@@ -502,7 +504,9 @@ await section('E. Cancellation', async () => {
   check('E1 tier 1 before day H: penalty 20% = 200.000, refund 100.000', c.data?.tier === 1 && c.data.penalty === 200000 && c.data.refundDue === 100000, JSON.stringify(c.data));
   const after = await order(o.id);
   check('E2 order CANCELLED, days CANCELLED, driver released, fee 0', after.order_status === 'CANCELLED' && after.service_items.every((l) => l.line_status === 'CANCELLED' && !l.driver_id && Number(l.driver_fee) === 0));
-  check('E3 cancellation-fee invoice issued, old invoice CANCELLED', after.invoices.some((i) => i.invoice_type === 'CANCELLATION_FEE' && i.status === 'ISSUED') && after.invoices.find((i) => i.id === dp.id).status === 'CANCELLED');
+  check('E3 [A6] DP covers the fee: no cancellation-fee invoice, old invoice CANCELLED, fee stored on the order',
+    !after.invoices.some((i) => i.invoice_type === 'CANCELLATION_FEE') && after.invoices.find((i) => i.id === dp.id).status === 'CANCELLED' &&
+    Number(after.cancellation_fee) === 200000 && after.cancellation_reason === 'Pelanggan batal' && !!after.cancelled_at);
   check('E4 driver action on the cancelled day → 404', (await act(d3, o.service_items[0].id, 'start')).status === 404);
   check('E5 cancelling twice refused (409)', (await call('POST', `/orders/${o.id}/cancel`, { token: admin, body: { reason: 'lagi' } })).status === 409);
   check('E6 driver AVAILABLE again', (await prisma.driver.findUnique({ where: { id: d3.id } })).status === 'AVAILABLE');
@@ -571,11 +575,13 @@ await section('G. Payments (T3)', async () => {
   const rc4 = await prisma.receipt.count({ where: { invoice_id: i4.data.id } });
   const ok4 = (st4 === 'PAID' && rc4 === 1 && rev4.status === 409) || (st4 === 'REVISED' && rc4 === 0 && pay4.status === 409);
   check('G14 pay + revise at once: one wins, no payment on a revised invoice', ok4, `invoice ${st4}, receipts ${rc4}, pay ${pay4.status}, revise ${rev4.status}`);
-  // Money on an invoice voided by a cancellation still counts.
-  const o5 = await makeOrder('G15', { startDay: 4 });
+  // Money on an invoice voided by a cancellation still counts. The day was
+  // yesterday (tier 3, fee 100%), so the DP does not cover the fee.
+  const o5 = await makeOrder('G15', { startDay: -1 });
   await payDp(o5, 200_000);
   const c5 = await call('POST', `/orders/${o5.id}/cancel`, { token: admin, body: { reason: 'batal' } });
   const fee = (await order(o5.id)).invoices.find((i) => i.invoice_type === 'CANCELLATION_FEE');
+  check('G15a [A6] fee invoice asks only for the rest (fee 1.000.000 − DP 200.000)', c5.status === 200 && c5.data.tier === 3 && Number(fee?.amount) === 800000, `${JSON.stringify(c5.data ?? c5.json)} ${fee?.amount}`);
   await markPaid(o5.id, fee.id, { amount_received: 50_000 });
   const ord5 = await order(o5.id);
   check('G15 paid_to_date keeps the DP of a cancelled order (200.000 + 50.000)', c5.status === 200 && Number(ord5.paid_to_date) === 250000, String(ord5.paid_to_date));
@@ -688,6 +694,8 @@ await section('J. Phone clock, stale trips, packages, cancel on day H', async ()
   const wibHour = new Date(Date.now() + 7 * 3600e3).getUTCHours();
   const c = await call('POST', `/orders/${o.id}/cancel`, { token: admin, body: { reason: 'tes hari H' } });
   check('J7 cancel on day H after a departure → tier 3 (100%)', c.data?.tier === 3, `WIB hour ${wibHour}, ${JSON.stringify(c.data)}`);
+  const jFee = (await order(o.id)).invoices.find((i) => i.invoice_type === 'CANCELLATION_FEE');
+  check('J7b [A6] fee 1.300.000 − 1.000.000 already paid: invoice for 300.000', c.data?.stillOwed === 300000 && Number(jFee?.amount) === 300000, `${c.data?.stillOwed} / ${jFee?.amount}`);
   const line = (await order(o.id)).service_items[0];
   check('J8 started day keeps its driver and fee after cancel', line.driver_id === d3.id && Number(line.driver_fee) === 200000);
   const o3 = await makeOrder('J9', { startDay: -3 });
@@ -1106,6 +1114,146 @@ await section('N. Office e-toll cards', async () => {
   check('N37 takes at the same moment: exactly one open handover, the same client_ref stored once',
     rs.every((x) => x.status === 200 || x.status === 201) && open.length === 1 && (await prisma.etollCardHandover.count({ where: { client_ref: sameRef } })) === 1,
     rs.map((x) => x.status).join(','));
+});
+
+// ── O. One finance formula: Dashboard, Revenue page and order card ────────
+// Each step is measured as a before/after difference over a window that
+// covers every day used here, so other sections' data does not matter.
+await section('O. Finance formulas (extra charges, cancellations, cancelled days)', async () => {
+  const dO = await makeDriver(30);
+  const dP = await makeDriver(31);
+  const carO = await makeCar('Alphard');
+  const carP = await makeCar('Pajero');
+  const ymd = (days) => wibIso(days, '12:00').slice(0, 10);
+  const range = `date_from=${ymd(-1)}&date_to=${ymd(60)}`;
+  const dash = async () => (await call('GET', `/analytics/dashboard-v2?${range}`, { token: admin })).data;
+  const rev = async () => (await call('GET', `/analytics/revenue?${range}`, { token: admin })).data;
+  const get = (o, path) => path.split('.').reduce((x, k) => x?.[k], o);
+  const diff = (a, b, path) => Number(get(b, path)) - Number(get(a, path));
+  const show = (a, b, paths) => paths.map((p) => `${p} ${diff(a, b, p)}`).join(', ');
+  const noFeeInvoice = (o) => !o.invoices.some((i) => i.invoice_type === 'CANCELLATION_FEE');
+
+  // Extra charge (overtime) and a trip cost billed back at cost.
+  const o1 = await makeOrder('O1', { startDay: 5 });
+  await payDp(o1, 300_000);
+  await putLine(o1.service_items[0].id, { is_external: false, driver_id: dO.id, car_id: carO.id, line_status: 'ASSIGNED', driver_fee: 200000 });
+  let before = await dash();
+  let rb = await rev();
+  await call('POST', `/orders/${o1.id}/adjustments`, { token: admin, body: { type: 'OVERTIME', description: 'Overtime 2 jam', amount: 150000, quantity: 1, is_billable: true } });
+  let after = await dash();
+  let ra = await rev();
+  check('O1 [A1] overtime billed: Dashboard revenue, margin and internal channel +150.000 (extra charges)',
+    diff(before, after, 'accrual.revenue') === 150000 && diff(before, after, 'accrual.margin') === 150000 &&
+    diff(before, after, 'accrual.extra_charges') === 150000 && diff(before, after, 'channel.internal.revenue') === 150000,
+    show(before, after, ['accrual.revenue', 'accrual.margin', 'accrual.extra_charges', 'channel.internal.revenue']));
+  check('O2 [A1] Revenue page: order-level extra charges +150.000', diff(rb, ra, 'order_level.extra_charges') === 150000, show(rb, ra, ['order_level.extra_charges']));
+  before = after;
+  const pe = await call('POST', `/lines/${o1.service_items[0].id}/expenses`, { token: admin, body: { type: 'PARKING', amount: 40000, paid_by: 'COMPANY', bill_to_customer: true } });
+  after = await dash();
+  check('O3 parking billed back at cost: pass-through +40.000, revenue and margin unchanged',
+    pe.status < 300 && diff(before, after, 'accrual.pass_through') === 40000 && diff(before, after, 'accrual.revenue') === 0 && diff(before, after, 'accrual.margin') === 0,
+    `${pe.status} ${show(before, after, ['accrual.pass_through', 'accrual.revenue', 'accrual.margin'])}`);
+
+  // Cancel before day H, DP covers the 20% fee.
+  const o2 = await makeOrder('O4', { startDay: 6 });
+  await payDp(o2, 200_000);
+  before = await dash();
+  const c2 = await call('POST', `/orders/${o2.id}/cancel`, { token: admin, body: { reason: 'Pelanggan batal O4' } });
+  after = await dash();
+  const o2a = await order(o2.id);
+  check('O4 [A6] DP covers the 20% fee: no cancellation invoice, nothing owed, no refund',
+    c2.status === 200 && c2.data.penalty === 200000 && c2.data.stillOwed === 0 && c2.data.refundDue === 0 && noFeeInvoice(o2a), JSON.stringify(c2.data ?? c2.json));
+  check('O5 fee, date and reason stored on the order; paid in full',
+    Number(o2a.cancellation_fee) === 200000 && !!o2a.cancelled_at && o2a.cancellation_reason === 'Pelanggan batal O4' && o2a.payment_status === 'PAID', o2a.payment_status);
+  check('O6 [A2] Dashboard: the day leaves revenue (−1.000.000), the fee comes in (+200.000)',
+    diff(before, after, 'accrual.revenue') === -800000 && diff(before, after, 'accrual.cancellation_income') === 200000 && diff(before, after, 'accrual.margin') === -800000,
+    show(before, after, ['accrual.revenue', 'accrual.cancellation_income', 'accrual.margin']));
+  const fin2 = await prisma.orderFinalFinance.findUnique({ where: { order_id: o2.id } });
+  check('O7 [A8] order card after cancel: total and margin = fee 200.000', Number(fin2?.total_user_amount) === 200000 && Number(fin2?.margin_amount) === 200000, `${fin2?.total_user_amount} / ${fin2?.margin_amount}`);
+  const rebill = [await invoice(o2.id, 'FULL', 200000), await invoice(o2.id, 'ADDITIONAL', 50000)];
+  check('O7b the fee the DP covered cannot be billed again (new invoices refused)', rebill.every((r) => r.status >= 400), rebill.map((r) => `${r.status} ${r.json?.message ?? ''}`).join(' | '));
+
+  // The day was yesterday and never started (tier 3, fee 100%): the DP does
+  // not cover the fee. (Before day H the 20% fee never exceeds the ≥ 20% DP.)
+  const o3 = await makeOrder('O8', { startDay: -1 });
+  await payDp(o3, 300_000);
+  before = await dash();
+  const c3 = await call('POST', `/orders/${o3.id}/cancel`, { token: admin, body: { reason: 'Pelanggan batal O8' } });
+  after = await dash();
+  const fee3 = (await order(o3.id)).invoices.find((i) => i.invoice_type === 'CANCELLATION_FEE');
+  check('O8 [A6] DP 300.000 < fee 1.000.000: one cancellation invoice for the remaining 700.000',
+    c3.data?.tier === 3 && c3.data.stillOwed === 700000 && Number(fee3?.amount) === 700000 && fee3?.status === 'ISSUED' && c3.data.cancellationInvoiceNumber === fee3?.invoice_number,
+    JSON.stringify(c3.data ?? c3.json));
+  check('O9 [A2] the unpaid fee stays in receivables (700.000 before and after the cancel)', diff(before, after, 'outstanding.ar_outstanding') === 0, show(before, after, ['outstanding.ar_outstanding']));
+  const extra3 = await invoice(o3.id, 'ADDITIONAL', 300000);
+  const revUp = await call('POST', `/orders/${o3.id}/invoice/${fee3.id}/revise`, { token: admin, body: { amount: 1000000 } });
+  check('O9b the DP already received is not billed again: extra invoice and revising the fee invoice up to 1.000.000 refused',
+    extra3.status >= 400 && revUp.status >= 400, `${extra3.status} ${extra3.json?.message ?? ''} | ${revUp.status} ${revUp.json?.message ?? ''}`);
+  before = after;
+  await markPaid(o3.id, fee3.id);
+  after = await dash();
+  const o3b = await order(o3.id);
+  check('O10 paying that invoice: 700.000 leaves receivables, the order is PAID (1.000.000 received)',
+    diff(before, after, 'outstanding.ar_outstanding') === -700000 && Number(o3b.paid_to_date) === 1000000 && o3b.payment_status === 'PAID',
+    `${show(before, after, ['outstanding.ar_outstanding'])} ${o3b.paid_to_date} ${o3b.payment_status}`);
+
+  // Cancel after the driver left: the kept fee stays a cost.
+  const o4 = await makeOrder('O11', { startDay: 0 });
+  await payFull(o4);
+  const l4 = o4.service_items[0].id;
+  await putLine(l4, { is_external: false, driver_id: dO.id, car_id: carO.id, line_status: 'ASSIGNED', driver_fee: 200000 });
+  await act(dO, l4, 'start');
+  before = await dash();
+  rb = await rev();
+  const c4 = await call('POST', `/orders/${o4.id}/cancel`, { token: admin, body: { reason: 'Batal di jalan' } });
+  after = await dash();
+  ra = await rev();
+  check('O11 cancel after departure: tier 3, paid in full, no invoice',
+    c4.data?.tier === 3 && c4.data.stillOwed === 0 && noFeeInvoice(await order(o4.id)), JSON.stringify(c4.data ?? c4.json));
+  check('O12 [A3] Dashboard: the kept driver fee stays a cost; the fee replaces the day price (revenue and margin unchanged)',
+    diff(before, after, 'accrual.revenue') === 0 && diff(before, after, 'accrual.margin') === 0 && diff(before, after, 'accrual.driver_cost') === 0,
+    show(before, after, ['accrual.revenue', 'accrual.margin', 'accrual.driver_cost']));
+  check('O12b [A3] Revenue page: the unit keeps the fee as a cost (gross −1.000.000), the fee shows per order (+1.000.000)',
+    diff(rb, ra, 'internal_cars.totals.final.driver_fee') + diff(rb, ra, 'internal_cars.totals.estimated.driver_fee') === 0 &&
+    diff(rb, ra, 'internal_cars.totals.final.gross') + diff(rb, ra, 'internal_cars.totals.estimated.gross') === -1000000 &&
+    diff(rb, ra, 'order_level.cancellation_income') === 1000000,
+    show(rb, ra, ['internal_cars.totals.final.driver_fee', 'internal_cars.totals.estimated.driver_fee', 'internal_cars.totals.final.gross', 'internal_cars.totals.estimated.gross', 'order_level.cancellation_income']));
+
+  // Cancel after day 1 is done (A7): the order stays open and closes through finalize.
+  const o5 = await makeOrder('O13', { days: 2, price: 500_000, startDay: 0 });
+  await payFull(o5);
+  const [day1, day2] = [...o5.service_items].sort((a, b) => a.service_date.localeCompare(b.service_date)).map((l) => l.id);
+  await putLine(day1, { is_external: false, driver_id: dP.id, car_id: carP.id, line_status: 'ASSIGNED', driver_fee: 200000 });
+  await act(dP, day1, 'start');
+  await act(dP, day1, 'arrive', { latitude: -6.56, longitude: 106.8, location_accuracy_m: 12, location_mocked: false });
+  await act(dP, day1, 'board');
+  const fin = await act(dP, day1, 'finish', { notes: 'selesai' });
+  check('O13 day 1 finished by the driver', fin.data?.status === 'DONE', JSON.stringify(fin.json).slice(0, 160));
+  before = await dash();
+  const c5 = await call('POST', `/orders/${o5.id}/cancel`, { token: admin, body: { reason: 'Pelanggan pulang lebih awal' } });
+  after = await dash();
+  const o5a = await order(o5.id);
+  check('O14 [A7] cancel after day 1: tier 3, fee = the paid total 1.000.000, no invoice; order open, awaiting finalization',
+    c5.data?.tier === 3 && c5.data.penalty === 1000000 && c5.data.stillOwed === 0 && noFeeInvoice(o5a) &&
+    o5a.order_status !== 'CANCELLED' && o5a.awaiting_finalization === true && Number(o5a.cancellation_fee) === 1000000,
+    `${JSON.stringify(c5.data ?? c5.json)} ${o5a.order_status}`);
+  check('O15 [A7] Dashboard: day 2 leaves revenue, the fee takes its place (revenue and margin unchanged)',
+    diff(before, after, 'accrual.revenue') === 0 && diff(before, after, 'accrual.margin') === 0 && diff(before, after, 'accrual.cancellation_income') === 500000,
+    show(before, after, ['accrual.revenue', 'accrual.margin', 'accrual.cancellation_income']));
+  const fin5 = await prisma.orderFinalFinance.findUnique({ where: { order_id: o5.id } });
+  check('O16 order card: total 1.000.000, margin 800.000 (total − day-1 driver fee)', Number(fin5?.total_user_amount) === 1000000 && Number(fin5?.margin_amount) === 800000, `${fin5?.total_user_amount} / ${fin5?.margin_amount}`);
+  const resave = await putLine(day1, { is_external: false, driver_fee: 200000 });
+  const o5b = await order(o5.id);
+  check('O17 re-saving the done day keeps the fee as the order total (no fake refund)',
+    resave.status === 200 && Number(o5b.final_price) === 1000000 && o5b.payment_status === 'PAID', `${resave.status} ${o5b.final_price} ${o5b.payment_status}`);
+  check('O18 the cancelled day stays closed (409)', (await putLine(day2, { is_external: false, line_status: 'SCHEDULED' })).status === 409);
+  const again = await call('POST', `/orders/${o5.id}/cancel`, { token: admin, body: { reason: 'lagi' } });
+  const edit = await call('PUT', `/orders/${o5.id}`, { token: admin, body: editBody(o5b, { notes: 'x' }) });
+  const charge = await call('POST', `/orders/${o5.id}/adjustments`, { token: admin, body: { type: 'OVERTIME', description: 'OT', amount: 50000 } });
+  check('O19 second cancel, Edit Order and new charges refused (409)', again.status === 409 && edit.status === 409 && charge.status === 409, `${again.status} ${edit.status} ${charge.status}`);
+  const fz = await call('POST', `/orders/${o5.id}/finalize`, { token: admin });
+  const log = await prisma.orderChangeLog.findFirst({ where: { order_id: o5.id, new_value: 'DONE' } });
+  check('O20 [A7] finalize closes it as DONE, the cancellation in the note', fz.status === 200 && fz.data?.order_status === 'DONE' && /remaining days were cancelled/.test(log?.note ?? ''), log?.note);
 });
 
 const failed = summary();

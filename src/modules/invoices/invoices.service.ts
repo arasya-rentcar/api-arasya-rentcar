@@ -185,6 +185,31 @@ function buildNoteLines(order: {
 }
 
 /**
+ * What is already billed on an order, for the "never bill more than the order
+ * total" checks: the active invoices plus money received on invoices that a
+ * cancellation voided. That money still counts toward the cancellation fee
+ * (cancelOrder bills only the rest), so it must not be billed again. Only
+ * cancelOrder voids invoices, so other orders are unaffected.
+ */
+async function billedSoFar(orderId: string, excludeInvoiceId?: string): Promise<number> {
+  const [active, voidedPaid] = await Promise.all([
+    prisma.invoice.aggregate({
+      where: {
+        order_id: orderId,
+        ...(excludeInvoiceId ? { id: { not: excludeInvoiceId } } : {}),
+        status: { notIn: ["REVISED", "CANCELLED"] },
+      },
+      _sum: { amount: true },
+    }),
+    prisma.invoice.aggregate({
+      where: { order_id: orderId, status: "CANCELLED", paid_at: { not: null } },
+      _sum: { amount: true },
+    }),
+  ]);
+  return Number(active._sum.amount ?? 0) + Number(voidedPaid._sum.amount ?? 0);
+}
+
+/**
  * Prepare a CANCELLATION_FEE invoice for a cancelled order: reserve the invoice
  * number (atomic, short tx) and render the PDF. Returns everything the caller
  * needs to create the invoice row inside its own transaction. Network/PDF work
@@ -201,6 +226,8 @@ export async function buildCancellationFeePdf(args: {
     dropoff_location: string;
   };
   penalty: number;
+  /** Money already received on the order; the invoice asks for the rest. */
+  alreadyPaid: number;
   tierLabel: string;
   reason: string;
   issueDate?: Date;
@@ -222,6 +249,7 @@ export async function buildCancellationFeePdf(args: {
     totalPrice: args.penalty,
   };
 
+  const alreadyPaid = Math.min(Math.max(args.alreadyPaid, 0), args.penalty);
   const pdfBuffer = await generateInvoicePDF({
     invoiceNumber,
     displayNumber: args.order.order_code ?? null,
@@ -231,12 +259,13 @@ export async function buildCancellationFeePdf(args: {
     pickupLocation: args.order.pickup_location,
     dropoffLocation: args.order.dropoff_location,
     finalPrice: args.penalty,
-    // Reuse the single-amount totals layout ("Total Tambahan / TOTAL").
+    // Nothing paid yet: the single-amount layout ("Total Tambahan / TOTAL").
+    // Some money in: the settlement layout (total − already paid = remaining).
     invoiceType: "Cancellation Fee",
-    invoiceKind: "ADDITIONAL",
+    invoiceKind: alreadyPaid > 0 ? "SETTLEMENT" : "ADDITIONAL",
     paymentMethod: "Bank Transfer",
-    amountPaid: args.penalty,
-    previouslyPaid: 0,
+    amountPaid: args.penalty - alreadyPaid,
+    previouslyPaid: alreadyPaid,
     documentMode: "INVOICE",
     noteLines: [
       `Pembatalan pesanan: ${args.reason}`,
@@ -290,14 +319,7 @@ export async function generateInvoice(
   );
 
   // Calculate how much has already been invoiced
-  const aggregate = await prisma.invoice.aggregate({
-    where: {
-      order_id: orderId,
-      status: { notIn: ["REVISED", "CANCELLED"] },
-    },
-    _sum: { amount: true },
-  });
-  const alreadyInvoiced = Number(aggregate._sum.amount ?? 0);
+  const alreadyInvoiced = await billedSoFar(orderId);
   const finalPrice = Number(order.final_price);
   const remaining = finalPrice - alreadyInvoiced;
 
@@ -898,15 +920,7 @@ export async function reviseInvoice(
 
 
   // For a revision, exclude the invoice being revised from the "previously paid" total.
-  const aggregate = await prisma.invoice.aggregate({
-    where: {
-      order_id: invoice.order_id,
-      id: { not: invoice.id },
-      status: { notIn: ["REVISED", "CANCELLED"] },
-    },
-    _sum: { amount: true },
-  });
-  const previouslyPaid = Number(aggregate._sum.amount ?? 0);
+  const previouslyPaid = await billedSoFar(invoice.order_id, invoice.id);
   const finalPrice = Number(invoice.order.final_price);
 
   if (previouslyPaid + amount > finalPrice) {

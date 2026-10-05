@@ -768,11 +768,19 @@ export async function getOrderById(id: string) {
 // refund). Callers that mutate structural data should call this first.
 function assertOrderStructurallyEditable(order: {
   order_status: string;
+  cancellation_fee?: unknown;
 }): void {
   if (order.order_status === "DONE")
     throw new AppError("Order ini sudah selesai (difinalisasi), jadi tidak bisa diubah lagi.", 409);
   if (order.order_status === "CANCELLED")
     throw new AppError("Order ini sudah dibatalkan, jadi tidak bisa diubah lagi.", 409);
+  // Cancelled after some days were done: still open for finalize, but its
+  // total is the cancellation fee, so days and charges no longer change it.
+  if (order.cancellation_fee != null)
+    throw new AppError(
+      "Sisa hari order ini sudah dibatalkan, jadi order tidak bisa diubah lagi. Tinggal finalisasi.",
+      409,
+    );
 }
 
 // What a day in the order form carries (everything else on a day belongs to
@@ -1556,6 +1564,16 @@ export async function finalizeOrder(orderId: string, actor?: string) {
 
   return prisma.$transaction(
     async (tx) => {
+      // Under the order lock: a cancel or finalize that committed meanwhile
+      // wins, and a cancel of the remaining days is read fresh for the note.
+      await tx.$queryRaw`SELECT id FROM "orders" WHERE id = ${orderId} FOR NO KEY UPDATE`;
+      const fresh = await tx.order.findUniqueOrThrow({
+        where: { id: orderId },
+        select: { order_status: true, cancellation_fee: true, cancellation_reason: true },
+      });
+      if (fresh.order_status === "DONE" || fresh.order_status === "CANCELLED") {
+        throw new AppError("Order ini sudah selesai atau sudah dibatalkan.", 409);
+      }
       await tx.order.update({
         where: { id: orderId },
         data: { order_status: "DONE", awaiting_finalization: false },
@@ -1566,7 +1584,10 @@ export async function finalizeOrder(orderId: string, actor?: string) {
           field: "order_status",
           new_value: "DONE",
           actor,
-          note: "Order finalized by admin (finance reviewed)",
+          note:
+            fresh.cancellation_fee != null
+              ? `Order finalized by admin (finance reviewed); remaining days were cancelled (fee ${Number(fresh.cancellation_fee)}): ${fresh.cancellation_reason ?? "-"}`
+              : "Order finalized by admin (finance reviewed)",
         },
       });
       return tx.order.findUnique({ where: { id: orderId } });
@@ -1741,11 +1762,16 @@ export interface CancelOrderResult {
  *    recompute both work with zero special-casing.
  *  - voids active invoices (status → CANCELLED) and DECREMENTS total_billed
  *    by their sum, then issues ONE CANCELLATION_FEE invoice (with a real PDF)
- *    and INCREMENTS total_billed by the penalty → preserves the G9 invariant
- *    total_billed = sum(active invoices).
+ *    for what is still owed (penalty − money already received; none when the
+ *    money received covers it) and INCREMENTS total_billed by that amount →
+ *    preserves the G9 invariant total_billed = sum(active invoices).
  *  - cancels all active lines → order status derives to CANCELLED; releases
- *    drivers/cars.
- *  - recomputes payment_status against the new (penalty) total.
+ *    drivers/cars. Days already DONE are kept: the order then stays open and
+ *    closes through finalize (decided 6 Oct 2026).
+ *  - stores cancelled_at / cancellation_fee / cancellation_reason (what marks
+ *    the order as cancelled for rollupOrderFinance and the reports), recomputes
+ *    payment_status against the new (penalty) total and re-rolls the order
+ *    finance so the order card margin includes the fee.
  *  - does NOT move money or auto-mark refunded: refunds stay manual (bank
  *    transfer) via the existing refund flow. Returns a summary so the UI can
  *    show the admin what to collect/refund.
@@ -1766,6 +1792,22 @@ export async function cancelOrder(
   if (order.order_status === "DONE" || order.order_status === "CANCELLED") {
     throw new AppError(
       `Cannot cancel an order with status ${order.order_status}`,
+      409,
+    );
+  }
+  if (order.cancellation_fee != null) {
+    throw new AppError(
+      "Sisa hari order ini sudah dibatalkan. Tinggal finalisasi.",
+      409,
+    );
+  }
+  // Every day already done (awaiting finalize): nothing is left to cancel.
+  if (
+    order.service_items.length > 0 &&
+    order.service_items.every((l) => l.line_status === "DONE" || l.line_status === "CANCELLED")
+  ) {
+    throw new AppError(
+      "Semua hari order ini sudah selesai, jadi tidak ada yang bisa dibatalkan. Tutup order lewat Finalisasi.",
       409,
     );
   }
@@ -1792,13 +1834,21 @@ export async function cancelOrder(
     now,
   });
 
+  // What the customer still owes toward the penalty. Money already received
+  // (a DP, or the full price) counts against it; the transaction re-reads it.
+  const round2 = (x: number) => Math.round(x * 100) / 100;
+  const owedFor = (paid: number) => Math.max(0, round2(penalty - paid));
+  const paidBefore = netPaid(order);
+  const owedBefore = owedFor(paidBefore);
+
   // ── Render the cancellation-fee PDF + reserve its number OUTSIDE the main
   //    tx (slow network work; mirrors generateInvoice). Skip if no customer
-  //    is linked (cannot issue a numbered invoice without a customer code).
+  //    is linked (cannot issue a numbered invoice without a customer code),
+  //    or when nothing is owed (no invoice to issue).
   let prepared:
     | { invoiceNumber: string; invoiceSeq: number; fileUrl: string }
     | null = null;
-  if (order.customer) {
+  if (order.customer && owedBefore > 0) {
     const built = await buildCancellationFeePdf({
       customer: { id: order.customer.id, code: order.customer.code },
       order: {
@@ -1809,6 +1859,7 @@ export async function cancelOrder(
         dropoff_location: order.dropoff_location,
       },
       penalty,
+      alreadyPaid: paidBefore,
       tierLabel: label,
       reason,
       issueDate: now,
@@ -1818,6 +1869,21 @@ export async function cancelOrder(
 
   // ── Mutations in one transaction ────────────────────────────────────────
   const result = await prisma.$transaction(async (tx) => {
+    // 0) Lock the order and re-check under the lock: a second click (or a
+    //    finalize) that committed meanwhile wins and this cancel stops.
+    await tx.$queryRaw`SELECT id FROM "orders" WHERE id = ${orderId} FOR NO KEY UPDATE`;
+    const fresh = await tx.order.findUniqueOrThrow({
+      where: { id: orderId },
+      select: { order_status: true, cancellation_fee: true },
+    });
+    if (
+      fresh.order_status === "DONE" ||
+      fresh.order_status === "CANCELLED" ||
+      fresh.cancellation_fee != null
+    ) {
+      throw new AppError("Order ini sudah dibatalkan atau sudah selesai.", 409);
+    }
+
     // 1) Void active invoices and decrement the customer's billed total.
     const activeInvoices = await tx.invoice.findMany({
       where: {
@@ -1835,6 +1901,22 @@ export async function cancelOrder(
         where: { id: { in: activeInvoices.map((i) => i.id) } },
         data: { status: "CANCELLED" },
       });
+    }
+
+    // Money received, read now: the invoices are locked by step 1, so a
+    // payment recorded while the fee PDF was being built is included. The PDF
+    // was made for owedBefore; if that changed, stop and let the admin retry.
+    const money = await tx.order.findUniqueOrThrow({
+      where: { id: orderId },
+      select: { paid_to_date: true, is_refunded: true, refund_amount: true },
+    });
+    const paidToDate = Number(money.paid_to_date ?? 0);
+    const owed = owedFor(netPaid(money));
+    if (owed !== owedBefore) {
+      throw new AppError(
+        "Ada pembayaran yang baru tercatat saat pesanan dibatalkan. Coba batalkan lagi.",
+        409,
+      );
     }
 
     // 2) Cancel all active lines; collect drivers/cars to release.
@@ -1891,9 +1973,12 @@ export async function cancelOrder(
     for (const dId of driverIds) await syncDriverStatus(tx, dId);
     for (const cId of carIds) await syncCarStatus(tx, cId);
 
-    // 4) Issue the CANCELLATION_FEE invoice (penalty) with its PDF.
+    // 4) Issue the CANCELLATION_FEE invoice for what is still owed, with its
+    //    PDF (penalty − already paid = remaining). Nothing owed → no invoice:
+    //    a fee invoice over money already received would be paid twice.
     let cancellationInvoiceNumber: string | null = null;
-    if (prepared && order.customer) {
+    let invoiced = 0;
+    if (prepared && order.customer && owed > 0) {
       await tx.invoice.create({
         data: {
           order_id: orderId,
@@ -1902,18 +1987,19 @@ export async function cancelOrder(
           invoice_type: "CANCELLATION_FEE",
           payment_method: "BANK_TRANSFER",
           issue_date: now,
-          amount: penalty,
+          amount: owed,
           note: `${reason}\n${label}`,
           file_url: prepared.fileUrl,
           status: "ISSUED",
         },
       });
       cancellationInvoiceNumber = prepared.invoiceNumber;
+      invoiced = owed;
     }
 
-    // 5) Keep total_billed = sum(active invoices): remove voided, add penalty.
+    // 5) Keep total_billed = sum(active invoices): remove voided, add the new one.
     if (order.customer) {
-      const billedDelta = penalty - voidedSum;
+      const billedDelta = invoiced - voidedSum;
       if (billedDelta !== 0) {
         await tx.customer.update({
           where: { id: order.customer.id },
@@ -1925,19 +2011,21 @@ export async function cancelOrder(
     // 6) The order is now worth the penalty. Set final_price = penalty so the
     //    existing refund/payment flows compute correctly, and recompute
     //    payment_status against the new total (money received is unchanged).
-    // Money received, read now: the invoices are locked by step 1, so a
-    // payment recorded while the fee PDF was being built is included.
-    const money = await tx.order.findUniqueOrThrow({
-      where: { id: orderId },
-      select: { paid_to_date: true, is_refunded: true, refund_amount: true },
-    });
-    const paidToDate = Number(money.paid_to_date ?? 0);
+    //    The cancellation fields mark the order as cancelled even when done
+    //    days keep it open, so later roll-ups keep the penalty as its price.
     const paymentStatus = paymentStatusFor(netPaid(money), penalty);
 
     await tx.order.update({
       where: { id: orderId },
-      data: { final_price: penalty, payment_status: paymentStatus },
+      data: {
+        final_price: penalty,
+        payment_status: paymentStatus,
+        cancelled_at: now,
+        cancellation_fee: penalty,
+        cancellation_reason: reason,
+      },
     });
+    await rollupOrderFinance(tx, orderId);
 
     // 7) Audit log (preserve the original price).
     await tx.orderChangeLog.create({
@@ -1951,15 +2039,15 @@ export async function cancelOrder(
       },
     });
 
-    const refundDue = paidToDate > penalty ? paidToDate - penalty : 0;
-    const stillOwed = penalty > paidToDate ? penalty - paidToDate : 0;
+    // Net of any refund already made, like `owed` and payment_status.
+    const refundDue = Math.max(0, round2(netPaid(money) - penalty));
     return {
       tier,
       penalty,
       originalFinalPrice,
       paidToDate,
       refundDue,
-      stillOwed,
+      stillOwed: owed,
       cancellationInvoiceNumber,
     } satisfies CancelOrderResult;
   }, {

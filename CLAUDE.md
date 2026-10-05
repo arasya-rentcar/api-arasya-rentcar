@@ -18,6 +18,8 @@ Express 4 + Prisma 5 (Postgres on Supabase) + Supabase Storage, TypeScript. Sour
 - A service-day line (`OrderServiceItem`) **is** the trip. After changing `line_status` always call `deriveAndSetOrderStatus` + `syncDriverStatus`/`syncCarStatus` in the same transaction. Order DONE only via admin finalize.
 - Driver-app actions are exactly-once: guarded `updateMany` + report row with unique `client_ref` in one transaction; `eventTime(occurred_at)` clamps phone time to the last 7 days. Keep this pattern for anything a phone can resend.
 - `driver_accepted_at` records acceptance only; it must not change `line_status` (would mark drivers ON_DUTY days ahead).
+- Cancellation: `cancelOrder` stores `cancellation_fee` / `cancelled_at` / `cancellation_reason`; the CANCELLATION_FEE invoice bills only what is still unpaid (none when the money received covers it). Cancelled after some days were DONE: the order stays open (status not CANCELLED, `cancellation_fee` set, total = the fee) and closes through finalize.
+- Finance numbers follow one rule for the dashboard, the Revenue page and the order card: the header of the Dashboard v2 block in `analytics.service.ts` and `rollupOrderFinance`. Change them together, bump `MARGIN_FORMULA_VERSION`, and keep e2e group O passing.
 - Lead → order: `order_code = lead_code`; linking a lead to an existing order keeps that order's code.
 - Phone numbers: use the shared normaliser in `modules/customers/customers.validation.ts` (`08…`/`628…`/`+62…` are the same person).
 - Lists never include full NIK (`id_number_masked`). Don't `include: { customer: true }` in anything returned to clients.
