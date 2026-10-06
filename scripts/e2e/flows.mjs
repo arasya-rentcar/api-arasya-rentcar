@@ -1258,7 +1258,7 @@ await section('O. Finance formulas (extra charges, cancellations, cancelled days
 });
 
 // ── P. Cancelled days, billed totals and the DP minimum (B1, B2, B7, B12) ──
-await section('P. Cancelled days, billed totals, DP minimum (B1, B2, B7, B12)', async () => {
+await section('Q. Cancelled days, billed totals, DP minimum (B1, B2, B7, B12)', async () => {
   const dQ = await makeDriver(40);
   const carQ = await makeCar('Brio');
   const line = (id) => prisma.orderServiceItem.findUnique({ where: { id } });
@@ -1282,90 +1282,90 @@ await section('P. Cancelled days, billed totals, DP minimum (B1, B2, B7, B12)', 
   };
 
   // B1.1: Edit Hari never ends an order.
-  const o1 = await makeOrder('P1', { startDay: 20 });
+  const o1 = await makeOrder('Q1', { startDay: 20 });
   const p1 = await putLine(o1.service_items[0].id, { is_external: false, line_status: 'CANCELLED' });
-  check('P1 [B1.1] cancelling the only day in Edit Hari refused (409, points to Batalkan Pesanan), day and order unchanged',
+  check('Q1 [B1.1] cancelling the only day in Edit Hari refused (409, points to Batalkan Pesanan), day and order unchanged',
     p1.status === 409 && /hari terakhir yang masih aktif/.test(p1.json?.message ?? '') && /Batalkan Pesanan/.test(p1.json?.message ?? '') &&
     (await line(o1.service_items[0].id)).line_status === 'SCHEDULED' && (await order(o1.id)).order_status !== 'CANCELLED', p1.json?.message);
-  const o2 = await makeOrder('P2', { days: 2, startDay: 21 });
+  const o2 = await makeOrder('Q2', { days: 2, startDay: 21 });
   const p2a = await putLine(o2.service_items[0].id, { is_external: false, line_status: 'CANCELLED' });
   const o2a = await order(o2.id);
-  check('P2 [B1.1] one day of a two-day order can be cancelled; total 1.000.000', p2a.status === 200 && Number(o2a.final_price) === 1000000, `${p2a.status} ${p2a.json?.message ?? ''} ${o2a.final_price}`);
+  check('Q2 [B1.1] one day of a two-day order can be cancelled; total 1.000.000', p2a.status === 200 && Number(o2a.final_price) === 1000000, `${p2a.status} ${p2a.json?.message ?? ''} ${o2a.final_price}`);
   const p2b = await putLine(o2.service_items[1].id, { is_external: false, line_status: 'CANCELLED' });
-  check('P3 [B1.1] the remaining day then refused (409), order not cancelled',
+  check('Q3 [B1.1] the remaining day then refused (409), order not cancelled',
     p2b.status === 409 && /hari terakhir/.test(p2b.json?.message ?? '') && (await order(o2.id)).order_status !== 'CANCELLED', p2b.json?.message);
   // Day 1 done, day 2 still to run: cancelling or removing day 2 would end the order.
-  const o3 = await makeOrder('P4', { days: 2, startDay: 22 });
+  const o3 = await makeOrder('Q4', { days: 2, startDay: 22 });
   const [d1st, d2nd] = [...o3.service_items].sort((a, b) => a.service_date.localeCompare(b.service_date)).map((l) => l.id);
   await prisma.orderServiceItem.update({ where: { id: d1st }, data: { line_status: 'DONE' } });
   const p4 = await putLine(d2nd, { is_external: false, line_status: 'CANCELLED' });
-  check('P4 [B1.1] day 1 done: cancelling day 2 in Edit Hari refused (409)', p4.status === 409 && /hari terakhir/.test(p4.json?.message ?? '') && (await line(d2nd)).line_status === 'SCHEDULED', p4.json?.message);
+  check('Q4 [B1.1] day 1 done: cancelling day 2 in Edit Hari refused (409)', p4.status === 409 && /hari terakhir/.test(p4.json?.message ?? '') && (await line(d2nd)).line_status === 'SCHEDULED', p4.json?.message);
   const p5 = await call('PUT', `/orders/${o3.id}`, { token: admin, body: editBody(await order(o3.id), { reason: 'hapus hari', days: [{ id: d1st }] }) });
-  check('P5 [B1.1] nor removed in Edit Order (409), day kept', p5.status === 409 && /hari terakhir/.test(p5.json?.message ?? '') && (await order(o3.id)).service_items.length === 2, p5.json?.message);
+  check('Q5 [B1.1] nor removed in Edit Order (409), day kept', p5.status === 409 && /hari terakhir/.test(p5.json?.message ?? '') && (await order(o3.id)).service_items.length === 2, p5.json?.message);
 
   // B1.3: Edit Hari does not push the total below what is billed.
-  const o4 = await makeOrder('P6', { days: 2, startDay: 23 });
+  const o4 = await makeOrder('Q6', { days: 2, startDay: 23 });
   const full4 = (await invoice(o4.id, 'FULL', 2_000_000)).data;
   const p6 = await putLine(o4.service_items[1].id, { is_external: false, line_status: 'CANCELLED' });
   const o4a = await order(o4.id);
-  check('P6 [B1.3] cancelling a day below the issued invoice refused (409, both amounts), day and total unchanged',
+  check('Q6 [B1.3] cancelling a day below the issued invoice refused (409, both amounts), day and total unchanged',
     p6.status === 409 && /Rp 1\.000\.000/.test(p6.json?.message ?? '') && /Rp 2\.000\.000/.test(p6.json?.message ?? '') && /Revisi atau batalkan invoice/.test(p6.json?.message ?? '') &&
     o4a.service_items.every((l) => l.line_status === 'SCHEDULED') && Number(o4a.final_price) === 2000000, p6.json?.message);
   const rv4 = await revise(o4, full4, 1_000_000);
   const p7 = await putLine(o4.service_items[1].id, { is_external: false, line_status: 'CANCELLED' });
-  check('P7 [B1.3] after revising the invoice to 1.000.000 the day can be cancelled; total 1.000.000',
+  check('Q7 [B1.3] after revising the invoice to 1.000.000 the day can be cancelled; total 1.000.000',
     rv4.status === 201 && p7.status === 200 && Number((await order(o4.id)).final_price) === 1000000, `${rv4.status} ${p7.status} ${p7.json?.message ?? ''}`);
 
   // B2: DP_PAID needs 20% of the rental base actually received.
-  const o5 = await makeOrder('P8', { startDay: 24 });
+  const o5 = await makeOrder('Q8', { startDay: 24 });
   const dp5 = (await invoice(o5.id, 'DP', 200_000)).data;
   await markPaid(o5.id, dp5.id, { amount_received: 50_000 });
   const o5a = await order(o5.id);
-  check('P8 [B2] DP invoice marked paid with 50.000 received (< 20%): stays UNPAID', o5a.payment_status === 'UNPAID' && Number(o5a.paid_to_date) === 50000, `${o5a.payment_status} ${o5a.paid_to_date}`);
+  check('Q8 [B2] DP invoice marked paid with 50.000 received (< 20%): stays UNPAID', o5a.payment_status === 'UNPAID' && Number(o5a.paid_to_date) === 50000, `${o5a.payment_status} ${o5a.paid_to_date}`);
   const p9 = await putLine(o5.service_items[0].id, { is_external: false, driver_id: dQ.id, car_id: carQ.id });
-  check('P9 [B2] driver refused (409), message gives the money received and the minimum DP',
+  check('Q9 [B2] driver refused (409), message gives the money received and the minimum DP',
     p9.status === 409 && /Rp 50\.000/.test(p9.json?.message ?? '') && /Rp 200\.000/.test(p9.json?.message ?? ''), p9.json?.message);
   const st5 = (await invoice(o5.id, 'SETTLEMENT', 150_000)).data;
   await markPaid(o5.id, st5.id);
   const p10 = await putLine(o5.service_items[0].id, { is_external: false, driver_id: dQ.id, car_id: carQ.id });
-  check('P10 [B2] 200.000 received in total: DP_PAID, driver accepted', (await order(o5.id)).payment_status === 'DP_PAID' && p10.status === 200, `${p10.status} ${p10.json?.message ?? ''}`);
-  const o6 = await makeOrder('P11', { startDay: 25 });
+  check('Q10 [B2] 200.000 received in total: DP_PAID, driver accepted', (await order(o5.id)).payment_status === 'DP_PAID' && p10.status === 200, `${p10.status} ${p10.json?.message ?? ''}`);
+  const o6 = await makeOrder('Q11', { startDay: 25 });
   const dp6 = (await invoice(o6.id, 'DP', 200_000)).data;
   const low = await revise(o6, dp6, 100_000);
   const ok6 = await revise(o6, dp6, 250_000);
-  check('P11 [B2] revising a DP below 20% refused (409); 250.000 accepted', low.status === 409 && ok6.status === 201, `${low.status} ${low.json?.message ?? ''} / ${ok6.status}`);
-  const o7 = await makeOrder('P12', { startDay: 26 });
+  check('Q11 [B2] revising a DP below 20% refused (409); 250.000 accepted', low.status === 409 && ok6.status === 201, `${low.status} ${low.json?.message ?? ''} / ${ok6.status}`);
+  const o7 = await makeOrder('Q12', { startDay: 26 });
   await payDp(o7, 200_000);
   const add7 = await call('PUT', `/orders/${o7.id}`, {
     token: admin,
     body: editBody(o7, { reason: 'tambah hari', days: [{ id: o7.service_items[0].id }, { service_date: wibIso(27, '00:00'), start_at: wibIso(27, '08:00'), end_at: wibIso(27, '20:00'), unit_price: 1_000_000 }] }),
   });
-  check('P12 [B2] a day added: 200.000 is below 20% of 2.000.000, DP_PAID → UNPAID', add7.status === 200 && (await order(o7.id)).payment_status === 'UNPAID', `${add7.status} ${(await order(o7.id)).payment_status}`);
+  check('Q12 [B2] a day added: 200.000 is below 20% of 2.000.000, DP_PAID → UNPAID', add7.status === 200 && (await order(o7.id)).payment_status === 'UNPAID', `${add7.status} ${(await order(o7.id)).payment_status}`);
 
   // B7: the DP base and the PDFs leave cancelled days out.
-  const o8 = await makeOrder('P13', { days: 2, startDay: 28 });
+  const o8 = await makeOrder('Q13', { days: 2, startDay: 28 });
   await putLine(o8.service_items[1].id, { is_external: false, line_status: 'CANCELLED' });
   const dp8 = await invoice(o8.id, 'DP', 200_000);
-  check('P13 [B7] DP base without the cancelled day: 200.000 (20% of 1.000.000) accepted', dp8.status === 201, `${dp8.status} ${dp8.json?.message ?? ''}`);
+  check('Q13 [B7] DP base without the cancelled day: 200.000 (20% of 1.000.000) accepted', dp8.status === 201, `${dp8.status} ${dp8.json?.message ?? ''}`);
   const dpPdf = dp8.data?.file_url ? await pdfText(dp8.data.file_url) : '';
   const stmt8 = await call('POST', `/orders/${o8.id}/statement`, { token: admin, body: {} });
   const stPdf = stmt8.data?.statement_url ? await pdfText(stmt8.data.statement_url) : '';
-  check('P14 [B7] invoice and statement PDFs print the cancelled day as "(Dibatalkan)"; statement total 1.000.000',
+  check('Q14 [B7] invoice and statement PDFs print the cancelled day as "(Dibatalkan)"; statement total 1.000.000',
     /\(Dibatalkan\)/.test(dpPdf) && /\(Dibatalkan\)/.test(stPdf) && Number(stmt8.data?.final_price) === 1000000,
     `dp ${/Dibatalkan/.test(dpPdf)} statement ${/Dibatalkan/.test(stPdf)} ${stmt8.data?.final_price}`);
-  const o9 = await makeOrder('P15', { days: 2, startDay: 29 });
+  const o9 = await makeOrder('Q15', { days: 2, startDay: 29 });
   const dp9 = (await invoice(o9.id, 'DP', 400_000)).data;
   await markPaid(o9.id, dp9.id, { amount_received: 300_000 });
   const before9 = (await order(o9.id)).payment_status;
   await putLine(o9.service_items[1].id, { is_external: false, line_status: 'CANCELLED' });
-  check('P15 [B2/B7] 300.000 received: UNPAID on 2 days (min 400.000), DP_PAID once a day is cancelled (min 200.000)',
+  check('Q15 [B2/B7] 300.000 received: UNPAID on 2 days (min 400.000), DP_PAID once a day is cancelled (min 200.000)',
     before9 === 'UNPAID' && (await order(o9.id)).payment_status === 'DP_PAID', `${before9} → ${(await order(o9.id)).payment_status}`);
 
   // B12: cancellation fees in whole rupiah.
-  const o10 = await makeOrder('P16', { price: 1_000_003, startDay: 30 });
+  const o10 = await makeOrder('Q16', { price: 1_000_003, startDay: 30 });
   const c10 = await call('POST', `/orders/${o10.id}/cancel`, { token: admin, body: { reason: 'tes pembulatan' } });
   const fee10 = (await order(o10.id)).invoices.find((i) => i.invoice_type === 'CANCELLATION_FEE');
-  check('P16 [B12] 20% of 1.000.003 billed as 200.001 (whole rupiah), fee invoice the same',
+  check('Q16 [B12] 20% of 1.000.003 billed as 200.001 (whole rupiah), fee invoice the same',
     c10.status === 200 && c10.data.penalty === 200001 && c10.data.stillOwed === 200001 && Number(fee10?.amount) === 200001 && Number((await order(o10.id)).cancellation_fee) === 200001,
     `${JSON.stringify(c10.data ?? c10.json)} ${fee10?.amount}`);
 });
