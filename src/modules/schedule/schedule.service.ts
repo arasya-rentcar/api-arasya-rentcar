@@ -4,11 +4,13 @@ import { AppError } from '../../utils/AppError';
 import {
   assertOrderOpenForDayChanges,
   assertOrderPaidForDriverAssignment,
-  netPaid,
-  paymentStatusFor,
+  orderPaymentStatus,
+  paymentOrderSelect,
   startPayment,
   startPaymentSelect,
 } from '../orders/assignment-guard';
+import { billedSoFar } from '../invoices/invoices.service';
+import { rupiah } from '../../services/adminNotify';
 import { MARGIN_FORMULA_VERSION } from '../../utils/margin';
 import { staleTripCutoff } from '../../utils/wib';
 import { defaultDriverFee } from '../../utils/driverFee';
@@ -183,6 +185,12 @@ export async function listSchedule(query: ListScheduleQuery) {
   };
 }
 
+/** Day statuses still to run: an order with none of these has ended. */
+const OPEN_DAY: ScheduleStatus[] = ['SCHEDULED', 'ASSIGNED', 'IN_PROGRESS'];
+const LAST_OPEN_DAY_MESSAGE =
+  'Ini hari terakhir yang masih aktif. Pakai tombol Batalkan Pesanan supaya biaya pembatalan dihitung.';
+const toSen = (n: unknown) => Math.round(Number(n ?? 0) * 100);
+
 /** Update assignment / status / finance for a single day-line and recompute
  * its margin, then roll up the parent order's totals. */
 export async function assignScheduleLine(
@@ -192,7 +200,14 @@ export async function assignScheduleLine(
   const line = await prisma.orderServiceItem.findUnique({
     where: { id },
     include: {
-      order: { select: { payment_status: true, order_status: true, cancellation_fee: true } },
+      order: {
+        select: {
+          ...paymentOrderSelect,
+          order_status: true,
+          cancellation_fee: true,
+          service_items: { select: { id: true, total_price: true, line_status: true } },
+        },
+      },
       payable: { select: { status: true, kind: true } },
     },
   });
@@ -300,6 +315,15 @@ export async function assignScheduleLine(
   // unless the admin enters an amount in the same save.
   const becomesCancelled =
     input.line_status === 'CANCELLED' && line.line_status !== 'CANCELLED';
+  // B1.1 (owner, 6 Oct 2026): Edit Hari never ends an order. Cancelling the
+  // last day still to run (neither cancelled nor done) goes through "Batalkan
+  // Pesanan", which charges the cancellation fee. A day of a multi-day order
+  // may be cancelled here while another one is still to run. Checked again in
+  // the transaction (two days cancelled at once).
+  const endsOrder = becomesCancelled && OPEN_DAY.includes(line.line_status);
+  if (endsOrder && !line.order.service_items.some((l) => l.id !== id && OPEN_DAY.includes(l.line_status))) {
+    throw new AppError(LAST_OPEN_DAY_MESSAGE, 409);
+  }
   const started = !!(line.actual_start_at || line.trip_started_at);
   const paidPayable =
     line.payable?.status === 'PAID' ? line.payable.kind : null;
@@ -453,6 +477,32 @@ export async function assignScheduleLine(
         409,
       );
     }
+    // B1.1 again, under the order lock rollupOrderFinance took: a second day
+    // cancelled at the same moment committed first.
+    if (endsOrder) {
+      const stillOpen = await tx.orderServiceItem.count({
+        where: { order_id: line.order_id, id: { not: id }, line_status: { in: OPEN_DAY } },
+      });
+      if (stillOpen === 0) throw new AppError(LAST_OPEN_DAY_MESSAGE, 409);
+    }
+    // B1.3 (owner, 6 Oct 2026): a change here that lowers the order total
+    // (a day cancelled) must not leave it below what is already billed, the
+    // same rule as Edit Order. The admin revises or cancels the unpaid
+    // invoice first.
+    const totals = await tx.order.findUniqueOrThrow({
+      where: { id: line.order_id },
+      select: { final_price: true },
+    });
+    const newTotal = Number(totals.final_price);
+    if (toSen(newTotal) < toSen(line.order.final_price)) {
+      const billed = await billedSoFar(line.order_id, undefined, tx);
+      if (toSen(newTotal) < toSen(billed)) {
+        throw new AppError(
+          `Total order akan menjadi ${rupiah(newTotal)}, di bawah invoice yang sudah terbit (${rupiah(billed)}). Revisi atau batalkan invoice yang belum dibayar dulu.`,
+          409,
+        );
+      }
+    }
     if (checkUnits) {
       // Another admin giving the same driver / car an overlapping day at the
       // same moment waits on these locks and is then refused.
@@ -586,15 +636,13 @@ export async function rollupOrderFinance(
     ? Number(order.final_price)
     : revenue + charges;
 
-  // payment_status follows the money received against the (new) total, so an
-  // order whose total grows (a day added, a charge billed) is no longer shown
-  // as paid. A cancelled order's status is set by cancelOrder. Orders whose
-  // payment was recorded without paid_to_date (sheet imports) keep theirs.
-  const legacyPaid =
-    Number(order.paid_to_date ?? 0) === 0 && order.payment_status !== "UNPAID";
-  const paymentStatus = legacyPaid
-    ? order.payment_status
-    : paymentStatusFor(netPaid(order), finalPrice);
+  // payment_status follows the money received against the (new) total and
+  // rental base, so an order whose total grows (a day added, a charge billed)
+  // is no longer shown as paid, and one whose rental base grows until the
+  // money received is below the 20% DP is no longer DP_PAID. A cancelled
+  // order's status is set by cancelOrder. Orders whose payment was recorded
+  // without paid_to_date (sheet imports) keep theirs (orderPaymentStatus).
+  const paymentStatus = orderPaymentStatus({ ...order, final_price: finalPrice }, lines);
   await tx.order.update({
     where: { id: orderId },
     data: cancelledOrder

@@ -6,6 +6,7 @@ import {
   assertOrderPaidForDriverAssignment,
   netPaid,
   paymentStatusFor,
+  rentalBaseOf,
   startPayment,
 } from "./assignment-guard";
 import {
@@ -1148,6 +1149,20 @@ export async function updateOrder(id: string, input: UpdateOrderInput) {
             409,
           );
         }
+        // B1.1 (owner, 6 Oct 2026): removing the last days still to run while
+        // other days are done would end the order without the cancellation
+        // fee, like cancelling them in Edit Hari.
+        const toRun: ScheduleStatus[] = ["SCHEDULED", "ASSIGNED", "IN_PROGRESS"];
+        if (order.service_items.some((l) => toRun.includes(l.line_status))) {
+          const stillToRun = await tx.orderServiceItem.count({
+            where: { order_id: id, line_status: { in: toRun } },
+          });
+          if (stillToRun === 0)
+            throw new AppError(
+              "Hari yang dihapus adalah hari terakhir yang masih aktif. Pakai tombol Batalkan Pesanan supaya biaya pembatalan dihitung.",
+              409,
+            );
+        }
         if (days.updates.length || days.creates.length || days.deletes.length) {
           await rollupOrderFinance(tx, id);
           await deriveAndSetOrderStatus(tx, id);
@@ -1212,7 +1227,10 @@ export async function updateOrder(id: string, input: UpdateOrderInput) {
 
 export async function assignOrder(orderId: string, input: AssignOrderInput) {
   // Validate order
-  const order = await prisma.order.findUnique({ where: { id: orderId } });
+  const order = await prisma.order.findUnique({
+    where: { id: orderId },
+    include: { service_items: { select: { total_price: true, line_status: true } } },
+  });
   if (!order) throw new AppError("Order not found", 404);
   assertOrderOpenForDayChanges(order);
   if (order.order_status !== "CREATED") {
@@ -1318,7 +1336,10 @@ export async function reassignOrder(
   orderId: string,
   input: AssignOrderInput,
 ) {
-  const order = await prisma.order.findUnique({ where: { id: orderId } });
+  const order = await prisma.order.findUnique({
+    where: { id: orderId },
+    include: { service_items: { select: { total_price: true, line_status: true } } },
+  });
   if (!order) throw new AppError("Order not found", 404);
   assertOrderOpenForDayChanges(order);
 
@@ -1689,7 +1710,7 @@ function computeCancellationPenalty(args: {
   now: Date;
 }): { tier: 1 | 2 | 3; penalty: number; label: string } {
   const { finalPrice, firstServiceDate, anyLineStarted, now } = args;
-  const round2 = (n: number) => Math.round(n * 100) / 100;
+  // Penalties are in whole rupiah (B12): the fee is billed to the customer.
   const todayJakarta = jakartaDate(now);
   const jakartaNow = new Date(now.getTime() + JAKARTA_OFFSET_MS);
   const jakartaHour = jakartaNow.getUTCHours();
@@ -1699,7 +1720,7 @@ function computeCancellationPenalty(args: {
   if (!firstServiceDate) {
     return {
       tier: 1,
-      penalty: round2(finalPrice * 0.2),
+      penalty: Math.round(finalPrice * 0.2),
       label: "Tier 1 (tanpa tanggal layanan) — DP 20% hangus",
     };
   }
@@ -1710,7 +1731,7 @@ function computeCancellationPenalty(args: {
     // Cancel on any calendar day before the service date → forfeit DP (20%).
     return {
       tier: 1,
-      penalty: round2(finalPrice * 0.2),
+      penalty: Math.round(finalPrice * 0.2),
       label: "Tier 1 (sebelum hari H) — DP 20% hangus",
     };
   }
@@ -1721,13 +1742,13 @@ function computeCancellationPenalty(args: {
     if (before10 && !anyLineStarted) {
       return {
         tier: 2,
-        penalty: round2(finalPrice * 0.5),
+        penalty: Math.round(finalPrice * 0.5),
         label: "Tier 2 (hari H sebelum pukul 10.00) — 50% dari total",
       };
     }
     return {
       tier: 3,
-      penalty: round2(finalPrice),
+      penalty: Math.round(finalPrice),
       label:
         "Tier 3 (hari H setelah pukul 10.00 / driver tiba) — 100% dari total",
     };
@@ -1736,7 +1757,7 @@ function computeCancellationPenalty(args: {
   // Cancel after the first service day has passed → 100%.
   return {
     tier: 3,
-    penalty: round2(finalPrice),
+    penalty: Math.round(finalPrice),
     label: "Tier 3 (setelah hari H) — 100% dari total",
   };
 }
@@ -1836,8 +1857,8 @@ export async function cancelOrder(
 
   // What the customer still owes toward the penalty. Money already received
   // (a DP, or the full price) counts against it; the transaction re-reads it.
-  const round2 = (x: number) => Math.round(x * 100) / 100;
-  const owedFor = (paid: number) => Math.max(0, round2(penalty - paid));
+  // Whole rupiah, like the penalty (B12).
+  const owedFor = (paid: number) => Math.max(0, Math.round(penalty - paid));
   const paidBefore = netPaid(order);
   const owedBefore = owedFor(paidBefore);
 
@@ -2013,7 +2034,12 @@ export async function cancelOrder(
     //    payment_status against the new total (money received is unchanged).
     //    The cancellation fields mark the order as cancelled even when done
     //    days keep it open, so later roll-ups keep the penalty as its price.
-    const paymentStatus = paymentStatusFor(netPaid(money), penalty);
+    // The DP rule counts the days that were not cancelled (the done ones).
+    const paymentStatus = paymentStatusFor(
+      netPaid(money),
+      penalty,
+      rentalBaseOf(order.service_items.filter((l) => l.line_status === "DONE")),
+    );
 
     await tx.order.update({
       where: { id: orderId },
@@ -2040,7 +2066,7 @@ export async function cancelOrder(
     });
 
     // Net of any refund already made, like `owed` and payment_status.
-    const refundDue = Math.max(0, round2(netPaid(money) - penalty));
+    const refundDue = Math.max(0, Math.round(netPaid(money) - penalty));
     return {
       tier,
       penalty,
