@@ -8,6 +8,8 @@ import {
 } from "pdf-lib";
 import fs from "fs";
 import path from "path";
+import prisma from "../prisma/client";
+import { logger } from "../config/logger";
 
 export interface InvoiceLineItem {
   serviceDate?: Date | string | null;
@@ -73,8 +75,6 @@ const COMPANY = {
     "Pembayaran transfer ditujukan kepada rekening:\n" +
     "BCA 0954840782 a/n PT Ayomi Raya Karsa",
   overtimeTitle: "*Overtime*",
-  overtimeNote:
-    "Pemakaian melebihi durasi sewa (12 jam/Full day) atau lewat 23.00 dikenakan biaya overtime 10% per jam",
   terms:
     "Terms of Payment :\n" +
     "(1) DP 20% pada saat pemesanan.\n" +
@@ -89,6 +89,28 @@ const COMPANY = {
     "Cancel setelahnya = 100% dari total pesanan.",
   thankYou: "THANK YOU FOR YOUR BUSINESS!",
 };
+
+// The overtime percent is the one the website shows: extras.OVERTIME.percent
+// of the latest published price list (price_publications), not the working
+// copy the admins are still editing; 10 when nothing is published or it is
+// missing or unreadable.
+const DEFAULT_OVERTIME_PERCENT = 10;
+async function overtimePercent(): Promise<number> {
+  try {
+    // Only the one value, not the whole snapshot.
+    const [last] = await prisma.$queryRaw<{ percent: string | null }[]>`
+      SELECT snapshot->'extras'->'OVERTIME'->>'percent' AS percent
+      FROM "price_publications" ORDER BY created_at DESC LIMIT 1`;
+    const raw = last?.percent;
+    return raw != null && Number.isFinite(Number(raw)) ? Number(raw) : DEFAULT_OVERTIME_PERCENT;
+  } catch (err) {
+    logger.warn({ err }, "overtime percent not read, using the default");
+    return DEFAULT_OVERTIME_PERCENT;
+  }
+}
+const overtimeNote = (percent: number) =>
+  "Pemakaian melebihi durasi sewa (12 jam/Full day) atau lewat 23.00 dikenakan biaya overtime " +
+  `${new Intl.NumberFormat("id-ID", { maximumFractionDigits: 2 }).format(percent)}% dari harga Full day per jam`;
 
 const BRAND_DIR = path.join(__dirname, "..", "assets", "brand");
 
@@ -610,7 +632,7 @@ export async function generateInvoicePDF(data: InvoiceData): Promise<Buffer> {
     color: rgb(0.2, 0.2, 0.2),
   });
   fy -= 11;
-  for (const l of wrapText(COMPANY.overtimeNote, italic, 7, 300)) {
+  for (const l of wrapText(overtimeNote(await overtimePercent()), italic, 7, 300)) {
     page.drawText(l, {
       x: margin,
       y: fy,

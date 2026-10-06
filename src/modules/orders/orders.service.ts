@@ -2,9 +2,13 @@ import prisma from "../../prisma/client";
 import { Prisma, type ScheduleStatus } from "@prisma/client";
 import { AppError } from "../../utils/AppError";
 import {
+  assertNotLastOpenDay,
   assertOrderOpenForDayChanges,
   assertOrderPaidForDriverAssignment,
+  dpBaseOf,
   netPaid,
+  OPEN_DAY_STATUSES,
+  paymentOrderSelect,
   paymentStatusFor,
   startPayment,
 } from "./assignment-guard";
@@ -25,7 +29,7 @@ import { rollupOrderFinance } from "../schedule/schedule.service";
 import { assertUnitsFree, lockUnits } from "../schedule/availability";
 import { nextOrderCode } from "../../utils/codes";
 import { wibShortDay } from "../../utils/wib";
-import { buildCancellationFeePdf } from "../invoices/invoices.service";
+import { buildCancellationFeePdf, cancellationLogValue } from "../invoices/invoices.service";
 import {
   deriveAndSetOrderStatus,
   refreshCarStatuses,
@@ -1012,10 +1016,16 @@ export async function updateOrder(id: string, input: UpdateOrderInput) {
 
   const result = await prisma.$transaction(
     async (tx) => {
+      // B1.1: does this save remove a day still to run?
+      let deletesOpenDay = false;
       // Days first, then the order row: the same lock order as the driver
       // app and Edit Hari (day → order), so they cannot deadlock.
       if (days) {
         if (days.deletes.length > 0) {
+          deletesOpenDay =
+            (await tx.orderServiceItem.count({
+              where: { id: { in: days.deletes }, order_id: id, line_status: { in: OPEN_DAY_STATUSES } },
+            })) > 0;
           // Re-checked inside the transaction: a day assigned (or reported
           // on) after the check above is kept.
           const { count } = await tx.orderServiceItem.deleteMany({
@@ -1148,6 +1158,11 @@ export async function updateOrder(id: string, input: UpdateOrderInput) {
             409,
           );
         }
+        // B1.1: removing the last days still to run while other days are
+        // done would end the order without the cancellation fee, like
+        // cancelling them in Edit Hari. Only a save that removes such a day;
+        // checked on the days as they are now, under the order lock.
+        if (deletesOpenDay) await assertNotLastOpenDay(tx, id);
         if (days.updates.length || days.creates.length || days.deletes.length) {
           await rollupOrderFinance(tx, id);
           await deriveAndSetOrderStatus(tx, id);
@@ -1212,7 +1227,10 @@ export async function updateOrder(id: string, input: UpdateOrderInput) {
 
 export async function assignOrder(orderId: string, input: AssignOrderInput) {
   // Validate order
-  const order = await prisma.order.findUnique({ where: { id: orderId } });
+  const order = await prisma.order.findUnique({
+    where: { id: orderId },
+    select: { ...paymentOrderSelect, order_status: true },
+  });
   if (!order) throw new AppError("Order not found", 404);
   assertOrderOpenForDayChanges(order);
   if (order.order_status !== "CREATED") {
@@ -1318,7 +1336,10 @@ export async function reassignOrder(
   orderId: string,
   input: AssignOrderInput,
 ) {
-  const order = await prisma.order.findUnique({ where: { id: orderId } });
+  const order = await prisma.order.findUnique({
+    where: { id: orderId },
+    select: { ...paymentOrderSelect, order_status: true },
+  });
   if (!order) throw new AppError("Order not found", 404);
   assertOrderOpenForDayChanges(order);
 
@@ -1689,7 +1710,7 @@ function computeCancellationPenalty(args: {
   now: Date;
 }): { tier: 1 | 2 | 3; penalty: number; label: string } {
   const { finalPrice, firstServiceDate, anyLineStarted, now } = args;
-  const round2 = (n: number) => Math.round(n * 100) / 100;
+  // Penalties are in whole rupiah (B12): the fee is billed to the customer.
   const todayJakarta = jakartaDate(now);
   const jakartaNow = new Date(now.getTime() + JAKARTA_OFFSET_MS);
   const jakartaHour = jakartaNow.getUTCHours();
@@ -1699,7 +1720,7 @@ function computeCancellationPenalty(args: {
   if (!firstServiceDate) {
     return {
       tier: 1,
-      penalty: round2(finalPrice * 0.2),
+      penalty: Math.round(finalPrice * 0.2),
       label: "Tier 1 (tanpa tanggal layanan) — DP 20% hangus",
     };
   }
@@ -1710,7 +1731,7 @@ function computeCancellationPenalty(args: {
     // Cancel on any calendar day before the service date → forfeit DP (20%).
     return {
       tier: 1,
-      penalty: round2(finalPrice * 0.2),
+      penalty: Math.round(finalPrice * 0.2),
       label: "Tier 1 (sebelum hari H) — DP 20% hangus",
     };
   }
@@ -1721,13 +1742,13 @@ function computeCancellationPenalty(args: {
     if (before10 && !anyLineStarted) {
       return {
         tier: 2,
-        penalty: round2(finalPrice * 0.5),
+        penalty: Math.round(finalPrice * 0.5),
         label: "Tier 2 (hari H sebelum pukul 10.00) — 50% dari total",
       };
     }
     return {
       tier: 3,
-      penalty: round2(finalPrice),
+      penalty: Math.round(finalPrice),
       label:
         "Tier 3 (hari H setelah pukul 10.00 / driver tiba) — 100% dari total",
     };
@@ -1736,7 +1757,7 @@ function computeCancellationPenalty(args: {
   // Cancel after the first service day has passed → 100%.
   return {
     tier: 3,
-    penalty: round2(finalPrice),
+    penalty: Math.round(finalPrice),
     label: "Tier 3 (setelah hari H) — 100% dari total",
   };
 }
@@ -1836,8 +1857,8 @@ export async function cancelOrder(
 
   // What the customer still owes toward the penalty. Money already received
   // (a DP, or the full price) counts against it; the transaction re-reads it.
-  const round2 = (x: number) => Math.round(x * 100) / 100;
-  const owedFor = (paid: number) => Math.max(0, round2(penalty - paid));
+  // Whole rupiah, like the penalty (B12).
+  const owedFor = (paid: number) => Math.max(0, Math.round(penalty - paid));
   const paidBefore = netPaid(order);
   const owedBefore = owedFor(paidBefore);
 
@@ -2013,7 +2034,13 @@ export async function cancelOrder(
     //    payment_status against the new total (money received is unchanged).
     //    The cancellation fields mark the order as cancelled even when done
     //    days keep it open, so later roll-ups keep the penalty as its price.
-    const paymentStatus = paymentStatusFor(netPaid(money), penalty);
+    // The DP rule's base is the penalty too (dpBaseOf): it is what the
+    // customer owes now, so PAID once it is covered, DP_PAID from 20% of it.
+    const paymentStatus = paymentStatusFor(
+      netPaid(money),
+      penalty,
+      dpBaseOf({ cancellation_fee: penalty }, order.service_items),
+    );
 
     await tx.order.update({
       where: { id: orderId },
@@ -2033,14 +2060,14 @@ export async function cancelOrder(
         order_id: orderId,
         field: "order_status",
         old_value: `${order.order_status} (final_price ${originalFinalPrice})`,
-        new_value: `CANCELLED (cancellation fee ${penalty} — ${label})`,
+        new_value: cancellationLogValue(penalty, label),
         note: reason,
         actor: actor ?? "ADMIN",
       },
     });
 
     // Net of any refund already made, like `owed` and payment_status.
-    const refundDue = Math.max(0, round2(netPaid(money) - penalty));
+    const refundDue = Math.max(0, Math.round(netPaid(money) - penalty));
     return {
       tier,
       penalty,

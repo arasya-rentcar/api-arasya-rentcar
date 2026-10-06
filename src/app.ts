@@ -28,6 +28,7 @@ import driverAppRoutes from './modules/driver-app/driver-app.route';
 import driverRequestsRoutes from './modules/driver-requests/driver-requests.route';
 import etollCardsRoutes from './modules/etoll-cards/etoll-cards.route';
 import adminNotificationsRoutes from './modules/admin-notifications/admin-notifications.route';
+import pricesRoutes, { publicPricesRouter } from './modules/prices/prices.route';
 
 import { errorMiddleware } from './middleware/error.middleware';
 
@@ -42,6 +43,8 @@ app.use(helmet());
 // Public, unauthenticated: the website's booking form. Registered before the
 // dashboard CORS policy because it has its own allowed origins.
 app.use('/api/v1/public/leads', publicLeadsRouter);
+// Public, read-only: the published price list for the website (same origins).
+app.use('/api/v1/public/prices', publicPricesRouter);
 
 const allowedOrigins = (process.env.CORS_ORIGINS || '')
   .split(',')
@@ -118,6 +121,8 @@ app.use('/api/v1/driver', driverAppRoutes);
 app.use('/api/v1/driver-requests', driverRequestsRoutes);
 // Office e-toll cards (pool, handovers, history); the driver side is /driver/etoll-cards.
 app.use('/api/v1/etoll-cards', etollCardsRoutes);
+// Official price list (working copy + publishing); the website reads /public/prices.
+app.use('/api/v1/prices', pricesRoutes);
 // Merge: expenses now hang off service-day lines (the line IS the trip).
 app.use('/api/v1/lines', expensesRoutes);
 app.use('/api/v1/bot', botLimiter, botRoutes);

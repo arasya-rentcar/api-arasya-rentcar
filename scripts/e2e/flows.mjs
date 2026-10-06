@@ -1,6 +1,7 @@
 // End-to-end checks of the API: what the dashboard and the driver app do,
 // against the real API and a throwaway database. Run through run-local.sh.
 // Case ids in the output match dashboard-arasya-rentcar/docs/TEST-PLAN.md.
+import { createRequire } from 'node:module';
 import { call, check, section, summary, ensureAdmin, prisma, jpeg, wibIso, uuid, sleep, pushes, BASE, MOCK } from './lib.mjs';
 
 const admin = await ensureAdmin();
@@ -217,8 +218,9 @@ await section('B. Assignment paths (T4: one way to assign)', async () => {
   check('B27 and to tomorrow again: AVAILABLE', again.status === 200 && (await st(d4)) === 'AVAILABLE' && (await cs(car6)) === 'AVAILABLE');
   const started = await act(d4, b5day, 'start');
   check('B28 a trip under way keeps driver ON_DUTY and car IN_USE whatever its date', started.status === 200 && (await st(d4)) === 'ON_DUTY' && (await cs(car6)) === 'IN_USE');
-  await putLine(b5day, { is_external: false, line_status: 'CANCELLED' });
-  check('B29 trip closed: driver and car AVAILABLE', (await st(d4)) === 'AVAILABLE' && (await cs(car6)) === 'AVAILABLE');
+  // The only day cannot be cancelled in Edit Hari any more (B1.1): the order is cancelled.
+  const closed = await call('POST', `/orders/${oB5.id}/cancel`, { token: admin, body: { reason: 'tes B29' } });
+  check('B29 trip closed (order cancelled): driver and car AVAILABLE', closed.status === 200 && (await st(d4)) === 'AVAILABLE' && (await cs(car6)) === 'AVAILABLE', `${closed.status} ${closed.json?.message ?? ''}`);
 
   // Two units on the same date and hours: one driver / car cannot take both
   // on the bulk paths either (per-day assign already refuses the second).
@@ -1254,6 +1256,461 @@ await section('O. Finance formulas (extra charges, cancellations, cancelled days
   const fz = await call('POST', `/orders/${o5.id}/finalize`, { token: admin });
   const log = await prisma.orderChangeLog.findFirst({ where: { order_id: o5.id, new_value: 'DONE' } });
   check('O20 [A7] finalize closes it as DONE, the cancellation in the note', fz.status === 200 && fz.data?.order_status === 'DONE' && /remaining days were cancelled/.test(log?.note ?? ''), log?.note);
+});
+
+// ── P. Official price list: working copy, history, publishing; invoice notes ─
+// The list is seeded by the migration (docs/PRICE.md). Everything this group
+// changes is put back at the end, so only the logs and publications remain.
+await section('P. Price list and invoice wording', async () => {
+  const hadPublication = (await prisma.pricePublication.count()) > 0;
+  const list = await call('GET', '/prices', { token: admin });
+  const L = list.data;
+  const zone = (code) => L.zones.find((z) => z.code === code);
+  const car = (slug) => L.cars.find((c) => c.slug === slug);
+  const rate = (code, slug, duration) => zone(code).rates.find((r) => r.car_id === car(slug).id && r.duration === duration);
+  const allRates = L?.zones?.flatMap((z) => z.rates) ?? [];
+  const allSurcharges = L?.zones?.flatMap((z) => z.surcharges) ?? [];
+  check('P1 seeded list: 14 cars, 6 tables, 154 rates, 19 area surcharges, 17 cities, 3 driver costs',
+    list.status === 200 && L.cars.length === 14 && L.zones.length === 6 && allRates.length === 154 && allSurcharges.length === 19 && L.cities.length === 17 && L.extras.length === 3,
+    JSON.stringify({ status: list.status, cars: L?.cars?.length, zones: L?.zones?.length, rates: allRates.length, surcharges: allSurcharges.length, cities: L?.cities?.length, extras: L?.extras?.length }));
+  const drop = zone('DROP_JABODETABEK');
+  check('P2 seed: Avanza Jabodetabek 500.000/700.000, Avanza Bandung Fullday 1.100.000, Fortuner all-in "Dibahas dengan admin", Hiace Commuter 12 jam only, Ertiga and every Drop price are proposals',
+    rate('JABODETABEK', 'toyota-avanza', '12H').amount === 500000 && rate('JABODETABEK', 'toyota-avanza', 'FULLDAY').amount === 700000 &&
+    rate('BANDUNG', 'toyota-avanza', 'FULLDAY').amount === 1100000 && rate('SURABAYA', 'toyota-zenix-q-hybrid-modellista', 'FULLDAY').amount === 2200000 &&
+    rate('JAKARTA', 'toyota-fortuner', '12H').amount === null && rate('JAKARTA', 'toyota-fortuner', 'FULLDAY').note === 'Dibahas dengan admin' &&
+    rate('JABODETABEK', 'toyota-hiace-commuter', '12H').amount === 1500000 && rate('JABODETABEK', 'toyota-hiace-commuter', 'FULLDAY').amount === null &&
+    rate('JABODETABEK', 'suzuki-ertiga', '12H').is_proposal === true && rate('JABODETABEK', 'toyota-avanza', '12H').is_proposal === false &&
+    drop.rates.length === 14 && drop.rates.every((r) => r.duration === 'DROP' && r.is_proposal) && rate('DROP_JABODETABEK', 'toyota-fortuner', 'DROP').amount === 1600000 &&
+    allRates.filter((r) => r.is_proposal).length === 8 * 11 + 6);
+  check('P2b proposal_count = the rates still marked as proposals (94), every row carries updated_at',
+    L.proposal_count === 94 && [...L.cars, ...L.zones, ...allRates, ...allSurcharges, ...L.cities, ...L.extras].every((r) => typeof r.updated_at === 'string' && !Number.isNaN(Date.parse(r.updated_at))),
+    String(L.proposal_count));
+  const ot = L.extras.find((e) => e.code === 'OVERTIME');
+  const city = (slug) => L.cities.find((c) => c.slug === slug);
+  check('P3 seed: Bogor = Jabodetabek + all-in Surabaya, Jakarta = Jabodetabek + all-in Jakarta, Singapura a quote; overtime 10%, meal 100.000; Jakarta surcharges in order',
+    city('sewa-mobil-bogor').driver_zone_id === zone('JABODETABEK').id && city('sewa-mobil-bogor').all_in_zone_id === zone('SURABAYA').id &&
+    city('sewa-mobil-jakarta').all_in_zone_id === zone('JAKARTA').id && city('sewa-mobil-singapura').quote === true && city('sewa-mobil-singapura').driver_zone_id === null &&
+    ot.percent === 10 && ot.amount === null && L.extras.find((e) => e.code === 'DRIVER_MEAL').amount === 100000 &&
+    zone('JAKARTA').surcharges.map((s) => s.area).join(',') === 'Tangerang,Bekasi,Cikarang,Depok,Bogor,Puncak');
+  check('P4 a driver token cannot use the price list (403)', (await call('GET', '/prices', { token: d1.token })).status === 403);
+  if (!hadPublication) {
+    const none = await call('GET', '/public/prices');
+    check('P5 public list before the first publish → 404 "belum diterbitkan"', none.status === 404 && /belum diterbitkan/.test(none.json?.message ?? ''), JSON.stringify(none.json));
+  }
+
+  // Edit a rate: one log per changed field, counted as unpublished.
+  const before = L.unpublished_changes;
+  const target = rate('JAKARTA', 'toyota-avanza', '12H');
+  const upd = await call('PATCH', '/prices/rates', { token: admin, body: { items: [{ id: target.id, amount: 775000, note: 'Naik' }] } });
+  const changed = upd.data?.zones.find((z) => z.code === 'JAKARTA').rates.find((r) => r.id === target.id);
+  const logs = await prisma.priceChangeLog.findMany({ where: { entity_id: target.id }, orderBy: { created_at: 'desc' }, take: 2 });
+  check('P6 PATCH a rate: saved with who changed it, one log per changed field (amount, note), unpublished +2',
+    upd.status === 200 && changed?.amount === 775000 && changed.note === 'Naik' && upd.data.users[changed.updated_by] === 'admin@e2e.local' &&
+    logs.some((l) => l.field === 'amount' && l.old_value === '750000' && l.new_value === '775000') && logs.some((l) => l.field === 'note' && l.old_value === null && l.new_value === 'Naik') &&
+    upd.data.unpublished_changes === before + 2, JSON.stringify({ status: upd.status, changed, unpublished: upd.data?.unpublished_changes, before }));
+  const same = await call('PATCH', '/prices/rates', { token: admin, body: { items: [{ id: target.id, amount: 775000, note: 'Naik' }] } });
+  check('P7 the same values again: nothing logged', same.status === 200 && same.data.unpublished_changes === before + 2);
+  const ask = rate('LUAR_KOTA', 'toyota-rush', 'FULLDAY');
+  const askUpd = await call('PATCH', '/prices/rates', { token: admin, body: { items: [{ id: ask.id, amount: null, is_proposal: false }] } });
+  const askRow = askUpd.data?.zones.find((z) => z.code === 'LUAR_KOTA').rates.find((r) => r.id === ask.id);
+  check('P8 amount null = "tanya admin", proposal flag cleared', askUpd.status === 200 && askRow?.amount === null && askRow.is_proposal === false);
+  check('P9 negative or decimal amount (400), unknown rate (404), driver token (403)',
+    (await call('PATCH', '/prices/rates', { token: admin, body: { items: [{ id: target.id, amount: -1 }] } })).status === 400 &&
+    (await call('PATCH', '/prices/rates', { token: admin, body: { items: [{ id: target.id, amount: 1000.5 }] } })).status === 400 &&
+    (await call('PATCH', '/prices/rates', { token: admin, body: { items: [{ id: uuid(), amount: 1000 }] } })).status === 404 &&
+    (await call('PATCH', '/prices/rates', { token: d1.token, body: { items: [{ id: target.id, amount: 1 }] } })).status === 403);
+
+  // Two admins on the same page: a save from a stale page is refused (409).
+  const jktRate = (data, id) => data?.zones.find((z) => z.code === 'JAKARTA').rates.find((r) => r.id === id);
+  const loaded = jktRate(upd.data, target.id); // amount 775000, as the page shows it now
+  const otherRate = rate('JAKARTA', 'mitsubishi-xpander', '12H');
+  const fresh = await call('PATCH', '/prices/rates', { token: admin, body: { items: [{ id: target.id, amount: 780000, expected_updated_at: loaded.updated_at }] } });
+  const savedA = jktRate(fresh.data, target.id);
+  check('P9b save with the current expected_updated_at → 200, updated_at moves on',
+    fresh.status === 200 && savedA?.amount === 780000 && savedA.updated_at !== loaded.updated_at, JSON.stringify({ status: fresh.status, msg: fresh.json?.message, savedA }));
+  const stale = await call('PATCH', '/prices/rates', { token: admin, body: { items: [
+    { id: otherRate.id, amount: 1234000, expected_updated_at: otherRate.updated_at },
+    { id: target.id, amount: 790000, expected_updated_at: loaded.updated_at },
+  ] } });
+  const afterStale = (await call('GET', '/prices', { token: admin })).data;
+  check('P9c a stale item → 409 "sudah diubah admin lain" with only its id in conflict_ids; nothing of the save is stored (the fresh item neither)',
+    stale.status === 409 && stale.json?.message === 'Harga ini sudah diubah admin lain. Muat ulang halaman lalu ulangi.' &&
+    JSON.stringify(stale.json?.conflict_ids) === JSON.stringify([target.id]) &&
+    jktRate(afterStale, target.id).amount === 780000 && jktRate(afterStale, otherRate.id).amount === otherRate.amount,
+    JSON.stringify(stale.json));
+  const noCheck = await call('PATCH', '/prices/rates', { token: admin, body: { items: [{ id: target.id, amount: 775000 }] } });
+  check('P9d without expected_updated_at: saved as before (no check); a non-ISO value → 400',
+    noCheck.status === 200 && jktRate(noCheck.data, target.id).amount === 775000 &&
+    (await call('PATCH', '/prices/rates', { token: admin, body: { items: [{ id: target.id, amount: 775000, expected_updated_at: 'kemarin' }] } })).status === 400);
+  const longAgo = '2000-01-01T00:00:00.000Z';
+  const staleOne = async (path) => (await call('PATCH', path, { token: admin, body: { expected_updated_at: longAgo } }));
+  const [zStale, eStale, cStale, carStale] = await Promise.all([
+    staleOne(`/prices/zones/${zone('JAKARTA').id}`),
+    staleOne(`/prices/extras/${L.extras[0].id}`),
+    staleOne(`/prices/cities/${L.cities[0].id}`),
+    staleOne(`/prices/cars/${L.cars[0].id}`),
+  ]);
+  check('P9e zone, driver cost, city and car: a stale expected_updated_at → 409 with the id',
+    [zStale, eStale, cStale, carStale].every((r) => r.status === 409 && r.json?.conflict_ids?.length === 1) &&
+    zStale.json.conflict_ids[0] === zone('JAKARTA').id && carStale.json.conflict_ids[0] === L.cars[0].id,
+    [zStale, eStale, cStale, carStale].map((r) => r.status).join(','));
+  // A write after a publication dated later than this server's clock (another
+  // server, a clock step back) still counts as unpublished.
+  const ahead = await prisma.pricePublication.create({
+    data: { snapshot: {}, client_ref: uuid(), deploy_status: 'SKIPPED', created_at: new Date(Date.now() + 60_000) },
+  });
+  const afterAhead = await call('PATCH', '/prices/rates', { token: admin, body: { items: [{ id: target.id, amount: 776000 }] } });
+  const aheadLog = await prisma.priceChangeLog.findFirst({ where: { entity_id: target.id }, orderBy: { created_at: 'desc' } });
+  check('P9f a change after a publication stamped in the future is still counted (log time > publication time)',
+    afterAhead.status === 200 && afterAhead.data.unpublished_changes === 1 && aheadLog.created_at > ahead.created_at,
+    JSON.stringify({ unpublished: afterAhead.data?.unpublished_changes }));
+  await prisma.pricePublication.delete({ where: { id: ahead.id } });
+  await call('PATCH', '/prices/rates', { token: admin, body: { items: [{ id: target.id, amount: 775000 }] } });
+
+  // Publish, then the public list.
+  const pubCount = await prisma.pricePublication.count();
+  const noRef = await call('POST', '/prices/publish', { token: admin, body: { note: 'tanpa ref', confirm_proposals: true } });
+  check('P10a publish without client_ref → 400', noRef.status === 400, JSON.stringify(noRef.json));
+  const proposals = (await call('GET', '/prices', { token: admin })).data.proposal_count;
+  const unconfirmed = await call('POST', '/prices/publish', { token: admin, body: { client_ref: uuid() } });
+  check('P10b publish while rates are proposals, without confirm_proposals → 409 naming how many; nothing stored',
+    proposals === 93 && unconfirmed.status === 409 &&
+    unconfirmed.json?.message === `Masih ada ${proposals} harga usulan yang belum dikonfirmasi owner. Centang konfirmasi untuk tetap menerbitkan.` &&
+    unconfirmed.json?.proposal_count === proposals && (await prisma.pricePublication.count()) === pubCount,
+    JSON.stringify({ proposals, status: unconfirmed.status, body: unconfirmed.json }));
+  const hook = async (q = '') => (await fetch(`${MOCK}/__deploy-hook${q}`)).json();
+  await hook('?fail=0');
+  const hookCalls = (await hook()).calls;
+  const ref = uuid();
+  const p1 = await call('POST', '/prices/publish', { token: admin, body: { note: 'Daftar harga e2e', client_ref: ref, confirm_proposals: true } });
+  const snap1 = p1.data?.snapshot;
+  check('P10 publish with confirm_proposals → 201, the deploy hook called once (SENT), the snapshot has the new price',
+    p1.status === 201 && p1.data.publication.deploy_status === 'SENT' && (await hook()).calls === hookCalls + 1 && snap1?.version === 1 && snap1.zones.find((z) => z.code === 'JAKARTA').rates['toyota-avanza']['12H'] === 775000,
+    JSON.stringify(p1.data?.publication ?? p1.json));
+  const res = await fetch(`${BASE}/public/prices`); // no token, no Origin (a server-side build)
+  const body = await res.json();
+  const snap = body.data;
+  const text = JSON.stringify(body);
+  check('P11 public list (no token, no Origin): the published snapshot, Cache-Control public 5 min, no proposal flags or admin ids',
+    res.status === 200 && snap.published_at === snap1.published_at && snap.zones.find((z) => z.code === 'JAKARTA').rates['toyota-avanza']['12H'] === 775000 &&
+    snap.zones.find((z) => z.code === 'LUAR_KOTA').rates['toyota-rush'].FULLDAY === null &&
+    res.headers.get('cache-control') === 'public, max-age=300' && !/is_proposal|updated_by|published_by|changed_by/.test(text), `${res.status} ${res.headers.get('cache-control')}`);
+  const jkt = snap.zones.find((z) => z.code === 'JAKARTA');
+  check('P12 snapshot shape (website contract v1): cars, zones with rates by car slug (in fleet order), cities by zone code, extras by code',
+    snap.cars.length === 14 && JSON.stringify(snap.cars[0]) === '{"slug":"toyota-avanza","name":"Toyota Avanza","price_class":"Avanza sekelas"}' &&
+    Object.keys(jkt).join(',') === 'code,name,service_package,included,excluded,note,default_for_unlisted,rates,surcharges' &&
+    jkt.service_package === 'ALL-IN X PARKIR' && JSON.stringify(jkt.surcharges[0]) === '{"area":"Tangerang","amount":200000}' &&
+    Object.keys(jkt.rates).join(',') === snap.cars.map((c) => c.slug).join(',') && Object.keys(jkt.rates['toyota-avanza']).join(',') === '12H,FULLDAY' &&
+    JSON.stringify(snap.zones.find((z) => z.code === 'DROP_JABODETABEK').rates['toyota-avanza']) === '{"DROP":500000}' &&
+    JSON.stringify(snap.cities.find((c) => c.slug === 'sewa-mobil-jakarta')) === '{"slug":"sewa-mobil-jakarta","name":"Jakarta","driver_zone":"JABODETABEK","all_in_zone":"JAKARTA","quote":false}' &&
+    JSON.stringify(snap.cities.find((c) => c.slug === 'sewa-mobil-thailand')) === '{"slug":"sewa-mobil-thailand","name":"Thailand","driver_zone":null,"all_in_zone":null,"quote":true}' &&
+    snap.extras.OVERTIME.percent === 10 && snap.extras.DRIVER_LODGING.amount === 150000 && snap.zones.find((z) => z.code === 'SURABAYA').default_for_unlisted === true,
+    JSON.stringify(snap.cars[0]));
+  const site = await fetch(`${BASE}/public/prices`, { headers: { Origin: 'https://arasya-web.vercel.app' } });
+  const other = await fetch(`${BASE}/public/prices`, { headers: { Origin: 'https://evil.example' } });
+  check('P13 CORS: the website origin is allowed, another origin gets no allow header',
+    site.headers.get('access-control-allow-origin') === 'https://arasya-web.vercel.app' && !other.headers.get('access-control-allow-origin'),
+    `${site.headers.get('access-control-allow-origin')} / ${other.headers.get('access-control-allow-origin')}`);
+  const p2 = await call('POST', '/prices/publish', { token: admin, body: { client_ref: ref } });
+  check('P14 publish again with the same client_ref → 200, the same publication, stored once',
+    p2.status === 200 && p2.data.publication.id === p1.data.publication.id && (await prisma.pricePublication.count({ where: { client_ref: ref } })) === 1);
+  const L2 = (await call('GET', '/prices', { token: admin })).data;
+  check('P15 after publishing: unpublished_changes 0, last_publication is it, with who published',
+    L2.unpublished_changes === 0 && L2.last_publication?.id === p1.data.publication.id && L2.last_publication.deploy_status === 'SENT' && L2.users[L2.last_publication.published_by] === 'admin@e2e.local',
+    JSON.stringify({ unpublished: L2.unpublished_changes, last: L2.last_publication }));
+
+  // The hook is down: FAILED; the admin's resend (same client_ref) calls it again.
+  await hook('?fail=1');
+  const ref2 = uuid();
+  const f1 = await call('POST', '/prices/publish', { token: admin, body: { client_ref: ref2, confirm_proposals: true } });
+  await hook('?fail=0');
+  const callsBefore = (await hook()).calls;
+  const f2 = await call('POST', '/prices/publish', { token: admin, body: { client_ref: ref2, confirm_proposals: true } });
+  const f3 = await call('POST', '/prices/publish', { token: admin, body: { client_ref: ref2, confirm_proposals: true } });
+  const stored = await prisma.pricePublication.findUnique({ where: { client_ref: ref2 } });
+  check('P15b hook down → FAILED; the resend calls it again → 200, the same publication, SENT (stored); a further resend does not call it',
+    f1.status === 201 && f1.data.publication.deploy_status === 'FAILED' &&
+    f2.status === 200 && f2.data.publication.id === f1.data.publication.id && f2.data.publication.deploy_status === 'SENT' && stored?.deploy_status === 'SENT' &&
+    f3.status === 200 && (await hook()).calls === callsBefore + 1,
+    JSON.stringify({ f1: f1.data?.publication ?? f1.json, f2: f2.data?.publication ?? f2.json }));
+
+  // Area surcharges.
+  const jakarta = zone('JAKARTA');
+  const dup = await call('POST', '/prices/surcharges', { token: admin, body: { zone_id: jakarta.id, area: 'bekasi', amount: 150000 } });
+  check('P16 a surcharge for an area the table already has (any capitalisation) → 409', dup.status === 409 && /sudah ada/.test(dup.json?.message ?? ''), dup.json?.message);
+  const area = `Karawang ${tag}`;
+  const add = await call('POST', '/prices/surcharges', { token: admin, body: { zone_id: jakarta.id, area, amount: 250000 } });
+  const added = add.data?.zones.find((z) => z.code === 'JAKARTA').surcharges.find((s) => s.area === area);
+  check('P17 new surcharge (201) goes last in its table and counts as unpublished', add.status === 201 && added?.amount === 250000 && added.sort_order === 6 && add.data.unpublished_changes === 1, JSON.stringify(added));
+  check('P18 renaming it to an area already listed → 409', (await call('PATCH', `/prices/surcharges/${added.id}`, { token: admin, body: { area: 'Bogor' } })).status === 409);
+  const moved = await call('PATCH', `/prices/surcharges/${added.id}`, { token: admin, body: { sort_order: 7, expected_updated_at: added.updated_at } });
+  const movedRow = moved.data?.zones.find((z) => z.code === 'JAKARTA').surcharges.find((s) => s.id === added.id);
+  const staleMove = await call('PATCH', `/prices/surcharges/${added.id}`, { token: admin, body: { sort_order: 8, expected_updated_at: added.updated_at } });
+  const staleDel = await call('DELETE', `/prices/surcharges/${added.id}?expected_updated_at=${encodeURIComponent(added.updated_at)}`, { token: admin });
+  check('P18b surcharge: fresh PATCH → 200; PATCH and DELETE from the stale page → 409 (still there)',
+    moved.status === 200 && movedRow?.sort_order === 7 && staleMove.status === 409 && staleDel.status === 409 &&
+    JSON.stringify(staleDel.json?.conflict_ids) === JSON.stringify([added.id]) && (await prisma.priceSurcharge.count({ where: { id: added.id } })) === 1,
+    `${moved.status} ${staleMove.status} ${staleDel.status}`);
+  const del = await call('DELETE', `/prices/surcharges/${added.id}?expected_updated_at=${encodeURIComponent(movedRow?.updated_at ?? '')}`, { token: admin });
+  const delLog = await prisma.priceChangeLog.findFirst({ where: { entity_id: added.id, field: 'deleted' } });
+  check('P19 delete: gone, the log keeps what it was (new_value null)',
+    del.status === 200 && !del.data.zones.find((z) => z.code === 'JAKARTA').surcharges.some((s) => s.id === added.id) && delLog?.old_value === `${area}: 250000` && delLog.new_value === null);
+
+  // Cities, cars, driver costs.
+  const jktCity = city('sewa-mobil-jakarta');
+  check('P20 city: an all-in table as its car + driver table → 400', (await call('PATCH', `/prices/cities/${jktCity.id}`, { token: admin, body: { driver_zone_id: jakarta.id } })).status === 400);
+  const quote = await call('PATCH', `/prices/cities/${jktCity.id}`, { token: admin, body: { quote: true } });
+  const qc = quote.data?.cities.find((c) => c.id === jktCity.id);
+  const backCity = await call('PATCH', `/prices/cities/${jktCity.id}`, { token: admin, body: { quote: false, driver_zone_id: jktCity.driver_zone_id, all_in_zone_id: jktCity.all_in_zone_id } });
+  const bc = backCity.data?.cities.find((c) => c.id === jktCity.id);
+  check('P21 marking a city as quote clears both tables; back to its tables',
+    quote.status === 200 && qc.quote === true && qc.driver_zone_id === null && qc.all_in_zone_id === null &&
+    backCity.status === 200 && bc.quote === false && bc.driver_zone_id === jktCity.driver_zone_id && bc.all_in_zone_id === jktCity.all_in_zone_id);
+  const slug = `test-car-${tag}`;
+  const newCar = await call('POST', '/prices/cars', { token: admin, body: { slug, name: `Test Car ${tag}` } });
+  const nc = newCar.data?.cars.find((c) => c.slug === slug);
+  const ncRates = (newCar.data?.zones ?? []).flatMap((z) => z.rates.filter((r) => r.car_id === nc?.id).map((r) => ({ code: z.code, ...r })));
+  check('P22 new car: last in the list, 11 empty rates (12 jam + Fullday in 5 tables, Drop in the drop table), all proposals',
+    newCar.status === 201 && nc?.sort_order === 14 && ncRates.length === 11 &&
+    ncRates.every((r) => r.amount === null && r.is_proposal && (r.code.startsWith('DROP') ? r.duration === 'DROP' : r.duration !== 'DROP')), JSON.stringify({ status: newCar.status, nc, n: ncRates.length }));
+  check('P23 the same slug again → 409, a slug with spaces → 400',
+    (await call('POST', '/prices/cars', { token: admin, body: { slug, name: 'Dobel' } })).status === 409 &&
+    (await call('POST', '/prices/cars', { token: admin, body: { slug: 'Toyota Baru', name: 'X' } })).status === 400);
+  const ex = await call('PATCH', `/prices/extras/${ot.id}`, { token: admin, body: { percent: 12.5 } });
+  check('P24 overtime percent edited (12,5%)', ex.status === 200 && ex.data.extras.find((e) => e.code === 'OVERTIME').percent === 12.5);
+
+  // History and publications.
+  const hist = await call('GET', '/prices/history?limit=5', { token: admin });
+  const items = hist.data?.items ?? [];
+  const rateLog = (await call('GET', '/prices/history?limit=500', { token: admin })).data?.items.find((i) => i.entity_id === target.id);
+  check('P25 history: newest first, limit, admin emails; a rate log is labelled car · table · duration',
+    hist.status === 200 && items.length === 5 && items[0].field === 'percent' && new Date(items[0].created_at) >= new Date(items[4].created_at) &&
+    Object.values(hist.data.users).includes('admin@e2e.local') && rateLog?.label === 'Toyota Avanza · All-in Jakarta · 12 jam', rateLog?.label);
+  const pubs = await call('GET', '/prices/publications', { token: admin });
+  check('P26 publications list (newest first) without the snapshot body', pubs.status === 200 && pubs.data.items[0]?.id === f1.data.publication.id && pubs.data.items[1]?.id === p1.data.publication.id && !('snapshot' in pubs.data.items[0]));
+
+  // Put the seed back (the logs stay).
+  await call('PATCH', '/prices/rates', { token: admin, body: { items: [{ id: target.id, amount: 750000, note: null }, { id: ask.id, amount: ask.amount, is_proposal: ask.is_proposal }] } });
+  await call('PATCH', `/prices/extras/${ot.id}`, { token: admin, body: { percent: 10 } });
+  if (nc) {
+    await prisma.priceRate.deleteMany({ where: { car_id: nc.id } });
+    await prisma.priceCar.delete({ where: { id: nc.id } });
+  }
+  const L3 = (await call('GET', '/prices', { token: admin })).data;
+  check('P27 seed restored (Avanza all-in Jakarta 750.000, Rush luar kota Fullday 1.000.000, overtime 10%)',
+    L3.zones.find((z) => z.code === 'JAKARTA').rates.find((r) => r.id === target.id).amount === 750000 &&
+    L3.zones.find((z) => z.code === 'LUAR_KOTA').rates.find((r) => r.id === ask.id).amount === 1000000 && L3.cars.length === 14 &&
+    L3.extras.find((e) => e.code === 'OVERTIME').percent === 10);
+
+  // Invoice wording follows the package of the order's days (built file).
+  const { packageNoteLines } = createRequire(import.meta.url)('../../dist/src/utils/packageNotes.js');
+  const xops = packageNoteLines([{ service_package: 'XOPS', line_status: 'SCHEDULED' }]);
+  check('P28 invoice notes, X Ops: car and driver only',
+    xops.length === 2 && xops[0] === 'Harga termasuk mobil dan supir' && xops[1] === 'Belum termasuk BBM, tol, parkir/tiket masuk kawasan, dan makan supir; tips supir seikhlasnya dari Tamu', JSON.stringify(xops));
+  const allIn = packageNoteLines([{ service_package: 'ALL-IN X PARKIR', line_status: 'DONE' }, { service_package: 'XOPS', line_status: 'CANCELLED' }]);
+  check('P29 invoice notes, All-in X Parkir (a cancelled X Ops day ignored): the two all-in lines',
+    allIn.length === 2 && allIn[0] === 'Harga termasuk mobil supir bbm tol makan supir' && allIn[1] === 'Parkir/tiket masuk kawasan dan tips supir seikhlasnya dari Tamu', JSON.stringify(allIn));
+  const mixed = packageNoteLines([{ service_package: 'ALL-IN' }, { service_package: 'ALL-IN X PARKIR' }, { service_package: 'xops' }]);
+  check('P30 invoice notes, mixed order: one prefixed pair per package; unknown/empty = All-in',
+    mixed.length === 4 && mixed[0] === 'Paket All-in: Harga termasuk mobil supir bbm tol makan supir' && mixed[2] === 'Paket X Ops: Harga termasuk mobil dan supir' &&
+    packageNoteLines([{ service_package: null }])[0] === 'Harga termasuk mobil supir bbm tol makan supir', JSON.stringify(mixed));
+});
+
+// ── Q. Cancelled days, billed totals and the DP minimum (B1, B2, B7, B12) ──
+await section('Q. Cancelled days, billed totals, DP minimum (B1, B2, B7, B12)', async () => {
+  const dQ = await makeDriver(40);
+  const carQ = await makeCar('Brio');
+  const line = (id) => prisma.orderServiceItem.findUnique({ where: { id } });
+  const revise = (o, inv, amount) => call('POST', `/orders/${o.id}/invoice/${inv.id}/revise`, { token: admin, body: { amount } });
+  // Text of an uploaded PDF (pdf-lib writes standard-font text as hex strings,
+  // inside deflated content streams).
+  const { inflateSync } = await import('node:zlib');
+  const pdfText = async (url) => {
+    const key = decodeURIComponent(new URL(url).pathname.replace(/^.*\/object\/public\//, ''));
+    const buf = Buffer.from(await (await fetch(`${MOCK}/__object?key=${encodeURIComponent(key)}`)).arrayBuffer());
+    const raw = buf.toString('latin1');
+    const parts = [raw];
+    const re = /stream\r?\n/g;
+    let m;
+    while ((m = re.exec(raw))) {
+      const end = raw.indexOf('endstream', m.index);
+      if (end < 0) break;
+      try { parts.push(inflateSync(buf.subarray(m.index + m[0].length, end)).toString('latin1')); } catch {}
+    }
+    return parts.join('\n').replace(/<([0-9A-Fa-f\s]+)>/g, (_, h) => Buffer.from(h.replace(/\s/g, ''), 'hex').toString('latin1'));
+  };
+
+  // B1.1: Edit Hari never ends an order.
+  const o1 = await makeOrder('Q1', { startDay: 20 });
+  const p1 = await putLine(o1.service_items[0].id, { is_external: false, line_status: 'CANCELLED' });
+  check('Q1 [B1.1] cancelling the only day in Edit Hari refused (409, points to Batalkan Pesanan), day and order unchanged',
+    p1.status === 409 && /hari terakhir yang masih aktif/.test(p1.json?.message ?? '') && /Batalkan Pesanan/.test(p1.json?.message ?? '') &&
+    (await line(o1.service_items[0].id)).line_status === 'SCHEDULED' && (await order(o1.id)).order_status !== 'CANCELLED', p1.json?.message);
+  const o2 = await makeOrder('Q2', { days: 2, startDay: 21 });
+  const p2a = await putLine(o2.service_items[0].id, { is_external: false, line_status: 'CANCELLED' });
+  const o2a = await order(o2.id);
+  check('Q2 [B1.1] one day of a two-day order can be cancelled; total 1.000.000', p2a.status === 200 && Number(o2a.final_price) === 1000000, `${p2a.status} ${p2a.json?.message ?? ''} ${o2a.final_price}`);
+  const p2b = await putLine(o2.service_items[1].id, { is_external: false, line_status: 'CANCELLED' });
+  check('Q3 [B1.1] the remaining day then refused (409), order not cancelled',
+    p2b.status === 409 && /hari terakhir/.test(p2b.json?.message ?? '') && (await order(o2.id)).order_status !== 'CANCELLED', p2b.json?.message);
+  // Day 1 done, day 2 still to run: cancelling or removing day 2 would end the order.
+  const o3 = await makeOrder('Q4', { days: 2, startDay: 22 });
+  const [d1st, d2nd] = [...o3.service_items].sort((a, b) => a.service_date.localeCompare(b.service_date)).map((l) => l.id);
+  await prisma.orderServiceItem.update({ where: { id: d1st }, data: { line_status: 'DONE' } });
+  const p4 = await putLine(d2nd, { is_external: false, line_status: 'CANCELLED' });
+  check('Q4 [B1.1] day 1 done: cancelling day 2 in Edit Hari refused (409)', p4.status === 409 && /hari terakhir/.test(p4.json?.message ?? '') && (await line(d2nd)).line_status === 'SCHEDULED', p4.json?.message);
+  const p5 = await call('PUT', `/orders/${o3.id}`, { token: admin, body: editBody(await order(o3.id), { reason: 'hapus hari', days: [{ id: d1st }] }) });
+  check('Q5 [B1.1] nor removed in Edit Order (409), day kept', p5.status === 409 && /hari terakhir/.test(p5.json?.message ?? '') && (await order(o3.id)).service_items.length === 2, p5.json?.message);
+
+  // B1.3: Edit Hari does not push the total below what is billed.
+  const o4 = await makeOrder('Q6', { days: 2, startDay: 23 });
+  const full4 = (await invoice(o4.id, 'FULL', 2_000_000)).data;
+  const p6 = await putLine(o4.service_items[1].id, { is_external: false, line_status: 'CANCELLED' });
+  const o4a = await order(o4.id);
+  check('Q6 [B1.3] cancelling a day below the issued invoice refused (409, both amounts), day and total unchanged',
+    p6.status === 409 && /Rp 1\.000\.000/.test(p6.json?.message ?? '') && /Rp 2\.000\.000/.test(p6.json?.message ?? '') && /Revisi atau batalkan invoice/.test(p6.json?.message ?? '') &&
+    o4a.service_items.every((l) => l.line_status === 'SCHEDULED') && Number(o4a.final_price) === 2000000, p6.json?.message);
+  const rv4 = await revise(o4, full4, 1_000_000);
+  const p7 = await putLine(o4.service_items[1].id, { is_external: false, line_status: 'CANCELLED' });
+  check('Q7 [B1.3] after revising the invoice to 1.000.000 the day can be cancelled; total 1.000.000',
+    rv4.status === 201 && p7.status === 200 && Number((await order(o4.id)).final_price) === 1000000, `${rv4.status} ${p7.status} ${p7.json?.message ?? ''}`);
+
+  // B2: DP_PAID needs 20% of the rental base actually received.
+  const o5 = await makeOrder('Q8', { startDay: 24 });
+  const dp5 = (await invoice(o5.id, 'DP', 200_000)).data;
+  await markPaid(o5.id, dp5.id, { amount_received: 50_000 });
+  const o5a = await order(o5.id);
+  check('Q8 [B2] DP invoice marked paid with 50.000 received (< 20%): stays UNPAID', o5a.payment_status === 'UNPAID' && Number(o5a.paid_to_date) === 50000, `${o5a.payment_status} ${o5a.paid_to_date}`);
+  const p9 = await putLine(o5.service_items[0].id, { is_external: false, driver_id: dQ.id, car_id: carQ.id });
+  check('Q9 [B2] driver refused (409), message gives the money received and the minimum DP',
+    p9.status === 409 && /Rp 50\.000/.test(p9.json?.message ?? '') && /Rp 200\.000/.test(p9.json?.message ?? ''), p9.json?.message);
+  const st5 = (await invoice(o5.id, 'SETTLEMENT', 150_000)).data;
+  await markPaid(o5.id, st5.id);
+  const p10 = await putLine(o5.service_items[0].id, { is_external: false, driver_id: dQ.id, car_id: carQ.id });
+  check('Q10 [B2] 200.000 received in total: DP_PAID, driver accepted', (await order(o5.id)).payment_status === 'DP_PAID' && p10.status === 200, `${p10.status} ${p10.json?.message ?? ''}`);
+  const o6 = await makeOrder('Q11', { startDay: 25 });
+  const dp6 = (await invoice(o6.id, 'DP', 200_000)).data;
+  const low = await revise(o6, dp6, 100_000);
+  const ok6 = await revise(o6, dp6, 250_000);
+  check('Q11 [B2] revising a DP below 20% refused (409); 250.000 accepted', low.status === 409 && ok6.status === 201, `${low.status} ${low.json?.message ?? ''} / ${ok6.status}`);
+  const o7 = await makeOrder('Q12', { startDay: 26 });
+  await payDp(o7, 200_000);
+  const add7 = await call('PUT', `/orders/${o7.id}`, {
+    token: admin,
+    body: editBody(o7, { reason: 'tambah hari', days: [{ id: o7.service_items[0].id }, { service_date: wibIso(27, '00:00'), start_at: wibIso(27, '08:00'), end_at: wibIso(27, '20:00'), unit_price: 1_000_000 }] }),
+  });
+  check('Q12 [B2] a day added: 200.000 is below 20% of 2.000.000, DP_PAID → UNPAID', add7.status === 200 && (await order(o7.id)).payment_status === 'UNPAID', `${add7.status} ${(await order(o7.id)).payment_status}`);
+
+  // B7: the DP base and the PDFs leave cancelled days out.
+  const o8 = await makeOrder('Q13', { days: 2, startDay: 28 });
+  await putLine(o8.service_items[1].id, { is_external: false, line_status: 'CANCELLED' });
+  const dp8 = await invoice(o8.id, 'DP', 200_000);
+  check('Q13 [B7] DP base without the cancelled day: 200.000 (20% of 1.000.000) accepted', dp8.status === 201, `${dp8.status} ${dp8.json?.message ?? ''}`);
+  const dpPdf = dp8.data?.file_url ? await pdfText(dp8.data.file_url) : '';
+  const stmt8 = await call('POST', `/orders/${o8.id}/statement`, { token: admin, body: {} });
+  const stPdf = stmt8.data?.statement_url ? await pdfText(stmt8.data.statement_url) : '';
+  check('Q14 [B7] invoice and statement PDFs print the cancelled day as "(Dibatalkan)"; statement total 1.000.000',
+    /\(Dibatalkan\)/.test(dpPdf) && /\(Dibatalkan\)/.test(stPdf) && Number(stmt8.data?.final_price) === 1000000,
+    `dp ${/Dibatalkan/.test(dpPdf)} statement ${/Dibatalkan/.test(stPdf)} ${stmt8.data?.final_price}`);
+  const o9 = await makeOrder('Q15', { days: 2, startDay: 29 });
+  const dp9 = (await invoice(o9.id, 'DP', 400_000)).data;
+  await markPaid(o9.id, dp9.id, { amount_received: 300_000 });
+  const before9 = (await order(o9.id)).payment_status;
+  await putLine(o9.service_items[1].id, { is_external: false, line_status: 'CANCELLED' });
+  check('Q15 [B2/B7] 300.000 received: UNPAID on 2 days (min 400.000), DP_PAID once a day is cancelled (min 200.000)',
+    before9 === 'UNPAID' && (await order(o9.id)).payment_status === 'DP_PAID', `${before9} → ${(await order(o9.id)).payment_status}`);
+
+  // B12: cancellation fees in whole rupiah.
+  const o10 = await makeOrder('Q16', { price: 1_000_003, startDay: 30 });
+  const c10 = await call('POST', `/orders/${o10.id}/cancel`, { token: admin, body: { reason: 'tes pembulatan' } });
+  const fee10 = (await order(o10.id)).invoices.find((i) => i.invoice_type === 'CANCELLATION_FEE');
+  check('Q16 [B12] 20% of 1.000.003 billed as 200.001 (whole rupiah), fee invoice the same',
+    c10.status === 200 && c10.data.penalty === 200001 && c10.data.stillOwed === 200001 && Number(fee10?.amount) === 200001 && Number((await order(o10.id)).cancellation_fee) === 200001,
+    `${JSON.stringify(c10.data ?? c10.json)} ${fee10?.amount}`);
+
+  // B2 after a cancellation: the fee is what is owed, so it is also the DP base.
+  const o11 = await makeOrder('Q17', { price: 5_000_000, startDay: 32 });
+  const dp11 = (await invoice(o11.id, 'DP', 1_000_000)).data;
+  await markPaid(o11.id, dp11.id, { amount_received: 50_000 });
+  const c11 = await call('POST', `/orders/${o11.id}/cancel`, { token: admin, body: { reason: 'tes DP setelah batal' } });
+  const o11a = await order(o11.id);
+  check('Q17 [B2] 50.000 received on 5.000.000, cancelled before day H (fee 1.000.000): stays UNPAID (below 20% of the fee)',
+    c11.status === 200 && c11.data.penalty === 1000000 && o11a.payment_status === 'UNPAID', `${c11.status} ${c11.data?.penalty} ${o11a.payment_status}`);
+  const fee11 = o11a.invoices.find((i) => i.invoice_type === 'CANCELLATION_FEE' && i.status === 'ISSUED');
+  if (fee11) await markPaid(o11.id, fee11.id, { amount_received: 150_000 });
+  const o11b = await order(o11.id);
+  check('Q18 [B2] fee invoice 950.000 marked paid with 150.000: 200.000 received (20% of the fee) → DP_PAID',
+    Number(fee11?.amount) === 950000 && Number(o11b.paid_to_date) === 200000 && o11b.payment_status === 'DP_PAID', `${fee11?.amount} ${o11b.paid_to_date} ${o11b.payment_status}`);
+  // B7 on the documents of a cancelled order: a fee line, so the lines add up.
+  const inv11 = fee11 ? await prisma.invoice.findUnique({ where: { id: fee11.id } }) : null;
+  const rc11 = inv11?.receipt_url ? await pdfText(inv11.receipt_url) : '';
+  check('Q19 [B7] kwitansi of the fee invoice: one "Biaya Pembatalan - Tier 1" line of 1.000.000, no day rows, no package notes',
+    /Biaya Pembatalan - Tier 1 \(sebelum hari H\)/.test(rc11) && /1\.000\.000/.test(rc11) && !/Dibatalkan/.test(rc11) && !/Harga termasuk/.test(rc11),
+    `fee ${/Biaya Pembatalan/.test(rc11)} day ${/Dibatalkan/.test(rc11)} notes ${/Harga termasuk/.test(rc11)}`);
+  const st11 = await call('POST', `/orders/${o11.id}/statement`, { token: admin, body: {} });
+  const sp11 = st11.data?.statement_url ? await pdfText(st11.data.statement_url) : '';
+  check('Q20 [B7] statement of the cancelled order: the day as "(Dibatalkan)" plus the fee line, total 1.000.000, no package notes',
+    /\(Dibatalkan\)/.test(sp11) && /Biaya Pembatalan - Tier 1/.test(sp11) && Number(st11.data?.final_price) === 1000000 && !/Harga termasuk/.test(sp11),
+    `day ${/Dibatalkan/.test(sp11)} fee ${/Biaya Pembatalan/.test(sp11)} notes ${/Harga termasuk/.test(sp11)} ${st11.data?.final_price}`);
+
+  // B1.1 in Edit Order only when the save removes a day, on the days as they
+  // are inside its transaction: here the last open day finishes while the
+  // save waits for the order lock, and the save removes nothing.
+  const o12 = await makeOrder('Q21', { days: 2, startDay: 34 });
+  const [e1, e2] = [...o12.service_items].sort((a, b) => a.service_date.localeCompare(b.service_date)).map((l) => l.id);
+  await prisma.orderServiceItem.update({ where: { id: e1 }, data: { line_status: 'DONE' } });
+  const body12 = editBody(await order(o12.id));
+  let save12;
+  await prisma.$transaction(async (tx) => {
+    await tx.$queryRaw`SELECT id FROM "orders" WHERE id = ${o12.id} FOR UPDATE`;
+    await tx.orderServiceItem.update({ where: { id: e2 }, data: { line_status: 'DONE' } });
+    save12 = call('PUT', `/orders/${o12.id}`, { token: admin, body: body12 });
+    await sleep(1500);
+  }, { timeout: 15000 });
+  const r12 = await save12;
+  check('Q21 [B1.1] Edit Order that removes no day saves (200) although the last open day finished meanwhile', r12.status === 200, `${r12.status} ${r12.json?.message ?? ''}`);
+
+  // B1.3 compares with the total read under the order lock, not the one read
+  // before it: here the save first sees an older, lower total.
+  const o13 = await makeOrder('Q22', { days: 3, startDay: 36 });
+  await invoice(o13.id, 'FULL', 3_000_000);
+  await prisma.order.update({ where: { id: o13.id }, data: { final_price: 1_000_000 } });
+  let save13;
+  await prisma.$transaction(async (tx) => {
+    await tx.$queryRaw`SELECT id FROM "orders" WHERE id = ${o13.id} FOR UPDATE`;
+    await tx.order.update({ where: { id: o13.id }, data: { final_price: 3_000_000 } });
+    save13 = putLine(o13.service_items[2].id, { is_external: false, line_status: 'CANCELLED' });
+    await sleep(1500);
+  }, { timeout: 15000 });
+  const r13 = await save13;
+  const o13a = await order(o13.id);
+  check('Q22 [B1.3] a day cancelled below the issued invoice refused (409) against the total read under the lock; day and total unchanged',
+    r13.status === 409 && /Rp 3\.000\.000/.test(r13.json?.message ?? '') && o13a.service_items.every((l) => l.line_status === 'SCHEDULED') && Number(o13a.final_price) === 3000000,
+    `${r13.status} ${r13.json?.message ?? ''} ${o13a.final_price}`);
+
+  // B7: the settlement is due on the first day that will run.
+  const o14 = await makeOrder('Q23', { days: 2, startDay: 38 });
+  const [g1, g2] = [...o14.service_items].sort((a, b) => a.service_date.localeCompare(b.service_date));
+  await putLine(g1.id, { is_external: false, line_status: 'CANCELLED' });
+  await invoice(o14.id, 'DP', 200_000);
+  const st14 = await invoice(o14.id, 'SETTLEMENT', 800_000);
+  const due14 = st14.data?.id ? (await prisma.invoice.findUnique({ where: { id: st14.data.id } }))?.due_date : null;
+  check('Q23 [B7] settlement due on day 2 (day 1 cancelled), not on the cancelled day',
+    st14.status === 201 && due14 != null && due14.getTime() === new Date(g2.service_date).getTime(), `${st14.status} ${due14?.toISOString()} vs ${g2.service_date}`);
+
+  // Overtime % on documents: the published price list, not the working copy.
+  const pubRes = await call('GET', '/public/prices');
+  const pubPct = pubRes.status === 200 ? pubRes.data.extras.OVERTIME.percent : 10;
+  const otRow = (await call('GET', '/prices', { token: admin })).data.extras.find((e) => e.code === 'OVERTIME');
+  const draftPct = pubPct + 5;
+  await call('PATCH', `/prices/extras/${otRow.id}`, { token: admin, body: { percent: draftPct } });
+  const o15 = await makeOrder('Q24', { startDay: 40 });
+  const dp15 = await invoice(o15.id, 'DP', 200_000);
+  const dp15Pdf = dp15.data?.file_url ? await pdfText(dp15.data.file_url) : '';
+  await call('PATCH', `/prices/extras/${otRow.id}`, { token: admin, body: { percent: otRow.percent } });
+  const pct = (n) => `${new Intl.NumberFormat('id-ID', { maximumFractionDigits: 2 }).format(n)}%`;
+  check('Q24 invoice overtime % is the published one, not the unpublished edit',
+    dp15Pdf.includes(`${pct(pubPct)} dari harga Full day`) && !dp15Pdf.includes(pct(draftPct)), `published ${pct(pubPct)} draft ${pct(draftPct)} found ${/\S+% dari harga Full day/.exec(dp15Pdf)?.[0]}`);
 });
 
 const failed = summary();

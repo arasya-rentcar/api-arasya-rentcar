@@ -1,5 +1,12 @@
 import { waLink, waManual } from "../../utils/waManual";
-import { netPaid, paymentStatusFor, startPayment } from "../orders/assignment-guard";
+import {
+  dpBaseOf,
+  minDpFor,
+  netPaid,
+  paymentStatusFor,
+  rentalBaseOf,
+  startPayment,
+} from "../orders/assignment-guard";
 import { notifyOrderPaidInFull } from "../../services/driverNotify";
 import { reportLeadPurchase } from "../../services/ga4.service";
 import type { Prisma } from "@prisma/client";
@@ -7,6 +14,7 @@ import prisma from "../../prisma/client";
 import { env } from "../../config/env";
 import { AppError } from "../../utils/AppError";
 import { nextInvoiceNumber, nextReceiptNumber } from "../../utils/codes";
+import { packageNoteLines } from "../../utils/packageNotes";
 import {
   buildDpInvoiceCaption,
   buildSettlementInvoiceCaption,
@@ -17,7 +25,7 @@ import {
   greetingFor,
   isSameDay,
 } from "../../utils/waCaptions";
-import { generateInvoicePDF } from "../../services/pdf.service";
+import { generateInvoicePDF, type InvoiceLineItem } from "../../services/pdf.service";
 import {
   uploadInvoicePDF,
   uploadFile,
@@ -125,7 +133,11 @@ function paymentLines(
   }));
 }
 
-/** One service day as a PDF line item (invoice, kwitansi, statement). */
+/**
+ * One service day as a PDF line item (invoice, kwitansi, statement). A
+ * cancelled day is not in the order total, so it is printed as
+ * "(Dibatalkan)" at Rp 0 and the lines add up to the printed total (B7).
+ */
 function serviceItemToLineItem(item: {
   service_date: Date | null;
   description: string | null;
@@ -136,18 +148,84 @@ function serviceItemToLineItem(item: {
   quantity: number;
   unit_price: unknown;
   total_price: unknown;
+  line_status: string;
 }) {
+  const cancelled = item.line_status === "CANCELLED";
   return {
     serviceDate: item.service_date,
-    description: item.description,
+    description: cancelled
+      ? [item.description?.trim(), "(Dibatalkan)"].filter(Boolean).join(" ")
+      : item.description,
     serviceKind: item.service_kind,
     servicePackage: item.service_package,
     pickupLocation: item.pickup_location,
     dropoffLocation: item.dropoff_location,
     quantity: item.quantity,
-    unitPrice: Number(item.unit_price),
-    totalPrice: Number(item.total_price),
+    unitPrice: cancelled ? 0 : Number(item.unit_price),
+    totalPrice: cancelled ? 0 : Number(item.total_price),
   };
+}
+
+/**
+ * The audit-log value cancelOrder writes; tierLabelOf reads the tier back
+ * for the documents printed later (the order keeps only the fee).
+ */
+export const cancellationLogValue = (penalty: number, tierLabel: string) =>
+  `CANCELLED (cancellation fee ${penalty} — ${tierLabel})`;
+const CANCELLATION_LOG = /^CANCELLED \(cancellation fee [\d.]+ — (.+)\)$/;
+
+async function tierLabelOf(orderId: string): Promise<string | null> {
+  const log = await prisma.orderChangeLog.findFirst({
+    where: { order_id: orderId, field: "order_status", new_value: { startsWith: "CANCELLED (cancellation fee" } },
+    orderBy: { created_at: "desc" },
+    select: { new_value: true },
+  });
+  return log?.new_value?.match(CANCELLATION_LOG)?.[1] ?? null;
+}
+
+type DocumentOrder = {
+  id: string;
+  cancellation_fee: unknown;
+  service_items: Parameters<typeof serviceItemToLineItem>[0][];
+};
+
+/**
+ * A document only about the cancellation fee: the CANCELLATION_FEE invoice
+ * and its kwitansi, or anything for an order whose days are all cancelled.
+ * It prints no package notes (what the price includes is not what it bills).
+ */
+const isFeeOnly = (order: DocumentOrder, invoiceType?: string) =>
+  invoiceType === "CANCELLATION_FEE" ||
+  (order.cancellation_fee != null && order.service_items.every((i) => i.line_status === "CANCELLED"));
+
+/**
+ * The day lines of a document (invoice, kwitansi, statement). On a cancelled
+ * order (cancellation_fee set, the order total) a "Biaya Pembatalan" line
+ * holds what the days and the other lines printed (`otherLines`) do not, so
+ * the lines add up to the printed total (B7). A CANCELLATION_FEE document
+ * lists only the fee, like the invoice cancelOrder issued.
+ */
+async function rentalDocumentItems(
+  order: DocumentOrder,
+  invoiceType?: string,
+  otherLines = 0,
+): Promise<InvoiceLineItem[]> {
+  const fee = order.cancellation_fee == null ? null : Number(order.cancellation_fee);
+  const days = invoiceType === "CANCELLATION_FEE" ? [] : order.service_items.map(serviceItemToLineItem);
+  if (fee == null) return days;
+  const listed = days.reduce((s, d) => s + d.totalPrice, 0) + otherLines;
+  const amount = fee - listed;
+  if (amount <= 0) return days;
+  const tier = await tierLabelOf(order.id);
+  return [
+    ...days,
+    {
+      description: tier ? `Biaya Pembatalan — ${tier}` : "Biaya Pembatalan",
+      quantity: 1,
+      unitPrice: amount,
+      totalPrice: amount,
+    },
+  ];
 }
 
 // Turn a billable adjustment into a PDF line item, appending the date to the
@@ -168,19 +246,18 @@ function adjustmentToLineItem(a: {
 }
 
 // Build the descriptive note lines shown under the table (pickup / dropoff /
-// what's included), mirroring the official invoice/kuitansi templates.
+// what's included), mirroring the official invoice/kuitansi templates. What
+// is included follows the package of the order's days (packageNoteLines).
 function buildNoteLines(order: {
   pickup_location?: string | null;
   dropoff_location?: string | null;
+  service_items: { service_package?: string | null; line_status?: string | null }[];
 }): string[] {
   const lines: string[] = [];
   if (order.pickup_location) lines.push(`Jemput : ${order.pickup_location}`);
   if (order.dropoff_location)
     lines.push(`Tujuan : pemakaian area ${order.dropoff_location}`);
-  lines.push("Harga termasuk mobil supir bbm tol makan supir");
-  lines.push(
-    "Parkir/tiket masuk kawasan dan tips supir seikhlasnya dari Tamu",
-  );
+  lines.push(...packageNoteLines(order.service_items));
   return lines;
 }
 
@@ -191,9 +268,13 @@ function buildNoteLines(order: {
  * (cancelOrder bills only the rest), so it must not be billed again. Only
  * cancelOrder voids invoices, so other orders are unaffected.
  */
-async function billedSoFar(orderId: string, excludeInvoiceId?: string): Promise<number> {
+export async function billedSoFar(
+  orderId: string,
+  excludeInvoiceId?: string,
+  db: Prisma.TransactionClient | typeof prisma = prisma,
+): Promise<number> {
   const [active, voidedPaid] = await Promise.all([
-    prisma.invoice.aggregate({
+    db.invoice.aggregate({
       where: {
         order_id: orderId,
         ...(excludeInvoiceId ? { id: { not: excludeInvoiceId } } : {}),
@@ -201,7 +282,7 @@ async function billedSoFar(orderId: string, excludeInvoiceId?: string): Promise<
       },
       _sum: { amount: true },
     }),
-    prisma.invoice.aggregate({
+    db.invoice.aggregate({
       where: { order_id: orderId, status: "CANCELLED", paid_at: { not: null } },
       _sum: { amount: true },
     }),
@@ -279,6 +360,28 @@ export async function buildCancellationFeePdf(args: {
   return { invoiceNumber, invoiceSeq, fileUrl, issueDate };
 }
 
+/**
+ * A DP must be at least 20% of the rental base (minimum down payment) and at
+ * most the rental base. Customer may pay more than 20%, but never less. Same
+ * rule when the DP is created and when it is revised.
+ */
+function assertDpAmount(amount: number, rentalBase: number): void {
+  if (rentalBase <= 0) return;
+  const minDp = minDpFor(rentalBase);
+  if (amount < minDp) {
+    throw new AppError(
+      `DP must be at least 20% of the rental price (minimum ${minDp}). Rental base: ${rentalBase}.`,
+      409,
+    );
+  }
+  if (amount > rentalBase) {
+    throw new AppError(
+      `DP (${amount}) cannot exceed the rental price (${rentalBase}).`,
+      409,
+    );
+  }
+}
+
 export async function generateInvoice(
   orderId: string,
   input: GenerateInvoiceInput,
@@ -303,12 +406,10 @@ export async function generateInvoice(
 
   const isCombined = input.invoice_type === "COMBINED";
 
-  // Rental base = sum of service lines (additionals/adjustments are billed separately,
-  // each as its own ADDITIONAL invoice). DP percentage is based on this rental base.
-  const rentalBase = order.service_items.reduce(
-    (sum, item) => sum + Number(item.total_price || 0),
-    0,
-  );
+  // Rental base = the days that are not cancelled (additionals/adjustments are
+  // billed separately, each as its own ADDITIONAL invoice). DP percentage is
+  // based on this rental base.
+  const rentalBase = rentalBaseOf(order.service_items);
 
   // Billable additional charges (overtime/parking/etc.) — only used for COMBINED,
   // which rolls rental + extras into a single invoice (and a single Kwitansi).
@@ -366,23 +467,7 @@ export async function generateInvoice(
     );
   }
 
-  // Validate: DP must be at least 20% of the rental base (minimum down payment).
-  // Customer may pay more than 20%, but never less.
-  if (input.invoice_type === "DP" && rentalBase > 0) {
-    const minDp = Math.round(rentalBase * 0.2);
-    if (input.amount < minDp) {
-      throw new AppError(
-        `DP must be at least 20% of the rental price (minimum ${minDp}). Rental base: ${rentalBase}.`,
-        409,
-      );
-    }
-    if (input.amount > rentalBase) {
-      throw new AppError(
-        `DP (${input.amount}) cannot exceed the rental price (${rentalBase}).`,
-        409,
-      );
-    }
-  }
+  if (input.invoice_type === "DP") assertDpAmount(input.amount, rentalBase);
 
   // Guard: active invoice total must never exceed order.final_price.
   // Extra charges should update the order final_price first, then create an invoice.
@@ -406,13 +491,19 @@ export async function generateInvoice(
       ),
   );
 
-  // Settlement (remaining rental balance) is due on the first day of service.
+  // Settlement (remaining rental balance) is due on the first day of service
+  // that will run: a cancelled day is skipped (all of them only when every
+  // day is cancelled).
   let dueDate: Date | null = null;
   if (input.invoice_type === "SETTLEMENT") {
-    const firstServiceDate = order.service_items
-      .map((i) => i.service_date)
-      .filter((d): d is Date => !!d)
-      .sort((a, b) => a.getTime() - b.getTime())[0];
+    const earliest = (items: typeof order.service_items) =>
+      items
+        .map((i) => i.service_date)
+        .filter((d): d is Date => !!d)
+        .sort((a, b) => a.getTime() - b.getTime())[0];
+    const firstServiceDate =
+      earliest(order.service_items.filter((i) => i.line_status !== "CANCELLED")) ??
+      earliest(order.service_items);
     dueDate =
       firstServiceDate || order.service_start_at || order.order_date || null;
   }
@@ -430,10 +521,11 @@ export async function generateInvoice(
   //  - ADDITIONAL bills ONLY the billable adjustments (no rental day lines).
   //  - everything else (DP / SETTLEMENT / FULL / COMBINED) lists the rental
   //    service days; COMBINED also appends additionalItems above.
-  const rentalLineItems = order.service_items.map(serviceItemToLineItem);
   const additionalLineItems = billableAdjustments.map(adjustmentToLineItem);
   const pdfItems =
-    input.invoice_type === "ADDITIONAL" ? additionalLineItems : rentalLineItems;
+    input.invoice_type === "ADDITIONAL"
+      ? additionalLineItems
+      : await rentalDocumentItems(order, input.invoice_type, isCombined ? additionalsTotal : 0);
 
 
 
@@ -453,7 +545,7 @@ export async function generateInvoice(
     documentMode: "INVOICE",
     invoiceKind: input.invoice_type,
     dueDate,
-    noteLines: buildNoteLines(order),
+    noteLines: isFeeOnly(order) ? undefined : buildNoteLines(order),
     items: pdfItems,
     additionalItems,
   });
@@ -610,8 +702,14 @@ export async function markInvoicePaid(
         });
         if (count === 0) return null;
         const [locked] = await tx.$queryRaw<
-          { final_price: unknown; paid_to_date: unknown; is_refunded: boolean; refund_amount: unknown }[]
-        >`SELECT final_price, paid_to_date, is_refunded, refund_amount
+          {
+            final_price: unknown;
+            paid_to_date: unknown;
+            is_refunded: boolean;
+            refund_amount: unknown;
+            cancellation_fee: unknown;
+          }[]
+        >`SELECT final_price, paid_to_date, is_refunded, refund_amount, cancellation_fee
           FROM "orders" WHERE id = ${invoice.order_id} FOR NO KEY UPDATE`;
 
         if (customer) {
@@ -644,22 +742,24 @@ export async function markInvoicePaid(
         // paid_to_date = all money received on the order, this payment included.
         const others = await paymentsOnOrder(tx, invoice.order_id, invoice.id);
         const paidTotal = others.total + amountReceived;
+        const days = await tx.orderServiceItem.findMany({
+          where: { order_id: invoice.order_id },
+          select: { total_price: true, line_status: true },
+        });
         await tx.order.update({
           where: { id: invoice.order_id },
           data: {
+            // Less than the 20% DP received stays UNPAID (B2).
             payment_status: paymentStatusFor(
               netPaid({ ...locked, paid_to_date: paidTotal }),
               locked.final_price,
+              dpBaseOf(locked, days),
             ),
             paid_to_date: paidTotal,
           },
         });
         // Did this payment make the rental paid in full? Decided under the
         // lock, so two invoices paid at once notify the drivers only once.
-        const days = await tx.orderServiceItem.findMany({
-          where: { order_id: invoice.order_id },
-          select: { total_price: true, line_status: true },
-        });
         const becameReady =
           !startPayment({ paid_to_date: locked.paid_to_date }, days).ready &&
           startPayment({ paid_to_date: paidTotal }, days).ready;
@@ -728,11 +828,16 @@ async function attachReceiptPdf(
   // an Additional Charges section. An ADDITIONAL receipt lists ONLY the
   // additional charges; every other type lists the rental service days.
   const billable = order.adjustments.filter((a) => a.is_billable);
-  const rentalItems = order.service_items.map(serviceItemToLineItem);
-  const items =
-    invoice.invoice_type === "ADDITIONAL" ? billable.map(adjustmentToLineItem) : rentalItems;
   const additionalItems =
     invoice.invoice_type === "COMBINED" ? billable.map(adjustmentToLineItem) : undefined;
+  const items =
+    invoice.invoice_type === "ADDITIONAL"
+      ? billable.map(adjustmentToLineItem)
+      : await rentalDocumentItems(
+          order,
+          invoice.invoice_type,
+          (additionalItems ?? []).reduce((s, a) => s + a.totalPrice, 0),
+        );
 
   // Sum of the other active invoices, for the receipt summary.
   const priorAgg = await prisma.invoice.aggregate({
@@ -776,7 +881,7 @@ async function attachReceiptPdf(
     // Sprint 2: overpayment/refund details live ONLY in the PDF. Refund is due
     // only when total received exceeds the ORDER total (never the DP).
     refundDue: Math.max(totalReceived - orderTotal, 0),
-    noteLines: buildNoteLines(order),
+    noteLines: isFeeOnly(order, invoice.invoice_type) ? undefined : buildNoteLines(order),
     items,
     additionalItems,
   });
@@ -823,13 +928,17 @@ export async function generateOrderStatement(
 
   const finalPrice = Number(order.final_price);
 
-  // Service-day line items.
-  const items = order.service_items.map(serviceItemToLineItem);
-
   // Billable additional charges (overtime/parking/etc.).
   const additionalItems = order.adjustments
     .filter((a) => a.is_billable)
     .map(adjustmentToLineItem);
+
+  // Service-day line items (and the cancellation fee of a cancelled order).
+  const items = await rentalDocumentItems(
+    order,
+    undefined,
+    additionalItems.reduce((s, a) => s + a.totalPrice, 0),
+  );
 
   // Every payment actually received on the chosen invoices (the money on the
   // receipt, also for an invoice voided later by a cancellation).
@@ -859,7 +968,7 @@ export async function generateOrderStatement(
     paymentsReceived,
     remainingBalance,
     showPaidStamp: fullyPaid,
-    noteLines: buildNoteLines(order),
+    noteLines: isFeeOnly(order) ? undefined : buildNoteLines(order),
     items,
     additionalItems: additionalItems.length ? additionalItems : undefined,
   });
@@ -929,6 +1038,9 @@ export async function reviseInvoice(
       409,
     );
   }
+  // B2: a revised DP keeps the 20% minimum, like a new one.
+  if (invoice.invoice_type === "DP")
+    assertDpAmount(amount, rentalBaseOf(invoice.order.service_items));
 
   // Mirror the original invoice's line items: an ADDITIONAL revision lists ONLY
   // the additional charges; COMBINED lists rental + an Additional Charges
@@ -939,13 +1051,16 @@ export async function reviseInvoice(
   const reviseAdjustmentItems = reviseBillableAdjustments.map(
     adjustmentToLineItem,
   );
-  const reviseRentalItems = invoice.order.service_items.map(serviceItemToLineItem);
+  const reviseAdditionalItems =
+    invoice.invoice_type === "COMBINED" ? reviseAdjustmentItems : undefined;
   const reviseItems =
     invoice.invoice_type === "ADDITIONAL"
       ? reviseAdjustmentItems
-      : reviseRentalItems;
-  const reviseAdditionalItems =
-    invoice.invoice_type === "COMBINED" ? reviseAdjustmentItems : undefined;
+      : await rentalDocumentItems(
+          invoice.order,
+          invoice.invoice_type,
+          (reviseAdditionalItems ?? []).reduce((s, a) => s + a.totalPrice, 0),
+        );
 
   const pdfBuffer = await generateInvoicePDF({
     invoiceNumber,
@@ -960,6 +1075,9 @@ export async function reviseInvoice(
     amountPaid: amount,
     previouslyPaid,
     invoiceKind: invoice.invoice_type,
+    // Same notes as the original; a cancellation fee keeps none (its own
+    // notes, the reason and tier, are not stored).
+    noteLines: isFeeOnly(invoice.order, invoice.invoice_type) ? undefined : buildNoteLines(invoice.order),
     items: reviseItems,
     additionalItems: reviseAdditionalItems,
   });
@@ -1103,14 +1221,11 @@ export async function sendInvoiceWhatsapp(
     invoice.order.customers.find((c) => c.phone)?.name ||
     invoice.order.customer_name;
   const amount = Number(invoice.amount);
-  const rentalBase = invoice.order.service_items.reduce(
-    (sum, item) => sum + Number(item.total_price || 0),
-    0,
-  );
+  const rentalBase = rentalBaseOf(invoice.order.service_items);
   const rentalTotal = rentalBase > 0 ? rentalBase : amount;
   // DP caption quotes the DP invoice's actual amount; a settlement's own
   // amount is what is still due (the paid DP is read below).
-  let dpAmount = invoice.invoice_type === "DP" ? amount : Math.round(rentalTotal * 0.2);
+  let dpAmount = invoice.invoice_type === "DP" ? amount : minDpFor(rentalTotal);
   let settlementAmount =
     invoice.invoice_type === "SETTLEMENT" ? amount : Math.max(rentalTotal - dpAmount, 0);
 

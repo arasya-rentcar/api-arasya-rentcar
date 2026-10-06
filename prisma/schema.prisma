@@ -1157,3 +1157,165 @@ model AdminNotificationRead {
   @@index([user_id])
   @@map("admin_notification_reads")
 }
+
+/// Official price list (2026-10-06): the website's prices, edited by the admin
+/// in the dashboard. Cars are the website's fleet (Sanity slugs). Every edit is
+/// logged (PriceChangeLog); the website only sees what was last published
+/// (PricePublication), never the working copy.
+model PriceCar {
+  id          String      @id @default(uuid())
+  // Website/Sanity car slug, e.g. "toyota-avanza".
+  slug        String      @unique
+  name        String
+  // Price class shown to admins, e.g. "Avanza sekelas".
+  price_class String?
+  note        String?
+  sort_order  Int         @default(0)
+  created_at  DateTime    @default(now())
+  updated_at  DateTime    @updatedAt
+  rates       PriceRate[]
+
+  @@map("price_cars")
+}
+
+/// One price table (2026-10-06): a package in an area, e.g. "All-in Jakarta".
+model PriceZone {
+  id                   String           @id @default(uuid())
+  // Stable key the website uses, e.g. "JABODETABEK", "DROP_JABODETABEK".
+  code                 String           @unique
+  name                 String
+  // Order-form vocabulary: "XOPS" (car + driver) or "ALL-IN X PARKIR" (all-in, drop).
+  service_package      String
+  included             String
+  excluded             String
+  note                 String?
+  // The table for cities that have none of their own.
+  default_for_unlisted Boolean          @default(false)
+  sort_order           Int              @default(0)
+  created_at           DateTime         @default(now())
+  updated_at           DateTime         @updatedAt
+  rates                PriceRate[]
+  surcharges           PriceSurcharge[]
+  driver_cities        PriceCity[]      @relation("PriceCityDriverZone")
+  all_in_cities        PriceCity[]      @relation("PriceCityAllInZone")
+
+  @@map("price_zones")
+}
+
+/// Price of one car in one table for one duration (2026-10-06).
+model PriceRate {
+  id          String    @id @default(uuid())
+  zone_id     String
+  zone        PriceZone @relation(fields: [zone_id], references: [id])
+  car_id      String
+  car         PriceCar  @relation(fields: [car_id], references: [id])
+  // "12H" | "FULLDAY" | "DROP", same vocabulary as OrderServiceItem.service_kind.
+  duration    String
+  // Rupiah per car per day; null = "tanya admin".
+  amount      Decimal?  @db.Decimal(12, 2)
+  // Proposed by the team (marked (u) in the price list); the owner still has to confirm.
+  is_proposal Boolean   @default(false)
+  note        String?
+  // Admin user id of the last change.
+  updated_by  String?
+  created_at  DateTime  @default(now())
+  updated_at  DateTime  @updatedAt
+
+  @@unique([zone_id, car_id, duration])
+  @@index([car_id])
+  @@map("price_rates")
+}
+
+/// Extra charge when an all-in rental in a table's city also goes to an area
+/// (2026-10-06), e.g. Jakarta to Bekasi +100.000.
+model PriceSurcharge {
+  id         String    @id @default(uuid())
+  zone_id    String
+  zone       PriceZone @relation(fields: [zone_id], references: [id])
+  area       String
+  amount     Decimal   @db.Decimal(12, 2)
+  sort_order Int       @default(0)
+  updated_by String?
+  created_at DateTime  @default(now())
+  updated_at DateTime  @updatedAt
+
+  @@unique([zone_id, area])
+  @@map("price_surcharges")
+}
+
+/// Which tables a website city page shows (2026-10-06). Abroad cities are
+/// "quote": priced per trip, no table.
+model PriceCity {
+  id             String     @id @default(uuid())
+  // Website city slug, e.g. "sewa-mobil-bogor".
+  slug           String     @unique
+  name           String
+  // Car + driver table and all-in table; both null when quote.
+  driver_zone_id String?
+  driver_zone    PriceZone? @relation("PriceCityDriverZone", fields: [driver_zone_id], references: [id])
+  all_in_zone_id String?
+  all_in_zone    PriceZone? @relation("PriceCityAllInZone", fields: [all_in_zone_id], references: [id])
+  quote          Boolean    @default(false)
+  sort_order     Int        @default(0)
+  created_at     DateTime   @default(now())
+  updated_at     DateTime   @updatedAt
+
+  @@index([driver_zone_id])
+  @@index([all_in_zone_id])
+  @@map("price_cities")
+}
+
+/// Driver costs and overtime (2026-10-06): DRIVER_MEAL, DRIVER_LODGING,
+/// OVERTIME. A fixed amount, or a percent (overtime: of the Fullday price).
+model PriceExtra {
+  id         String   @id @default(uuid())
+  code       String   @unique
+  label      String
+  amount     Decimal? @db.Decimal(12, 2)
+  percent    Decimal? @db.Decimal(5, 2)
+  // "hari" | "malam" | "jam".
+  unit       String
+  note       String?
+  updated_by String?
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  @@map("price_extras")
+}
+
+/// Every change to the price list (2026-10-06), one row per field. Append-only.
+model PriceChangeLog {
+  id         String   @id @default(uuid())
+  // rate | surcharge | extra | zone | city | car
+  entity     String
+  entity_id  String
+  // The column, or "created" / "deleted" for a whole row.
+  field      String
+  old_value  String?
+  new_value  String?
+  // Admin user id.
+  changed_by String?
+  created_at DateTime @default(now())
+
+  @@index([created_at])
+  @@map("price_change_logs")
+}
+
+/// A published copy of the price list (2026-10-06): the snapshot the website
+/// build reads from GET /public/prices (latest row). Append-only.
+model PricePublication {
+  id            String   @id @default(uuid())
+  // json, not jsonb: keeps the key order (cars and durations in list order).
+  snapshot      Json     @db.Json
+  note          String?
+  // Idempotency key from the dashboard: a resend returns the same row.
+  client_ref    String?  @unique
+  // Admin user id.
+  published_by  String?
+  // Website deploy hook: SENT | SKIPPED (no hook configured) | FAILED.
+  deploy_status String
+  created_at    DateTime @default(now())
+
+  @@index([created_at])
+  @@map("price_publications")
+}

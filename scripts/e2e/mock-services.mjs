@@ -3,6 +3,8 @@ import http from 'node:http';
 
 const pushes = [];
 const objects = new Map();
+// Website deploy hook (price list publish): calls counted, can be made to fail.
+const deployHook = { calls: 0, fail: false };
 
 const server = http.createServer((req, res) => {
   const chunks = [];
@@ -18,6 +20,15 @@ const server = http.createServer((req, res) => {
       const msgs = JSON.parse(body.toString() || '[]');
       for (const m of msgs) pushes.push({ at: new Date().toISOString(), ...m });
       return json(200, { data: msgs.map(() => ({ status: 'ok', id: 'x' })) });
+    }
+    if (url.pathname === '/deploy-hook' && req.method === 'POST') {
+      deployHook.calls++;
+      return deployHook.fail ? json(500, { error: 'down' }) : json(201, { job: 'x' });
+    }
+    // ?fail=1 / ?fail=0 switches it; always answers the current state.
+    if (url.pathname === '/__deploy-hook') {
+      if (url.searchParams.has('fail')) deployHook.fail = url.searchParams.get('fail') === '1';
+      return json(200, deployHook);
     }
     if (url.pathname === '/__pushes') return json(200, pushes);
     if (url.pathname === '/__objects') return json(200, [...objects.keys()]);
