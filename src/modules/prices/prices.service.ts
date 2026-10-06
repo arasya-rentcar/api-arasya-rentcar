@@ -53,6 +53,13 @@ const rank = (duration: string) => {
 };
 
 /**
+ * Every price list transaction: about ten serial round trips (~1s each over
+ * the Supabase pooler) plus the wait for the advisory lock while another save
+ * holds it, so Prisma's default 5s limit is not enough.
+ */
+const PRICE_TX = { maxWait: 15000, timeout: 30000 };
+
+/**
  * Inside a transaction, before reading anything it changes. Returns the time
  * of this write: the timestamp of its change logs (or the publication) and
  * the updated_at of the rows it changes. It is set here, in lock order, and
@@ -232,7 +239,7 @@ export async function updateRates(items: RateUpdate[], adminId: string) {
       if (logs.length) await tx.priceChangeLog.createMany({ data: logs });
     },
     // Up to 200 rates in one save.
-    { maxWait: 15000, timeout: 30000 },
+    PRICE_TX,
   );
   return getPriceList();
 }
@@ -269,7 +276,7 @@ export async function createSurcharge(input: CreateSurchargeInput, adminId: stri
         },
       });
       await tx.priceChangeLog.create({ data: rowLog("surcharge", s.id, "created", surchargeText(s), adminId, at) });
-    });
+    }, PRICE_TX);
   } catch (err) {
     if (isUniqueViolation(err)) throw duplicateArea(input.area);
     throw err;
@@ -290,7 +297,7 @@ export async function updateSurcharge(id: string, input: UpdateSurchargeInput, a
       if (!c.logs.length) return;
       await tx.priceSurcharge.update({ where: { id }, data: { ...c.changed, updated_by: adminId, updated_at: at } });
       await tx.priceChangeLog.createMany({ data: c.logs });
-    });
+    }, PRICE_TX);
   } catch (err) {
     if (isUniqueViolation(err)) throw duplicateArea(input.area);
     throw err;
@@ -307,7 +314,7 @@ export async function deleteSurcharge(id: string, input: DeleteSurchargeInput, a
     if (isStale(s, input.expected_updated_at)) throw conflict([id]);
     await tx.priceSurcharge.delete({ where: { id } });
     await tx.priceChangeLog.create({ data: rowLog("surcharge", id, "deleted", surchargeText(s), adminId, at) });
-  });
+  }, PRICE_TX);
   return getPriceList();
 }
 
@@ -323,7 +330,7 @@ export async function updateZone(id: string, input: UpdateZoneInput, adminId: st
     if (!c.logs.length) return;
     await tx.priceZone.update({ where: { id }, data: { ...c.changed, updated_at: at } });
     await tx.priceChangeLog.createMany({ data: c.logs });
-  });
+  }, PRICE_TX);
   return getPriceList();
 }
 
@@ -338,7 +345,7 @@ export async function updateExtra(id: string, input: UpdateExtraInput, adminId: 
     if (!c.logs.length) return;
     await tx.priceExtra.update({ where: { id }, data: { ...c.changed, updated_by: adminId, updated_at: at } });
     await tx.priceChangeLog.createMany({ data: c.logs });
-  });
+  }, PRICE_TX);
   return getPriceList();
 }
 
@@ -377,7 +384,7 @@ export async function updateCity(id: string, input: UpdateCityInput, adminId: st
     if (!c.logs.length) return;
     await tx.priceCity.update({ where: { id }, data: { ...c.changed, updated_at: at } });
     await tx.priceChangeLog.createMany({ data: c.logs });
-  });
+  }, PRICE_TX);
   return getPriceList();
 }
 
@@ -392,7 +399,7 @@ export async function updateCar(id: string, input: UpdateCarInput, adminId: stri
     if (!c.logs.length) return;
     await tx.priceCar.update({ where: { id }, data: { ...c.changed, updated_at: at } });
     await tx.priceChangeLog.createMany({ data: c.logs });
-  });
+  }, PRICE_TX);
   return getPriceList();
 }
 
@@ -429,7 +436,7 @@ export async function createCar(input: CreateCarInput, adminId: string) {
         ),
       });
       await tx.priceChangeLog.create({ data: rowLog("car", car.id, "created", `${car.name} (${car.slug})`, adminId, at) });
-    });
+    }, PRICE_TX);
   } catch (err) {
     if (isUniqueViolation(err)) throw taken();
     throw err;
@@ -610,7 +617,7 @@ export async function publishPrices(input: PublishInput, adminId: string) {
           created_at: at,
         },
       });
-    });
+    }, PRICE_TX);
   } catch (err) {
     // The same publish sent twice at once: the other copy was stored (and
     // calls the hook itself).

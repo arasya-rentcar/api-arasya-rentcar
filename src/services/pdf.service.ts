@@ -90,13 +90,19 @@ const COMPANY = {
   thankYou: "THANK YOU FOR YOUR BUSINESS!",
 };
 
-// The overtime percent is the one on the price list (price_extras OVERTIME,
-// published to the website); 10 when it is missing or unreadable.
+// The overtime percent is the one the website shows: extras.OVERTIME.percent
+// of the latest published price list (price_publications), not the working
+// copy the admins are still editing; 10 when nothing is published or it is
+// missing or unreadable.
 const DEFAULT_OVERTIME_PERCENT = 10;
 async function overtimePercent(): Promise<number> {
   try {
-    const row = await prisma.priceExtra.findUnique({ where: { code: "OVERTIME" }, select: { percent: true } });
-    return row?.percent != null ? Number(row.percent) : DEFAULT_OVERTIME_PERCENT;
+    // Only the one value, not the whole snapshot.
+    const [last] = await prisma.$queryRaw<{ percent: string | null }[]>`
+      SELECT snapshot->'extras'->'OVERTIME'->>'percent' AS percent
+      FROM "price_publications" ORDER BY created_at DESC LIMIT 1`;
+    const raw = last?.percent;
+    return raw != null && Number.isFinite(Number(raw)) ? Number(raw) : DEFAULT_OVERTIME_PERCENT;
   } catch (err) {
     logger.warn({ err }, "overtime percent not read, using the default");
     return DEFAULT_OVERTIME_PERCENT;
