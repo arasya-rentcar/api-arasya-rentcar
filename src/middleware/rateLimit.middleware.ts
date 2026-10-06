@@ -44,6 +44,16 @@ export const publicLeadLimiter = rateLimit({
   message: { status: 'error', message: 'Too many requests, please try again later.' },
 });
 
+// Public price list (GET /api/v1/public/prices): read by the website build
+// and visitors' browsers; cached for 5 minutes, so a light budget.
+export const publicPriceLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 120,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { status: 'error', message: 'Too many requests, please try again later.' },
+});
+
 // Bot limiter: moderate; bot is a single trusted client but bursty.
 export const botLimiter = rateLimit({
   windowMs: 60 * 1000, // 1 minute

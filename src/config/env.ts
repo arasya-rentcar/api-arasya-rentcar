@@ -37,6 +37,10 @@ const envSchema = z.object({
   // gets its first payment. Both empty = reporting off.
   GA4_MEASUREMENT_ID: z.string().default(''),
   GA4_API_SECRET: z.string().default(''),
+  // Website deploy hook, called after "Terbitkan" on the price list so the
+  // site rebuilds with the new prices. Secret (the URL is the credential);
+  // empty = off (the publication is still stored, deploy_status SKIPPED).
+  WEB_DEPLOY_HOOK_URL: z.string().default(''),
   CONFIRMATION_SWEEP_ENABLED: z
     .enum(['true', 'false'])
     .default('true')

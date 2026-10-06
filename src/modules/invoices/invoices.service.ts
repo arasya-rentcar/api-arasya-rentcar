@@ -13,6 +13,7 @@ import prisma from "../../prisma/client";
 import { env } from "../../config/env";
 import { AppError } from "../../utils/AppError";
 import { nextInvoiceNumber, nextReceiptNumber } from "../../utils/codes";
+import { packageNoteLines } from "../../utils/packageNotes";
 import {
   buildDpInvoiceCaption,
   buildSettlementInvoiceCaption,
@@ -182,19 +183,18 @@ function adjustmentToLineItem(a: {
 }
 
 // Build the descriptive note lines shown under the table (pickup / dropoff /
-// what's included), mirroring the official invoice/kuitansi templates.
+// what's included), mirroring the official invoice/kuitansi templates. What
+// is included follows the package of the order's days (packageNoteLines).
 function buildNoteLines(order: {
   pickup_location?: string | null;
   dropoff_location?: string | null;
+  service_items: { service_package?: string | null; line_status?: string | null }[];
 }): string[] {
   const lines: string[] = [];
   if (order.pickup_location) lines.push(`Jemput : ${order.pickup_location}`);
   if (order.dropoff_location)
     lines.push(`Tujuan : pemakaian area ${order.dropoff_location}`);
-  lines.push("Harga termasuk mobil supir bbm tol makan supir");
-  lines.push(
-    "Parkir/tiket masuk kawasan dan tips supir seikhlasnya dari Tamu",
-  );
+  lines.push(...packageNoteLines(order.service_items));
   return lines;
 }
 
@@ -987,6 +987,10 @@ export async function reviseInvoice(
     amountPaid: amount,
     previouslyPaid,
     invoiceKind: invoice.invoice_type,
+    // Same notes as the original; a cancellation fee keeps none (its own
+    // notes, the reason and tier, are not stored).
+    noteLines:
+      invoice.invoice_type === "CANCELLATION_FEE" ? undefined : buildNoteLines(invoice.order),
     items: reviseItems,
     additionalItems: reviseAdditionalItems,
   });

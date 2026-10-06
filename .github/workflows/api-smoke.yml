@@ -32,6 +32,7 @@ jobs:
           check GET  /api/v1/driver/me           401
           check GET  /api/v1/etoll-cards         401
           check GET  /api/v1/driver/etoll-cards  401
+          check GET  /api/v1/prices              401
           check POST /api/v1/devices             401 '{}'
           check POST /api/v1/public/leads        204 '{"lead_code":"invalid"}'
           exit $fail

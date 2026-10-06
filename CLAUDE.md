@@ -38,7 +38,7 @@ Push to `main` that touches API paths (`src/**`, `prisma/**`, package files) run
 `keep-supabase-awake.yml` pings the DB every 3 days (secret `SUPABASE_KEEPALIVE_DB_URL`, login role `keepalive`).
 
 ## Env (see `.env.example`)
-`DATABASE_URL`, `DIRECT_URL`, `JWT_SECRET`, `JWT_EXPIRES_IN` (admins; drivers get 90d), `SUPABASE_URL`, `SUPABASE_SERVICE_KEY`, `SUPABASE_STORAGE_BUCKET`, `BOT_INTERNAL_TOKEN`, `CORS_ORIGINS`, `PUBLIC_LEAD_ORIGINS`, `GA4_MEASUREMENT_ID`, `GA4_API_SECRET`, `WA_DELIVERY` (manual default | bot), `CONFIRMATION_SWEEP_*`.
+`DATABASE_URL`, `DIRECT_URL`, `JWT_SECRET`, `JWT_EXPIRES_IN` (admins; drivers get 90d), `SUPABASE_URL`, `SUPABASE_SERVICE_KEY`, `SUPABASE_STORAGE_BUCKET`, `BOT_INTERNAL_TOKEN`, `CORS_ORIGINS`, `PUBLIC_LEAD_ORIGINS`, `GA4_MEASUREMENT_ID`, `GA4_API_SECRET`, `WEB_DEPLOY_HOOK_URL` (website deploy hook called after the price list is published; secret, empty = off), `WA_DELIVERY` (manual default | bot), `CONFIRMATION_SWEEP_*`.
 
 ## Arasya system map (same section in all four repos)
 
