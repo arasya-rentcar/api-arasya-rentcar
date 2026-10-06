@@ -1,3 +1,4 @@
+import type { Prisma, ScheduleStatus } from "@prisma/client";
 import { AppError } from "../../utils/AppError";
 import { rupiah } from "../../services/adminNotify";
 
@@ -16,7 +17,7 @@ export function assertOrderPaidForDriverAssignment(
   const paid = netPaid(order);
   if (paid > 0) {
     throw new AppError(
-      `Uang yang sudah diterima ${rupiah(paid)}, belum mencapai DP minimal 20% dari harga sewa (${rupiah(minDpFor(rentalBaseOf(order.service_items)))}). Driver baru bisa ditugaskan setelah DP minimal tercatat.`,
+      `Uang yang sudah diterima ${rupiah(paid)}, belum mencapai DP minimal 20% dari harga sewa (${rupiah(minDpFor(dpBaseOf(order, order.service_items)))}). Driver baru bisa ditugaskan setelah DP minimal tercatat.`,
       409,
     );
   }
@@ -44,6 +45,36 @@ export function assertOrderOpenForDayChanges(order: {
       "Order ini sudah dibatalkan, jadi harinya tidak bisa diubah lagi. Biaya perjalanan dan pembayaran fee driver tetap bisa diurus di menu Biaya dan Utang.",
       409,
     );
+}
+
+// B1.1 (owner, 6 Oct 2026): Edit Hari and Edit Order never end an order. The
+// last day still to run is not cancelled or removed there while other days
+// are done: that would end the order without the cancellation fee. Ending it
+// goes through "Batalkan Pesanan" (cancelOrder).
+/** Day statuses still to run: an order with none of these has ended. */
+export const OPEN_DAY_STATUSES: ScheduleStatus[] = ["SCHEDULED", "ASSIGNED", "IN_PROGRESS"];
+export const isOpenDay = (status: string) => (OPEN_DAY_STATUSES as string[]).includes(status);
+export const LAST_OPEN_DAY_MESSAGE =
+  "Ini hari terakhir yang masih aktif di order ini. Untuk mengakhiri order, pakai tombol Batalkan Pesanan supaya biaya pembatalan dihitung.";
+
+/**
+ * Inside the transaction, under the order lock, after the change: refused
+ * when no day of the order (other than `exceptId`, the day being cancelled)
+ * is still to run.
+ */
+export async function assertNotLastOpenDay(
+  tx: Prisma.TransactionClient,
+  orderId: string,
+  exceptId?: string,
+): Promise<void> {
+  const stillOpen = await tx.orderServiceItem.count({
+    where: {
+      order_id: orderId,
+      line_status: { in: OPEN_DAY_STATUSES },
+      ...(exceptId ? { id: { not: exceptId } } : {}),
+    },
+  });
+  if (stillOpen === 0) throw new AppError(LAST_OPEN_DAY_MESSAGE, 409);
 }
 
 // Owner rule (3 Oct 2026): the trip with the customer begins only when the
@@ -100,6 +131,23 @@ export function rentalBaseOf(lines: RentalLine[]): number {
     .reduce((s, l) => s + Number(l.total_price ?? 0), 0);
 }
 
+/**
+ * The base of the 20% DP rule in payment_status: the rental price of the days
+ * that are not cancelled, or, once the order is cancelled (cancellation_fee
+ * set), the fee. After a cancellation the fee is what the customer owes (it
+ * is also the order's new total), so the rental price of days that will
+ * never run must not decide it, and the cancelled days' rental base (often 0)
+ * would make any money count as DP.
+ */
+export function dpBaseOf(
+  order: { cancellation_fee?: unknown },
+  lines: RentalLine[],
+): number {
+  return order.cancellation_fee != null
+    ? Number(order.cancellation_fee)
+    : rentalBaseOf(lines);
+}
+
 /** Minimum DP: 20% of the rental base, in whole rupiah. */
 export function minDpFor(rentalBase: number): number {
   return Math.round(rentalBase * 0.2);
@@ -117,11 +165,11 @@ export function netPaid(order: {
 
 /**
  * payment_status from the money received: PAID once the order total is
- * covered, DP_PAID once at least the minimum DP (20% of the rental base) is
- * in, UNPAID otherwise (also when some money is in but less than the DP).
- * With no rental base (no days, or every day cancelled) any money counts as
- * DP. The one rule for every place that changes the money or the total
- * (payments, days or charges changing, cancellation).
+ * covered, DP_PAID once at least the minimum DP (20% of the base, dpBaseOf)
+ * is in, UNPAID otherwise (also when some money is in but less than the DP).
+ * With no base (no days) any money counts as DP. The one rule for every place
+ * that changes the money or the total (payments, days or charges changing,
+ * cancellation); pass dpBaseOf as the base.
  */
 export function paymentStatusFor(
   paidToDate: unknown,
@@ -142,6 +190,7 @@ export interface PaymentOrder {
   payment_status: string;
   is_refunded?: boolean | null;
   refund_amount?: unknown;
+  cancellation_fee?: unknown;
 }
 
 /** Prisma select for orderPaymentStatus / assertOrderPaidForDriverAssignment. */
@@ -151,6 +200,7 @@ export const paymentOrderSelect = {
   payment_status: true,
   is_refunded: true,
   refund_amount: true,
+  cancellation_fee: true,
   service_items: { select: { total_price: true, line_status: true } },
 } as const;
 
@@ -166,5 +216,5 @@ export function orderPaymentStatus(
   const legacyPaid =
     Number(order.paid_to_date ?? 0) === 0 && order.payment_status !== "UNPAID";
   if (legacyPaid) return order.payment_status as "DP_PAID" | "PAID";
-  return paymentStatusFor(netPaid(order), order.final_price, rentalBaseOf(lines));
+  return paymentStatusFor(netPaid(order), order.final_price, dpBaseOf(order, lines));
 }

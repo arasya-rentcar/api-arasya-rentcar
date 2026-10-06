@@ -2,11 +2,14 @@ import prisma from "../../prisma/client";
 import { Prisma, type ScheduleStatus } from "@prisma/client";
 import { AppError } from "../../utils/AppError";
 import {
+  assertNotLastOpenDay,
   assertOrderOpenForDayChanges,
   assertOrderPaidForDriverAssignment,
+  dpBaseOf,
   netPaid,
+  OPEN_DAY_STATUSES,
+  paymentOrderSelect,
   paymentStatusFor,
-  rentalBaseOf,
   startPayment,
 } from "./assignment-guard";
 import {
@@ -26,7 +29,7 @@ import { rollupOrderFinance } from "../schedule/schedule.service";
 import { assertUnitsFree, lockUnits } from "../schedule/availability";
 import { nextOrderCode } from "../../utils/codes";
 import { wibShortDay } from "../../utils/wib";
-import { buildCancellationFeePdf } from "../invoices/invoices.service";
+import { buildCancellationFeePdf, cancellationLogValue } from "../invoices/invoices.service";
 import {
   deriveAndSetOrderStatus,
   refreshCarStatuses,
@@ -1013,10 +1016,16 @@ export async function updateOrder(id: string, input: UpdateOrderInput) {
 
   const result = await prisma.$transaction(
     async (tx) => {
+      // B1.1: does this save remove a day still to run?
+      let deletesOpenDay = false;
       // Days first, then the order row: the same lock order as the driver
       // app and Edit Hari (day → order), so they cannot deadlock.
       if (days) {
         if (days.deletes.length > 0) {
+          deletesOpenDay =
+            (await tx.orderServiceItem.count({
+              where: { id: { in: days.deletes }, order_id: id, line_status: { in: OPEN_DAY_STATUSES } },
+            })) > 0;
           // Re-checked inside the transaction: a day assigned (or reported
           // on) after the check above is kept.
           const { count } = await tx.orderServiceItem.deleteMany({
@@ -1149,20 +1158,11 @@ export async function updateOrder(id: string, input: UpdateOrderInput) {
             409,
           );
         }
-        // B1.1 (owner, 6 Oct 2026): removing the last days still to run while
-        // other days are done would end the order without the cancellation
-        // fee, like cancelling them in Edit Hari.
-        const toRun: ScheduleStatus[] = ["SCHEDULED", "ASSIGNED", "IN_PROGRESS"];
-        if (order.service_items.some((l) => toRun.includes(l.line_status))) {
-          const stillToRun = await tx.orderServiceItem.count({
-            where: { order_id: id, line_status: { in: toRun } },
-          });
-          if (stillToRun === 0)
-            throw new AppError(
-              "Hari yang dihapus adalah hari terakhir yang masih aktif. Pakai tombol Batalkan Pesanan supaya biaya pembatalan dihitung.",
-              409,
-            );
-        }
+        // B1.1: removing the last days still to run while other days are
+        // done would end the order without the cancellation fee, like
+        // cancelling them in Edit Hari. Only a save that removes such a day;
+        // checked on the days as they are now, under the order lock.
+        if (deletesOpenDay) await assertNotLastOpenDay(tx, id);
         if (days.updates.length || days.creates.length || days.deletes.length) {
           await rollupOrderFinance(tx, id);
           await deriveAndSetOrderStatus(tx, id);
@@ -1229,7 +1229,7 @@ export async function assignOrder(orderId: string, input: AssignOrderInput) {
   // Validate order
   const order = await prisma.order.findUnique({
     where: { id: orderId },
-    include: { service_items: { select: { total_price: true, line_status: true } } },
+    select: { ...paymentOrderSelect, order_status: true },
   });
   if (!order) throw new AppError("Order not found", 404);
   assertOrderOpenForDayChanges(order);
@@ -1338,7 +1338,7 @@ export async function reassignOrder(
 ) {
   const order = await prisma.order.findUnique({
     where: { id: orderId },
-    include: { service_items: { select: { total_price: true, line_status: true } } },
+    select: { ...paymentOrderSelect, order_status: true },
   });
   if (!order) throw new AppError("Order not found", 404);
   assertOrderOpenForDayChanges(order);
@@ -2034,11 +2034,12 @@ export async function cancelOrder(
     //    payment_status against the new total (money received is unchanged).
     //    The cancellation fields mark the order as cancelled even when done
     //    days keep it open, so later roll-ups keep the penalty as its price.
-    // The DP rule counts the days that were not cancelled (the done ones).
+    // The DP rule's base is the penalty too (dpBaseOf): it is what the
+    // customer owes now, so PAID once it is covered, DP_PAID from 20% of it.
     const paymentStatus = paymentStatusFor(
       netPaid(money),
       penalty,
-      rentalBaseOf(order.service_items.filter((l) => l.line_status === "DONE")),
+      dpBaseOf({ cancellation_fee: penalty }, order.service_items),
     );
 
     await tx.order.update({
@@ -2059,7 +2060,7 @@ export async function cancelOrder(
         order_id: orderId,
         field: "order_status",
         old_value: `${order.order_status} (final_price ${originalFinalPrice})`,
-        new_value: `CANCELLED (cancellation fee ${penalty} — ${label})`,
+        new_value: cancellationLogValue(penalty, label),
         note: reason,
         actor: actor ?? "ADMIN",
       },

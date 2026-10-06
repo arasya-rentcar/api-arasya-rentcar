@@ -1627,6 +1627,90 @@ await section('Q. Cancelled days, billed totals, DP minimum (B1, B2, B7, B12)', 
   check('Q16 [B12] 20% of 1.000.003 billed as 200.001 (whole rupiah), fee invoice the same',
     c10.status === 200 && c10.data.penalty === 200001 && c10.data.stillOwed === 200001 && Number(fee10?.amount) === 200001 && Number((await order(o10.id)).cancellation_fee) === 200001,
     `${JSON.stringify(c10.data ?? c10.json)} ${fee10?.amount}`);
+
+  // B2 after a cancellation: the fee is what is owed, so it is also the DP base.
+  const o11 = await makeOrder('Q17', { price: 5_000_000, startDay: 32 });
+  const dp11 = (await invoice(o11.id, 'DP', 1_000_000)).data;
+  await markPaid(o11.id, dp11.id, { amount_received: 50_000 });
+  const c11 = await call('POST', `/orders/${o11.id}/cancel`, { token: admin, body: { reason: 'tes DP setelah batal' } });
+  const o11a = await order(o11.id);
+  check('Q17 [B2] 50.000 received on 5.000.000, cancelled before day H (fee 1.000.000): stays UNPAID (below 20% of the fee)',
+    c11.status === 200 && c11.data.penalty === 1000000 && o11a.payment_status === 'UNPAID', `${c11.status} ${c11.data?.penalty} ${o11a.payment_status}`);
+  const fee11 = o11a.invoices.find((i) => i.invoice_type === 'CANCELLATION_FEE' && i.status === 'ISSUED');
+  if (fee11) await markPaid(o11.id, fee11.id, { amount_received: 150_000 });
+  const o11b = await order(o11.id);
+  check('Q18 [B2] fee invoice 950.000 marked paid with 150.000: 200.000 received (20% of the fee) → DP_PAID',
+    Number(fee11?.amount) === 950000 && Number(o11b.paid_to_date) === 200000 && o11b.payment_status === 'DP_PAID', `${fee11?.amount} ${o11b.paid_to_date} ${o11b.payment_status}`);
+  // B7 on the documents of a cancelled order: a fee line, so the lines add up.
+  const inv11 = fee11 ? await prisma.invoice.findUnique({ where: { id: fee11.id } }) : null;
+  const rc11 = inv11?.receipt_url ? await pdfText(inv11.receipt_url) : '';
+  check('Q19 [B7] kwitansi of the fee invoice: one "Biaya Pembatalan - Tier 1" line of 1.000.000, no day rows, no package notes',
+    /Biaya Pembatalan - Tier 1 \(sebelum hari H\)/.test(rc11) && /1\.000\.000/.test(rc11) && !/Dibatalkan/.test(rc11) && !/Harga termasuk/.test(rc11),
+    `fee ${/Biaya Pembatalan/.test(rc11)} day ${/Dibatalkan/.test(rc11)} notes ${/Harga termasuk/.test(rc11)}`);
+  const st11 = await call('POST', `/orders/${o11.id}/statement`, { token: admin, body: {} });
+  const sp11 = st11.data?.statement_url ? await pdfText(st11.data.statement_url) : '';
+  check('Q20 [B7] statement of the cancelled order: the day as "(Dibatalkan)" plus the fee line, total 1.000.000, no package notes',
+    /\(Dibatalkan\)/.test(sp11) && /Biaya Pembatalan - Tier 1/.test(sp11) && Number(st11.data?.final_price) === 1000000 && !/Harga termasuk/.test(sp11),
+    `day ${/Dibatalkan/.test(sp11)} fee ${/Biaya Pembatalan/.test(sp11)} notes ${/Harga termasuk/.test(sp11)} ${st11.data?.final_price}`);
+
+  // B1.1 in Edit Order only when the save removes a day, on the days as they
+  // are inside its transaction: here the last open day finishes while the
+  // save waits for the order lock, and the save removes nothing.
+  const o12 = await makeOrder('Q21', { days: 2, startDay: 34 });
+  const [e1, e2] = [...o12.service_items].sort((a, b) => a.service_date.localeCompare(b.service_date)).map((l) => l.id);
+  await prisma.orderServiceItem.update({ where: { id: e1 }, data: { line_status: 'DONE' } });
+  const body12 = editBody(await order(o12.id));
+  let save12;
+  await prisma.$transaction(async (tx) => {
+    await tx.$queryRaw`SELECT id FROM "orders" WHERE id = ${o12.id} FOR UPDATE`;
+    await tx.orderServiceItem.update({ where: { id: e2 }, data: { line_status: 'DONE' } });
+    save12 = call('PUT', `/orders/${o12.id}`, { token: admin, body: body12 });
+    await sleep(1500);
+  }, { timeout: 15000 });
+  const r12 = await save12;
+  check('Q21 [B1.1] Edit Order that removes no day saves (200) although the last open day finished meanwhile', r12.status === 200, `${r12.status} ${r12.json?.message ?? ''}`);
+
+  // B1.3 compares with the total read under the order lock, not the one read
+  // before it: here the save first sees an older, lower total.
+  const o13 = await makeOrder('Q22', { days: 3, startDay: 36 });
+  await invoice(o13.id, 'FULL', 3_000_000);
+  await prisma.order.update({ where: { id: o13.id }, data: { final_price: 1_000_000 } });
+  let save13;
+  await prisma.$transaction(async (tx) => {
+    await tx.$queryRaw`SELECT id FROM "orders" WHERE id = ${o13.id} FOR UPDATE`;
+    await tx.order.update({ where: { id: o13.id }, data: { final_price: 3_000_000 } });
+    save13 = putLine(o13.service_items[2].id, { is_external: false, line_status: 'CANCELLED' });
+    await sleep(1500);
+  }, { timeout: 15000 });
+  const r13 = await save13;
+  const o13a = await order(o13.id);
+  check('Q22 [B1.3] a day cancelled below the issued invoice refused (409) against the total read under the lock; day and total unchanged',
+    r13.status === 409 && /Rp 3\.000\.000/.test(r13.json?.message ?? '') && o13a.service_items.every((l) => l.line_status === 'SCHEDULED') && Number(o13a.final_price) === 3000000,
+    `${r13.status} ${r13.json?.message ?? ''} ${o13a.final_price}`);
+
+  // B7: the settlement is due on the first day that will run.
+  const o14 = await makeOrder('Q23', { days: 2, startDay: 38 });
+  const [g1, g2] = [...o14.service_items].sort((a, b) => a.service_date.localeCompare(b.service_date));
+  await putLine(g1.id, { is_external: false, line_status: 'CANCELLED' });
+  await invoice(o14.id, 'DP', 200_000);
+  const st14 = await invoice(o14.id, 'SETTLEMENT', 800_000);
+  const due14 = st14.data?.id ? (await prisma.invoice.findUnique({ where: { id: st14.data.id } }))?.due_date : null;
+  check('Q23 [B7] settlement due on day 2 (day 1 cancelled), not on the cancelled day',
+    st14.status === 201 && due14 != null && due14.getTime() === new Date(g2.service_date).getTime(), `${st14.status} ${due14?.toISOString()} vs ${g2.service_date}`);
+
+  // Overtime % on documents: the published price list, not the working copy.
+  const pubRes = await call('GET', '/public/prices');
+  const pubPct = pubRes.status === 200 ? pubRes.data.extras.OVERTIME.percent : 10;
+  const otRow = (await call('GET', '/prices', { token: admin })).data.extras.find((e) => e.code === 'OVERTIME');
+  const draftPct = pubPct + 5;
+  await call('PATCH', `/prices/extras/${otRow.id}`, { token: admin, body: { percent: draftPct } });
+  const o15 = await makeOrder('Q24', { startDay: 40 });
+  const dp15 = await invoice(o15.id, 'DP', 200_000);
+  const dp15Pdf = dp15.data?.file_url ? await pdfText(dp15.data.file_url) : '';
+  await call('PATCH', `/prices/extras/${otRow.id}`, { token: admin, body: { percent: otRow.percent } });
+  const pct = (n) => `${new Intl.NumberFormat('id-ID', { maximumFractionDigits: 2 }).format(n)}%`;
+  check('Q24 invoice overtime % is the published one, not the unpublished edit',
+    dp15Pdf.includes(`${pct(pubPct)} dari harga Full day`) && !dp15Pdf.includes(pct(draftPct)), `published ${pct(pubPct)} draft ${pct(draftPct)} found ${/\S+% dari harga Full day/.exec(dp15Pdf)?.[0]}`);
 });
 
 const failed = summary();

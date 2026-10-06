@@ -1,5 +1,6 @@
 import { waLink, waManual } from "../../utils/waManual";
 import {
+  dpBaseOf,
   minDpFor,
   netPaid,
   paymentStatusFor,
@@ -24,7 +25,7 @@ import {
   greetingFor,
   isSameDay,
 } from "../../utils/waCaptions";
-import { generateInvoicePDF } from "../../services/pdf.service";
+import { generateInvoicePDF, type InvoiceLineItem } from "../../services/pdf.service";
 import {
   uploadInvoicePDF,
   uploadFile,
@@ -163,6 +164,68 @@ function serviceItemToLineItem(item: {
     unitPrice: cancelled ? 0 : Number(item.unit_price),
     totalPrice: cancelled ? 0 : Number(item.total_price),
   };
+}
+
+/**
+ * The audit-log value cancelOrder writes; tierLabelOf reads the tier back
+ * for the documents printed later (the order keeps only the fee).
+ */
+export const cancellationLogValue = (penalty: number, tierLabel: string) =>
+  `CANCELLED (cancellation fee ${penalty} — ${tierLabel})`;
+const CANCELLATION_LOG = /^CANCELLED \(cancellation fee [\d.]+ — (.+)\)$/;
+
+async function tierLabelOf(orderId: string): Promise<string | null> {
+  const log = await prisma.orderChangeLog.findFirst({
+    where: { order_id: orderId, field: "order_status", new_value: { startsWith: "CANCELLED (cancellation fee" } },
+    orderBy: { created_at: "desc" },
+    select: { new_value: true },
+  });
+  return log?.new_value?.match(CANCELLATION_LOG)?.[1] ?? null;
+}
+
+type DocumentOrder = {
+  id: string;
+  cancellation_fee: unknown;
+  service_items: Parameters<typeof serviceItemToLineItem>[0][];
+};
+
+/**
+ * A document only about the cancellation fee: the CANCELLATION_FEE invoice
+ * and its kwitansi, or anything for an order whose days are all cancelled.
+ * It prints no package notes (what the price includes is not what it bills).
+ */
+const isFeeOnly = (order: DocumentOrder, invoiceType?: string) =>
+  invoiceType === "CANCELLATION_FEE" ||
+  (order.cancellation_fee != null && order.service_items.every((i) => i.line_status === "CANCELLED"));
+
+/**
+ * The day lines of a document (invoice, kwitansi, statement). On a cancelled
+ * order (cancellation_fee set, the order total) a "Biaya Pembatalan" line
+ * holds what the days and the other lines printed (`otherLines`) do not, so
+ * the lines add up to the printed total (B7). A CANCELLATION_FEE document
+ * lists only the fee, like the invoice cancelOrder issued.
+ */
+async function rentalDocumentItems(
+  order: DocumentOrder,
+  invoiceType?: string,
+  otherLines = 0,
+): Promise<InvoiceLineItem[]> {
+  const fee = order.cancellation_fee == null ? null : Number(order.cancellation_fee);
+  const days = invoiceType === "CANCELLATION_FEE" ? [] : order.service_items.map(serviceItemToLineItem);
+  if (fee == null) return days;
+  const listed = days.reduce((s, d) => s + d.totalPrice, 0) + otherLines;
+  const amount = fee - listed;
+  if (amount <= 0) return days;
+  const tier = await tierLabelOf(order.id);
+  return [
+    ...days,
+    {
+      description: tier ? `Biaya Pembatalan — ${tier}` : "Biaya Pembatalan",
+      quantity: 1,
+      unitPrice: amount,
+      totalPrice: amount,
+    },
+  ];
 }
 
 // Turn a billable adjustment into a PDF line item, appending the date to the
@@ -428,13 +491,19 @@ export async function generateInvoice(
       ),
   );
 
-  // Settlement (remaining rental balance) is due on the first day of service.
+  // Settlement (remaining rental balance) is due on the first day of service
+  // that will run: a cancelled day is skipped (all of them only when every
+  // day is cancelled).
   let dueDate: Date | null = null;
   if (input.invoice_type === "SETTLEMENT") {
-    const firstServiceDate = order.service_items
-      .map((i) => i.service_date)
-      .filter((d): d is Date => !!d)
-      .sort((a, b) => a.getTime() - b.getTime())[0];
+    const earliest = (items: typeof order.service_items) =>
+      items
+        .map((i) => i.service_date)
+        .filter((d): d is Date => !!d)
+        .sort((a, b) => a.getTime() - b.getTime())[0];
+    const firstServiceDate =
+      earliest(order.service_items.filter((i) => i.line_status !== "CANCELLED")) ??
+      earliest(order.service_items);
     dueDate =
       firstServiceDate || order.service_start_at || order.order_date || null;
   }
@@ -452,10 +521,11 @@ export async function generateInvoice(
   //  - ADDITIONAL bills ONLY the billable adjustments (no rental day lines).
   //  - everything else (DP / SETTLEMENT / FULL / COMBINED) lists the rental
   //    service days; COMBINED also appends additionalItems above.
-  const rentalLineItems = order.service_items.map(serviceItemToLineItem);
   const additionalLineItems = billableAdjustments.map(adjustmentToLineItem);
   const pdfItems =
-    input.invoice_type === "ADDITIONAL" ? additionalLineItems : rentalLineItems;
+    input.invoice_type === "ADDITIONAL"
+      ? additionalLineItems
+      : await rentalDocumentItems(order, input.invoice_type, isCombined ? additionalsTotal : 0);
 
 
 
@@ -475,7 +545,7 @@ export async function generateInvoice(
     documentMode: "INVOICE",
     invoiceKind: input.invoice_type,
     dueDate,
-    noteLines: buildNoteLines(order),
+    noteLines: isFeeOnly(order) ? undefined : buildNoteLines(order),
     items: pdfItems,
     additionalItems,
   });
@@ -632,8 +702,14 @@ export async function markInvoicePaid(
         });
         if (count === 0) return null;
         const [locked] = await tx.$queryRaw<
-          { final_price: unknown; paid_to_date: unknown; is_refunded: boolean; refund_amount: unknown }[]
-        >`SELECT final_price, paid_to_date, is_refunded, refund_amount
+          {
+            final_price: unknown;
+            paid_to_date: unknown;
+            is_refunded: boolean;
+            refund_amount: unknown;
+            cancellation_fee: unknown;
+          }[]
+        >`SELECT final_price, paid_to_date, is_refunded, refund_amount, cancellation_fee
           FROM "orders" WHERE id = ${invoice.order_id} FOR NO KEY UPDATE`;
 
         if (customer) {
@@ -677,7 +753,7 @@ export async function markInvoicePaid(
             payment_status: paymentStatusFor(
               netPaid({ ...locked, paid_to_date: paidTotal }),
               locked.final_price,
-              rentalBaseOf(days),
+              dpBaseOf(locked, days),
             ),
             paid_to_date: paidTotal,
           },
@@ -752,11 +828,16 @@ async function attachReceiptPdf(
   // an Additional Charges section. An ADDITIONAL receipt lists ONLY the
   // additional charges; every other type lists the rental service days.
   const billable = order.adjustments.filter((a) => a.is_billable);
-  const rentalItems = order.service_items.map(serviceItemToLineItem);
-  const items =
-    invoice.invoice_type === "ADDITIONAL" ? billable.map(adjustmentToLineItem) : rentalItems;
   const additionalItems =
     invoice.invoice_type === "COMBINED" ? billable.map(adjustmentToLineItem) : undefined;
+  const items =
+    invoice.invoice_type === "ADDITIONAL"
+      ? billable.map(adjustmentToLineItem)
+      : await rentalDocumentItems(
+          order,
+          invoice.invoice_type,
+          (additionalItems ?? []).reduce((s, a) => s + a.totalPrice, 0),
+        );
 
   // Sum of the other active invoices, for the receipt summary.
   const priorAgg = await prisma.invoice.aggregate({
@@ -800,7 +881,7 @@ async function attachReceiptPdf(
     // Sprint 2: overpayment/refund details live ONLY in the PDF. Refund is due
     // only when total received exceeds the ORDER total (never the DP).
     refundDue: Math.max(totalReceived - orderTotal, 0),
-    noteLines: buildNoteLines(order),
+    noteLines: isFeeOnly(order, invoice.invoice_type) ? undefined : buildNoteLines(order),
     items,
     additionalItems,
   });
@@ -847,13 +928,17 @@ export async function generateOrderStatement(
 
   const finalPrice = Number(order.final_price);
 
-  // Service-day line items.
-  const items = order.service_items.map(serviceItemToLineItem);
-
   // Billable additional charges (overtime/parking/etc.).
   const additionalItems = order.adjustments
     .filter((a) => a.is_billable)
     .map(adjustmentToLineItem);
+
+  // Service-day line items (and the cancellation fee of a cancelled order).
+  const items = await rentalDocumentItems(
+    order,
+    undefined,
+    additionalItems.reduce((s, a) => s + a.totalPrice, 0),
+  );
 
   // Every payment actually received on the chosen invoices (the money on the
   // receipt, also for an invoice voided later by a cancellation).
@@ -883,7 +968,7 @@ export async function generateOrderStatement(
     paymentsReceived,
     remainingBalance,
     showPaidStamp: fullyPaid,
-    noteLines: buildNoteLines(order),
+    noteLines: isFeeOnly(order) ? undefined : buildNoteLines(order),
     items,
     additionalItems: additionalItems.length ? additionalItems : undefined,
   });
@@ -966,13 +1051,16 @@ export async function reviseInvoice(
   const reviseAdjustmentItems = reviseBillableAdjustments.map(
     adjustmentToLineItem,
   );
-  const reviseRentalItems = invoice.order.service_items.map(serviceItemToLineItem);
+  const reviseAdditionalItems =
+    invoice.invoice_type === "COMBINED" ? reviseAdjustmentItems : undefined;
   const reviseItems =
     invoice.invoice_type === "ADDITIONAL"
       ? reviseAdjustmentItems
-      : reviseRentalItems;
-  const reviseAdditionalItems =
-    invoice.invoice_type === "COMBINED" ? reviseAdjustmentItems : undefined;
+      : await rentalDocumentItems(
+          invoice.order,
+          invoice.invoice_type,
+          (reviseAdditionalItems ?? []).reduce((s, a) => s + a.totalPrice, 0),
+        );
 
   const pdfBuffer = await generateInvoicePDF({
     invoiceNumber,
@@ -989,8 +1077,7 @@ export async function reviseInvoice(
     invoiceKind: invoice.invoice_type,
     // Same notes as the original; a cancellation fee keeps none (its own
     // notes, the reason and tier, are not stored).
-    noteLines:
-      invoice.invoice_type === "CANCELLATION_FEE" ? undefined : buildNoteLines(invoice.order),
+    noteLines: isFeeOnly(invoice.order, invoice.invoice_type) ? undefined : buildNoteLines(invoice.order),
     items: reviseItems,
     additionalItems: reviseAdditionalItems,
   });

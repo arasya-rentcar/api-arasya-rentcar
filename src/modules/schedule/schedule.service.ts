@@ -2,8 +2,11 @@ import { notifyNewTrips, notifyTripsRemoved } from '../../services/tripNotify';
 import prisma from '../../prisma/client';
 import { AppError } from '../../utils/AppError';
 import {
+  assertNotLastOpenDay,
   assertOrderOpenForDayChanges,
   assertOrderPaidForDriverAssignment,
+  isOpenDay,
+  LAST_OPEN_DAY_MESSAGE,
   orderPaymentStatus,
   paymentOrderSelect,
   startPayment,
@@ -185,10 +188,6 @@ export async function listSchedule(query: ListScheduleQuery) {
   };
 }
 
-/** Day statuses still to run: an order with none of these has ended. */
-const OPEN_DAY: ScheduleStatus[] = ['SCHEDULED', 'ASSIGNED', 'IN_PROGRESS'];
-const LAST_OPEN_DAY_MESSAGE =
-  'Ini hari terakhir yang masih aktif. Pakai tombol Batalkan Pesanan supaya biaya pembatalan dihitung.';
 const toSen = (n: unknown) => Math.round(Number(n ?? 0) * 100);
 
 /** Update assignment / status / finance for a single day-line and recompute
@@ -320,8 +319,8 @@ export async function assignScheduleLine(
   // Pesanan", which charges the cancellation fee. A day of a multi-day order
   // may be cancelled here while another one is still to run. Checked again in
   // the transaction (two days cancelled at once).
-  const endsOrder = becomesCancelled && OPEN_DAY.includes(line.line_status);
-  if (endsOrder && !line.order.service_items.some((l) => l.id !== id && OPEN_DAY.includes(l.line_status))) {
+  const endsOrder = becomesCancelled && isOpenDay(line.line_status);
+  if (endsOrder && !line.order.service_items.some((l) => l.id !== id && isOpenDay(l.line_status))) {
     throw new AppError(LAST_OPEN_DAY_MESSAGE, 409);
   }
   const started = !!(line.actual_start_at || line.trip_started_at);
@@ -460,6 +459,14 @@ export async function assignScheduleLine(
 
   const updated = await prisma.$transaction(async (tx) => {
     await tx.orderServiceItem.update({ where: { id }, data });
+    // The order total before this change, read under the order lock (day →
+    // order, like every caller): the baseline of the B1.3 check below. The
+    // total read before the transaction may already be out of date.
+    await tx.$queryRaw`SELECT id FROM "orders" WHERE id = ${line.order_id} FOR NO KEY UPDATE`;
+    const before = await tx.order.findUniqueOrThrow({
+      where: { id: line.order_id },
+      select: { final_price: true },
+    });
     // Costs, margin and the payable follow the day; then the order totals.
     await recomputeLineMoney(tx, id);
     await rollupOrderFinance(tx, line.order_id);
@@ -479,12 +486,7 @@ export async function assignScheduleLine(
     }
     // B1.1 again, under the order lock rollupOrderFinance took: a second day
     // cancelled at the same moment committed first.
-    if (endsOrder) {
-      const stillOpen = await tx.orderServiceItem.count({
-        where: { order_id: line.order_id, id: { not: id }, line_status: { in: OPEN_DAY } },
-      });
-      if (stillOpen === 0) throw new AppError(LAST_OPEN_DAY_MESSAGE, 409);
-    }
+    if (endsOrder) await assertNotLastOpenDay(tx, line.order_id, id);
     // B1.3 (owner, 6 Oct 2026): a change here that lowers the order total
     // (a day cancelled) must not leave it below what is already billed, the
     // same rule as Edit Order. The admin revises or cancels the unpaid
@@ -494,7 +496,7 @@ export async function assignScheduleLine(
       select: { final_price: true },
     });
     const newTotal = Number(totals.final_price);
-    if (toSen(newTotal) < toSen(line.order.final_price)) {
+    if (toSen(newTotal) < toSen(before.final_price)) {
       const billed = await billedSoFar(line.order_id, undefined, tx);
       if (toSen(newTotal) < toSen(billed)) {
         throw new AppError(
