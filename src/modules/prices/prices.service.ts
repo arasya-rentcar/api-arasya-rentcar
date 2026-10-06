@@ -6,6 +6,7 @@ import { AppError } from "../../utils/AppError";
 import type {
   CreateCarInput,
   CreateSurchargeInput,
+  DeleteSurchargeInput,
   PublishInput,
   RateUpdate,
   UpdateCarInput,
@@ -27,6 +28,10 @@ import type {
  * Every write and every publish take the same advisory lock, so they run one
  * after the other: a snapshot holds a change completely or not at all, and
  * "unpublished changes" (logs newer than the last publication) is exact.
+ *
+ * Every row in GET /prices carries updated_at. A write that sends it back as
+ * expected_updated_at is refused (409) when the row changed since the page
+ * was loaded, so a stale page never silently overwrites a newer price.
  */
 
 type Tx = Prisma.TransactionClient;
@@ -49,13 +54,25 @@ const rank = (duration: string) => {
 
 /**
  * Inside a transaction, before reading anything it changes. Returns the time
- * the lock was taken: the timestamp of the change logs (or the publication),
- * set here rather than by the database so it follows the lock order.
+ * of this write: the timestamp of its change logs (or the publication) and
+ * the updated_at of the rows it changes. It is set here, in lock order, and
+ * is always later than every earlier log and publication (at least 1 ms, even
+ * within one millisecond or when the clock steps back), so "logs newer than
+ * the last publication" counts exactly the changes it does not hold.
  */
 async function lockPriceList(tx: Tx): Promise<Date> {
   await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext('price_list'))`;
-  return new Date();
+  const log = await tx.priceChangeLog.aggregate({ _max: { created_at: true } });
+  const pub = await tx.pricePublication.aggregate({ _max: { created_at: true } });
+  const latest = Math.max(log._max.created_at?.getTime() ?? 0, pub._max.created_at?.getTime() ?? 0);
+  return new Date(Math.max(Date.now(), latest + 1));
 }
+
+const CONFLICT_MESSAGE = "Harga ini sudah diubah admin lain. Muat ulang halaman lalu ulangi.";
+/** The row changed after the admin's page loaded it (millisecond precision). */
+const isStale = (row: { updated_at: Date }, expected: string | undefined) =>
+  expected !== undefined && row.updated_at.getTime() !== new Date(expected).getTime();
+const conflict = (ids: string[]) => new AppError(CONFLICT_MESSAGE, 409, { conflict_ids: ids });
 
 // How a value is written in the change log: rupiah as plain numbers.
 const logValue = (v: unknown): string | null =>
@@ -188,6 +205,8 @@ export async function getPriceList() {
     extras: extras.map(toExtra),
     last_publication: last,
     unpublished_changes: unpublished,
+    // Rates not confirmed by the owner yet; publishing them needs confirm_proposals.
+    proposal_count: zones.reduce((n, z) => n + z.rates.filter((r) => r.is_proposal).length, 0),
     users: await userEmails(adminIds),
   };
 }
@@ -201,11 +220,13 @@ export async function updateRates(items: RateUpdate[], adminId: string) {
       const rows = await tx.priceRate.findMany({ where: { id: { in: items.map((i) => i.id) } } });
       const byId = new Map(rows.map((r) => [r.id, r]));
       if (items.some((i) => !byId.has(i.id))) throw new AppError("Tarif tidak ditemukan", 404);
+      const stale = items.filter((i) => isStale(byId.get(i.id)!, i.expected_updated_at)).map((i) => i.id);
+      if (stale.length) throw conflict(stale);
       const logs: Prisma.PriceChangeLogCreateManyInput[] = [];
-      for (const { id, ...data } of items) {
+      for (const { id, expected_updated_at: _expected, ...data } of items) {
         const c = changes("rate", byId.get(id)!, data, adminId, at);
         if (!c.logs.length) continue;
-        await tx.priceRate.update({ where: { id }, data: { ...c.changed, updated_by: adminId } });
+        await tx.priceRate.update({ where: { id }, data: { ...c.changed, updated_by: adminId, updated_at: at } });
         logs.push(...c.logs);
       }
       if (logs.length) await tx.priceChangeLog.createMany({ data: logs });
@@ -257,15 +278,17 @@ export async function createSurcharge(input: CreateSurchargeInput, adminId: stri
 }
 
 export async function updateSurcharge(id: string, input: UpdateSurchargeInput, adminId: string) {
+  const { expected_updated_at, ...data } = input;
   try {
     await prisma.$transaction(async (tx) => {
       const at = await lockPriceList(tx);
       const s = await tx.priceSurcharge.findUnique({ where: { id } });
       if (!s) throw new AppError("Tambahan area tidak ditemukan", 404);
-      if (input.area) await assertAreaFree(tx, s.zone_id, input.area, id);
-      const c = changes("surcharge", s, input, adminId, at);
+      if (isStale(s, expected_updated_at)) throw conflict([id]);
+      if (data.area) await assertAreaFree(tx, s.zone_id, data.area, id);
+      const c = changes("surcharge", s, data, adminId, at);
       if (!c.logs.length) return;
-      await tx.priceSurcharge.update({ where: { id }, data: { ...c.changed, updated_by: adminId } });
+      await tx.priceSurcharge.update({ where: { id }, data: { ...c.changed, updated_by: adminId, updated_at: at } });
       await tx.priceChangeLog.createMany({ data: c.logs });
     });
   } catch (err) {
@@ -276,11 +299,12 @@ export async function updateSurcharge(id: string, input: UpdateSurchargeInput, a
 }
 
 /** Removed for good; the log keeps what it was. */
-export async function deleteSurcharge(id: string, adminId: string) {
+export async function deleteSurcharge(id: string, input: DeleteSurchargeInput, adminId: string) {
   await prisma.$transaction(async (tx) => {
     const at = await lockPriceList(tx);
     const s = await tx.priceSurcharge.findUnique({ where: { id } });
     if (!s) throw new AppError("Tambahan area tidak ditemukan", 404);
+    if (isStale(s, input.expected_updated_at)) throw conflict([id]);
     await tx.priceSurcharge.delete({ where: { id } });
     await tx.priceChangeLog.create({ data: rowLog("surcharge", id, "deleted", surchargeText(s), adminId, at) });
   });
@@ -289,26 +313,30 @@ export async function deleteSurcharge(id: string, adminId: string) {
 
 // ── Tables, driver costs, cities, cars ──────────────────────────────────────
 export async function updateZone(id: string, input: UpdateZoneInput, adminId: string) {
+  const { expected_updated_at, ...data } = input;
   await prisma.$transaction(async (tx) => {
     const at = await lockPriceList(tx);
     const zone = await tx.priceZone.findUnique({ where: { id } });
     if (!zone) throw new AppError("Tabel harga tidak ditemukan", 404);
-    const c = changes("zone", zone, input, adminId, at);
+    if (isStale(zone, expected_updated_at)) throw conflict([id]);
+    const c = changes("zone", zone, data, adminId, at);
     if (!c.logs.length) return;
-    await tx.priceZone.update({ where: { id }, data: c.changed });
+    await tx.priceZone.update({ where: { id }, data: { ...c.changed, updated_at: at } });
     await tx.priceChangeLog.createMany({ data: c.logs });
   });
   return getPriceList();
 }
 
 export async function updateExtra(id: string, input: UpdateExtraInput, adminId: string) {
+  const { expected_updated_at, ...data } = input;
   await prisma.$transaction(async (tx) => {
     const at = await lockPriceList(tx);
     const extra = await tx.priceExtra.findUnique({ where: { id } });
     if (!extra) throw new AppError("Biaya tidak ditemukan", 404);
-    const c = changes("extra", extra, input, adminId, at);
+    if (isStale(extra, expected_updated_at)) throw conflict([id]);
+    const c = changes("extra", extra, data, adminId, at);
     if (!c.logs.length) return;
-    await tx.priceExtra.update({ where: { id }, data: { ...c.changed, updated_by: adminId } });
+    await tx.priceExtra.update({ where: { id }, data: { ...c.changed, updated_by: adminId, updated_at: at } });
     await tx.priceChangeLog.createMany({ data: c.logs });
   });
   return getPriceList();
@@ -323,6 +351,7 @@ export async function updateCity(id: string, input: UpdateCityInput, adminId: st
     const at = await lockPriceList(tx);
     const city = await tx.priceCity.findUnique({ where: { id } });
     if (!city) throw new AppError("Kota tidak ditemukan", 404);
+    if (isStale(city, input.expected_updated_at)) throw conflict([id]);
     const quote = input.quote ?? city.quote;
     const next = quote
       ? { quote, driver_zone_id: null, all_in_zone_id: null }
@@ -346,20 +375,22 @@ export async function updateCity(id: string, input: UpdateCityInput, adminId: st
     }
     const c = changes("city", city, next, adminId, at);
     if (!c.logs.length) return;
-    await tx.priceCity.update({ where: { id }, data: c.changed });
+    await tx.priceCity.update({ where: { id }, data: { ...c.changed, updated_at: at } });
     await tx.priceChangeLog.createMany({ data: c.logs });
   });
   return getPriceList();
 }
 
 export async function updateCar(id: string, input: UpdateCarInput, adminId: string) {
+  const { expected_updated_at, ...data } = input;
   await prisma.$transaction(async (tx) => {
     const at = await lockPriceList(tx);
     const car = await tx.priceCar.findUnique({ where: { id } });
     if (!car) throw new AppError("Mobil tidak ditemukan", 404);
-    const c = changes("car", car, input, adminId, at);
+    if (isStale(car, expected_updated_at)) throw conflict([id]);
+    const c = changes("car", car, data, adminId, at);
     if (!c.logs.length) return;
-    await tx.priceCar.update({ where: { id }, data: c.changed });
+    await tx.priceCar.update({ where: { id }, data: { ...c.changed, updated_at: at } });
     await tx.priceChangeLog.createMany({ data: c.logs });
   });
   return getPriceList();
@@ -539,25 +570,40 @@ const toPublication = (p: Prisma.PricePublicationGetPayload<{ select: typeof pub
   deploy_status: p.deploy_status,
 });
 
-/** "Terbitkan ke website". A resend with the same client_ref returns the same publication. */
+/**
+ * "Terbitkan ke website". A resend with the same client_ref returns the same
+ * publication; when its deploy hook had failed, the resend calls it again.
+ * Refused (409) while rates are still proposals, unless confirm_proposals.
+ */
 export async function publishPrices(input: PublishInput, adminId: string) {
-  const byRef = async () => {
-    if (!input.client_ref) return null;
-    const p = await prisma.pricePublication.findUnique({ where: { client_ref: input.client_ref } });
-    return p ? { created: false, publication: toPublication(p), snapshot: p.snapshot } : null;
+  const byRef = async (retryHook: boolean) => {
+    let p = await prisma.pricePublication.findUnique({ where: { client_ref: input.client_ref } });
+    if (!p) return null;
+    if (retryHook && p.deploy_status === "FAILED" && env.WEB_DEPLOY_HOOK_URL && (await triggerWebsiteDeploy())) {
+      p = await prisma.pricePublication.update({ where: { id: p.id }, data: { deploy_status: "SENT" } });
+    }
+    return { created: false, publication: toPublication(p), snapshot: p.snapshot };
   };
-  const prev = await byRef();
+  const prev = await byRef(true);
   if (prev) return prev;
 
   let row: PricePublication;
   try {
     row = await prisma.$transaction(async (tx) => {
       const at = await lockPriceList(tx);
+      const proposals = await tx.priceRate.count({ where: { is_proposal: true } });
+      if (proposals > 0 && input.confirm_proposals !== true) {
+        throw new AppError(
+          `Masih ada ${proposals} harga usulan yang belum dikonfirmasi owner. Centang konfirmasi untuk tetap menerbitkan.`,
+          409,
+          { proposal_count: proposals },
+        );
+      }
       return tx.pricePublication.create({
         data: {
           snapshot: await buildSnapshot(tx, at),
           note: input.note ?? null,
-          client_ref: input.client_ref ?? null,
+          client_ref: input.client_ref,
           published_by: adminId,
           // With a hook: not confirmed until it answers (below).
           deploy_status: env.WEB_DEPLOY_HOOK_URL ? "FAILED" : "SKIPPED",
@@ -566,9 +612,10 @@ export async function publishPrices(input: PublishInput, adminId: string) {
       });
     });
   } catch (err) {
-    // The same publish sent twice at once: the other copy was stored.
+    // The same publish sent twice at once: the other copy was stored (and
+    // calls the hook itself).
     if (isUniqueViolation(err)) {
-      const again = await byRef();
+      const again = await byRef(false);
       if (again) return again;
     }
     throw err;

@@ -6,6 +6,7 @@ import { env } from "../../config/env";
 import {
   createCarSchema,
   createSurchargeSchema,
+  deleteSurchargeSchema,
   historyQuerySchema,
   publicationsQuerySchema,
   publishSchema,
@@ -53,7 +54,14 @@ router.get("/", h(() => getPriceList()));
 router.patch("/rates", h((req) => updateRates(updateRatesSchema.parse(req.body ?? {}).items, admin(req))));
 router.post("/surcharges", h((req) => createSurcharge(createSurchargeSchema.parse(req.body ?? {}), admin(req)), 201));
 router.patch("/surcharges/:id", h((req) => updateSurcharge(req.params.id, updateSurchargeSchema.parse(req.body ?? {}), admin(req))));
-router.delete("/surcharges/:id", h((req) => deleteSurcharge(req.params.id, admin(req))));
+// expected_updated_at in the query string (some proxies drop DELETE bodies) or the body.
+router.delete("/surcharges/:id", h((req) =>
+  deleteSurcharge(
+    req.params.id,
+    deleteSurchargeSchema.parse({ expected_updated_at: req.query.expected_updated_at ?? req.body?.expected_updated_at }),
+    admin(req),
+  ),
+));
 router.patch("/zones/:id", h((req) => updateZone(req.params.id, updateZoneSchema.parse(req.body ?? {}), admin(req))));
 router.patch("/extras/:id", h((req) => updateExtra(req.params.id, updateExtraSchema.parse(req.body ?? {}), admin(req))));
 router.patch("/cities/:id", h((req) => updateCity(req.params.id, updateCitySchema.parse(req.body ?? {}), admin(req))));

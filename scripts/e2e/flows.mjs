@@ -1281,6 +1281,9 @@ await section('P. Price list and invoice wording', async () => {
     rate('JABODETABEK', 'suzuki-ertiga', '12H').is_proposal === true && rate('JABODETABEK', 'toyota-avanza', '12H').is_proposal === false &&
     drop.rates.length === 14 && drop.rates.every((r) => r.duration === 'DROP' && r.is_proposal) && rate('DROP_JABODETABEK', 'toyota-fortuner', 'DROP').amount === 1600000 &&
     allRates.filter((r) => r.is_proposal).length === 8 * 11 + 6);
+  check('P2b proposal_count = the rates still marked as proposals (94), every row carries updated_at',
+    L.proposal_count === 94 && [...L.cars, ...L.zones, ...allRates, ...allSurcharges, ...L.cities, ...L.extras].every((r) => typeof r.updated_at === 'string' && !Number.isNaN(Date.parse(r.updated_at))),
+    String(L.proposal_count));
   const ot = L.extras.find((e) => e.code === 'OVERTIME');
   const city = (slug) => L.cities.find((c) => c.slug === slug);
   check('P3 seed: Bogor = Jabodetabek + all-in Surabaya, Jakarta = Jabodetabek + all-in Jakarta, Singapura a quote; overtime 10%, meal 100.000; Jakarta surcharges in order',
@@ -1316,12 +1319,72 @@ await section('P. Price list and invoice wording', async () => {
     (await call('PATCH', '/prices/rates', { token: admin, body: { items: [{ id: uuid(), amount: 1000 }] } })).status === 404 &&
     (await call('PATCH', '/prices/rates', { token: d1.token, body: { items: [{ id: target.id, amount: 1 }] } })).status === 403);
 
+  // Two admins on the same page: a save from a stale page is refused (409).
+  const jktRate = (data, id) => data?.zones.find((z) => z.code === 'JAKARTA').rates.find((r) => r.id === id);
+  const loaded = jktRate(upd.data, target.id); // amount 775000, as the page shows it now
+  const otherRate = rate('JAKARTA', 'mitsubishi-xpander', '12H');
+  const fresh = await call('PATCH', '/prices/rates', { token: admin, body: { items: [{ id: target.id, amount: 780000, expected_updated_at: loaded.updated_at }] } });
+  const savedA = jktRate(fresh.data, target.id);
+  check('P9b save with the current expected_updated_at → 200, updated_at moves on',
+    fresh.status === 200 && savedA?.amount === 780000 && savedA.updated_at !== loaded.updated_at, JSON.stringify({ status: fresh.status, msg: fresh.json?.message, savedA }));
+  const stale = await call('PATCH', '/prices/rates', { token: admin, body: { items: [
+    { id: otherRate.id, amount: 1234000, expected_updated_at: otherRate.updated_at },
+    { id: target.id, amount: 790000, expected_updated_at: loaded.updated_at },
+  ] } });
+  const afterStale = (await call('GET', '/prices', { token: admin })).data;
+  check('P9c a stale item → 409 "sudah diubah admin lain" with only its id in conflict_ids; nothing of the save is stored (the fresh item neither)',
+    stale.status === 409 && stale.json?.message === 'Harga ini sudah diubah admin lain. Muat ulang halaman lalu ulangi.' &&
+    JSON.stringify(stale.json?.conflict_ids) === JSON.stringify([target.id]) &&
+    jktRate(afterStale, target.id).amount === 780000 && jktRate(afterStale, otherRate.id).amount === otherRate.amount,
+    JSON.stringify(stale.json));
+  const noCheck = await call('PATCH', '/prices/rates', { token: admin, body: { items: [{ id: target.id, amount: 775000 }] } });
+  check('P9d without expected_updated_at: saved as before (no check); a non-ISO value → 400',
+    noCheck.status === 200 && jktRate(noCheck.data, target.id).amount === 775000 &&
+    (await call('PATCH', '/prices/rates', { token: admin, body: { items: [{ id: target.id, amount: 775000, expected_updated_at: 'kemarin' }] } })).status === 400);
+  const longAgo = '2000-01-01T00:00:00.000Z';
+  const staleOne = async (path) => (await call('PATCH', path, { token: admin, body: { expected_updated_at: longAgo } }));
+  const [zStale, eStale, cStale, carStale] = await Promise.all([
+    staleOne(`/prices/zones/${zone('JAKARTA').id}`),
+    staleOne(`/prices/extras/${L.extras[0].id}`),
+    staleOne(`/prices/cities/${L.cities[0].id}`),
+    staleOne(`/prices/cars/${L.cars[0].id}`),
+  ]);
+  check('P9e zone, driver cost, city and car: a stale expected_updated_at → 409 with the id',
+    [zStale, eStale, cStale, carStale].every((r) => r.status === 409 && r.json?.conflict_ids?.length === 1) &&
+    zStale.json.conflict_ids[0] === zone('JAKARTA').id && carStale.json.conflict_ids[0] === L.cars[0].id,
+    [zStale, eStale, cStale, carStale].map((r) => r.status).join(','));
+  // A write after a publication dated later than this server's clock (another
+  // server, a clock step back) still counts as unpublished.
+  const ahead = await prisma.pricePublication.create({
+    data: { snapshot: {}, client_ref: uuid(), deploy_status: 'SKIPPED', created_at: new Date(Date.now() + 60_000) },
+  });
+  const afterAhead = await call('PATCH', '/prices/rates', { token: admin, body: { items: [{ id: target.id, amount: 776000 }] } });
+  const aheadLog = await prisma.priceChangeLog.findFirst({ where: { entity_id: target.id }, orderBy: { created_at: 'desc' } });
+  check('P9f a change after a publication stamped in the future is still counted (log time > publication time)',
+    afterAhead.status === 200 && afterAhead.data.unpublished_changes === 1 && aheadLog.created_at > ahead.created_at,
+    JSON.stringify({ unpublished: afterAhead.data?.unpublished_changes }));
+  await prisma.pricePublication.delete({ where: { id: ahead.id } });
+  await call('PATCH', '/prices/rates', { token: admin, body: { items: [{ id: target.id, amount: 775000 }] } });
+
   // Publish, then the public list.
+  const pubCount = await prisma.pricePublication.count();
+  const noRef = await call('POST', '/prices/publish', { token: admin, body: { note: 'tanpa ref', confirm_proposals: true } });
+  check('P10a publish without client_ref → 400', noRef.status === 400, JSON.stringify(noRef.json));
+  const proposals = (await call('GET', '/prices', { token: admin })).data.proposal_count;
+  const unconfirmed = await call('POST', '/prices/publish', { token: admin, body: { client_ref: uuid() } });
+  check('P10b publish while rates are proposals, without confirm_proposals → 409 naming how many; nothing stored',
+    proposals === 93 && unconfirmed.status === 409 &&
+    unconfirmed.json?.message === `Masih ada ${proposals} harga usulan yang belum dikonfirmasi owner. Centang konfirmasi untuk tetap menerbitkan.` &&
+    unconfirmed.json?.proposal_count === proposals && (await prisma.pricePublication.count()) === pubCount,
+    JSON.stringify({ proposals, status: unconfirmed.status, body: unconfirmed.json }));
+  const hook = async (q = '') => (await fetch(`${MOCK}/__deploy-hook${q}`)).json();
+  await hook('?fail=0');
+  const hookCalls = (await hook()).calls;
   const ref = uuid();
-  const p1 = await call('POST', '/prices/publish', { token: admin, body: { note: 'Daftar harga e2e', client_ref: ref } });
+  const p1 = await call('POST', '/prices/publish', { token: admin, body: { note: 'Daftar harga e2e', client_ref: ref, confirm_proposals: true } });
   const snap1 = p1.data?.snapshot;
-  check('P10 publish → 201, deploy SKIPPED (no hook configured), the snapshot has the new price',
-    p1.status === 201 && p1.data.publication.deploy_status === 'SKIPPED' && snap1?.version === 1 && snap1.zones.find((z) => z.code === 'JAKARTA').rates['toyota-avanza']['12H'] === 775000,
+  check('P10 publish with confirm_proposals → 201, the deploy hook called once (SENT), the snapshot has the new price',
+    p1.status === 201 && p1.data.publication.deploy_status === 'SENT' && (await hook()).calls === hookCalls + 1 && snap1?.version === 1 && snap1.zones.find((z) => z.code === 'JAKARTA').rates['toyota-avanza']['12H'] === 775000,
     JSON.stringify(p1.data?.publication ?? p1.json));
   const res = await fetch(`${BASE}/public/prices`); // no token, no Origin (a server-side build)
   const body = await res.json();
@@ -1352,8 +1415,23 @@ await section('P. Price list and invoice wording', async () => {
     p2.status === 200 && p2.data.publication.id === p1.data.publication.id && (await prisma.pricePublication.count({ where: { client_ref: ref } })) === 1);
   const L2 = (await call('GET', '/prices', { token: admin })).data;
   check('P15 after publishing: unpublished_changes 0, last_publication is it, with who published',
-    L2.unpublished_changes === 0 && L2.last_publication?.id === p1.data.publication.id && L2.last_publication.deploy_status === 'SKIPPED' && L2.users[L2.last_publication.published_by] === 'admin@e2e.local',
+    L2.unpublished_changes === 0 && L2.last_publication?.id === p1.data.publication.id && L2.last_publication.deploy_status === 'SENT' && L2.users[L2.last_publication.published_by] === 'admin@e2e.local',
     JSON.stringify({ unpublished: L2.unpublished_changes, last: L2.last_publication }));
+
+  // The hook is down: FAILED; the admin's resend (same client_ref) calls it again.
+  await hook('?fail=1');
+  const ref2 = uuid();
+  const f1 = await call('POST', '/prices/publish', { token: admin, body: { client_ref: ref2, confirm_proposals: true } });
+  await hook('?fail=0');
+  const callsBefore = (await hook()).calls;
+  const f2 = await call('POST', '/prices/publish', { token: admin, body: { client_ref: ref2, confirm_proposals: true } });
+  const f3 = await call('POST', '/prices/publish', { token: admin, body: { client_ref: ref2, confirm_proposals: true } });
+  const stored = await prisma.pricePublication.findUnique({ where: { client_ref: ref2 } });
+  check('P15b hook down → FAILED; the resend calls it again → 200, the same publication, SENT (stored); a further resend does not call it',
+    f1.status === 201 && f1.data.publication.deploy_status === 'FAILED' &&
+    f2.status === 200 && f2.data.publication.id === f1.data.publication.id && f2.data.publication.deploy_status === 'SENT' && stored?.deploy_status === 'SENT' &&
+    f3.status === 200 && (await hook()).calls === callsBefore + 1,
+    JSON.stringify({ f1: f1.data?.publication ?? f1.json, f2: f2.data?.publication ?? f2.json }));
 
   // Area surcharges.
   const jakarta = zone('JAKARTA');
@@ -1364,7 +1442,15 @@ await section('P. Price list and invoice wording', async () => {
   const added = add.data?.zones.find((z) => z.code === 'JAKARTA').surcharges.find((s) => s.area === area);
   check('P17 new surcharge (201) goes last in its table and counts as unpublished', add.status === 201 && added?.amount === 250000 && added.sort_order === 6 && add.data.unpublished_changes === 1, JSON.stringify(added));
   check('P18 renaming it to an area already listed → 409', (await call('PATCH', `/prices/surcharges/${added.id}`, { token: admin, body: { area: 'Bogor' } })).status === 409);
-  const del = await call('DELETE', `/prices/surcharges/${added.id}`, { token: admin });
+  const moved = await call('PATCH', `/prices/surcharges/${added.id}`, { token: admin, body: { sort_order: 7, expected_updated_at: added.updated_at } });
+  const movedRow = moved.data?.zones.find((z) => z.code === 'JAKARTA').surcharges.find((s) => s.id === added.id);
+  const staleMove = await call('PATCH', `/prices/surcharges/${added.id}`, { token: admin, body: { sort_order: 8, expected_updated_at: added.updated_at } });
+  const staleDel = await call('DELETE', `/prices/surcharges/${added.id}?expected_updated_at=${encodeURIComponent(added.updated_at)}`, { token: admin });
+  check('P18b surcharge: fresh PATCH → 200; PATCH and DELETE from the stale page → 409 (still there)',
+    moved.status === 200 && movedRow?.sort_order === 7 && staleMove.status === 409 && staleDel.status === 409 &&
+    JSON.stringify(staleDel.json?.conflict_ids) === JSON.stringify([added.id]) && (await prisma.priceSurcharge.count({ where: { id: added.id } })) === 1,
+    `${moved.status} ${staleMove.status} ${staleDel.status}`);
+  const del = await call('DELETE', `/prices/surcharges/${added.id}?expected_updated_at=${encodeURIComponent(movedRow?.updated_at ?? '')}`, { token: admin });
   const delLog = await prisma.priceChangeLog.findFirst({ where: { entity_id: added.id, field: 'deleted' } });
   check('P19 delete: gone, the log keeps what it was (new_value null)',
     del.status === 200 && !del.data.zones.find((z) => z.code === 'JAKARTA').surcharges.some((s) => s.id === added.id) && delLog?.old_value === `${area}: 250000` && delLog.new_value === null);
@@ -1400,7 +1486,7 @@ await section('P. Price list and invoice wording', async () => {
     hist.status === 200 && items.length === 5 && items[0].field === 'percent' && new Date(items[0].created_at) >= new Date(items[4].created_at) &&
     Object.values(hist.data.users).includes('admin@e2e.local') && rateLog?.label === 'Toyota Avanza · All-in Jakarta · 12 jam', rateLog?.label);
   const pubs = await call('GET', '/prices/publications', { token: admin });
-  check('P26 publications list (newest first) without the snapshot body', pubs.status === 200 && pubs.data.items[0]?.id === p1.data.publication.id && !('snapshot' in pubs.data.items[0]));
+  check('P26 publications list (newest first) without the snapshot body', pubs.status === 200 && pubs.data.items[0]?.id === f1.data.publication.id && pubs.data.items[1]?.id === p1.data.publication.id && !('snapshot' in pubs.data.items[0]));
 
   // Put the seed back (the logs stay).
   await call('PATCH', '/prices/rates', { token: admin, body: { items: [{ id: target.id, amount: 750000, note: null }, { id: ask.id, amount: ask.amount, is_proposal: ask.is_proposal }] } });

@@ -232,11 +232,11 @@ FROM (VALUES
   ('SURABAYA', 'All-in Surabaya', 'ALL-IN X PARKIR',
    'Mobil, supir, BBM, tol, dan makan supir.',
    'Parkir/tiket masuk wisata. Tip supir seikhlasnya.',
-   'Juga dipakai kota lain yang belum punya tabel sendiri.', true, 4),
+   NULL, true, 4),
   ('DROP_JABODETABEK', 'Drop Only Jabodetabek', 'ALL-IN X PARKIR',
    'Mobil, supir, BBM, dan tol untuk satu tujuan.',
    'Parkir. Tip supir seikhlasnya.',
-   'Usulan, perlu konfirmasi owner.', false, 5)
+   NULL, false, 5)
 ) AS v("code", "name", "service_package", "included", "excluded", "note", "default_for_unlisted", "sort_order")
 ON CONFLICT ("code") DO NOTHING;
 
