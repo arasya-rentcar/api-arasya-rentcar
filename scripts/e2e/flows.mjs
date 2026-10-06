@@ -1,6 +1,7 @@
 // End-to-end checks of the API: what the dashboard and the driver app do,
 // against the real API and a throwaway database. Run through run-local.sh.
 // Case ids in the output match dashboard-arasya-rentcar/docs/TEST-PLAN.md.
+import { createRequire } from 'node:module';
 import { call, check, section, summary, ensureAdmin, prisma, jpeg, wibIso, uuid, sleep, pushes, BASE, MOCK } from './lib.mjs';
 
 const admin = await ensureAdmin();
@@ -1254,6 +1255,178 @@ await section('O. Finance formulas (extra charges, cancellations, cancelled days
   const fz = await call('POST', `/orders/${o5.id}/finalize`, { token: admin });
   const log = await prisma.orderChangeLog.findFirst({ where: { order_id: o5.id, new_value: 'DONE' } });
   check('O20 [A7] finalize closes it as DONE, the cancellation in the note', fz.status === 200 && fz.data?.order_status === 'DONE' && /remaining days were cancelled/.test(log?.note ?? ''), log?.note);
+});
+
+// ── P. Official price list: working copy, history, publishing; invoice notes ─
+// The list is seeded by the migration (docs/PRICE.md). Everything this group
+// changes is put back at the end, so only the logs and publications remain.
+await section('P. Price list and invoice wording', async () => {
+  const hadPublication = (await prisma.pricePublication.count()) > 0;
+  const list = await call('GET', '/prices', { token: admin });
+  const L = list.data;
+  const zone = (code) => L.zones.find((z) => z.code === code);
+  const car = (slug) => L.cars.find((c) => c.slug === slug);
+  const rate = (code, slug, duration) => zone(code).rates.find((r) => r.car_id === car(slug).id && r.duration === duration);
+  const allRates = L?.zones?.flatMap((z) => z.rates) ?? [];
+  const allSurcharges = L?.zones?.flatMap((z) => z.surcharges) ?? [];
+  check('P1 seeded list: 14 cars, 6 tables, 154 rates, 19 area surcharges, 17 cities, 3 driver costs',
+    list.status === 200 && L.cars.length === 14 && L.zones.length === 6 && allRates.length === 154 && allSurcharges.length === 19 && L.cities.length === 17 && L.extras.length === 3,
+    JSON.stringify({ status: list.status, cars: L?.cars?.length, zones: L?.zones?.length, rates: allRates.length, surcharges: allSurcharges.length, cities: L?.cities?.length, extras: L?.extras?.length }));
+  const drop = zone('DROP_JABODETABEK');
+  check('P2 seed: Avanza Jabodetabek 500.000/700.000, Avanza Bandung Fullday 1.100.000, Fortuner all-in "Dibahas dengan admin", Hiace Commuter 12 jam only, Ertiga and every Drop price are proposals',
+    rate('JABODETABEK', 'toyota-avanza', '12H').amount === 500000 && rate('JABODETABEK', 'toyota-avanza', 'FULLDAY').amount === 700000 &&
+    rate('BANDUNG', 'toyota-avanza', 'FULLDAY').amount === 1100000 && rate('SURABAYA', 'toyota-zenix-q-hybrid-modellista', 'FULLDAY').amount === 2200000 &&
+    rate('JAKARTA', 'toyota-fortuner', '12H').amount === null && rate('JAKARTA', 'toyota-fortuner', 'FULLDAY').note === 'Dibahas dengan admin' &&
+    rate('JABODETABEK', 'toyota-hiace-commuter', '12H').amount === 1500000 && rate('JABODETABEK', 'toyota-hiace-commuter', 'FULLDAY').amount === null &&
+    rate('JABODETABEK', 'suzuki-ertiga', '12H').is_proposal === true && rate('JABODETABEK', 'toyota-avanza', '12H').is_proposal === false &&
+    drop.rates.length === 14 && drop.rates.every((r) => r.duration === 'DROP' && r.is_proposal) && rate('DROP_JABODETABEK', 'toyota-fortuner', 'DROP').amount === 1600000 &&
+    allRates.filter((r) => r.is_proposal).length === 8 * 11 + 6);
+  const ot = L.extras.find((e) => e.code === 'OVERTIME');
+  const city = (slug) => L.cities.find((c) => c.slug === slug);
+  check('P3 seed: Bogor = Jabodetabek + all-in Surabaya, Jakarta = Jabodetabek + all-in Jakarta, Singapura a quote; overtime 10%, meal 100.000; Jakarta surcharges in order',
+    city('sewa-mobil-bogor').driver_zone_id === zone('JABODETABEK').id && city('sewa-mobil-bogor').all_in_zone_id === zone('SURABAYA').id &&
+    city('sewa-mobil-jakarta').all_in_zone_id === zone('JAKARTA').id && city('sewa-mobil-singapura').quote === true && city('sewa-mobil-singapura').driver_zone_id === null &&
+    ot.percent === 10 && ot.amount === null && L.extras.find((e) => e.code === 'DRIVER_MEAL').amount === 100000 &&
+    zone('JAKARTA').surcharges.map((s) => s.area).join(',') === 'Tangerang,Bekasi,Cikarang,Depok,Bogor,Puncak');
+  check('P4 a driver token cannot use the price list (403)', (await call('GET', '/prices', { token: d1.token })).status === 403);
+  if (!hadPublication) {
+    const none = await call('GET', '/public/prices');
+    check('P5 public list before the first publish → 404 "belum diterbitkan"', none.status === 404 && /belum diterbitkan/.test(none.json?.message ?? ''), JSON.stringify(none.json));
+  }
+
+  // Edit a rate: one log per changed field, counted as unpublished.
+  const before = L.unpublished_changes;
+  const target = rate('JAKARTA', 'toyota-avanza', '12H');
+  const upd = await call('PATCH', '/prices/rates', { token: admin, body: { items: [{ id: target.id, amount: 775000, note: 'Naik' }] } });
+  const changed = upd.data?.zones.find((z) => z.code === 'JAKARTA').rates.find((r) => r.id === target.id);
+  const logs = await prisma.priceChangeLog.findMany({ where: { entity_id: target.id }, orderBy: { created_at: 'desc' }, take: 2 });
+  check('P6 PATCH a rate: saved with who changed it, one log per changed field (amount, note), unpublished +2',
+    upd.status === 200 && changed?.amount === 775000 && changed.note === 'Naik' && upd.data.users[changed.updated_by] === 'admin@e2e.local' &&
+    logs.some((l) => l.field === 'amount' && l.old_value === '750000' && l.new_value === '775000') && logs.some((l) => l.field === 'note' && l.old_value === null && l.new_value === 'Naik') &&
+    upd.data.unpublished_changes === before + 2, JSON.stringify({ status: upd.status, changed, unpublished: upd.data?.unpublished_changes, before }));
+  const same = await call('PATCH', '/prices/rates', { token: admin, body: { items: [{ id: target.id, amount: 775000, note: 'Naik' }] } });
+  check('P7 the same values again: nothing logged', same.status === 200 && same.data.unpublished_changes === before + 2);
+  const ask = rate('LUAR_KOTA', 'toyota-rush', 'FULLDAY');
+  const askUpd = await call('PATCH', '/prices/rates', { token: admin, body: { items: [{ id: ask.id, amount: null, is_proposal: false }] } });
+  const askRow = askUpd.data?.zones.find((z) => z.code === 'LUAR_KOTA').rates.find((r) => r.id === ask.id);
+  check('P8 amount null = "tanya admin", proposal flag cleared', askUpd.status === 200 && askRow?.amount === null && askRow.is_proposal === false);
+  check('P9 negative or decimal amount (400), unknown rate (404), driver token (403)',
+    (await call('PATCH', '/prices/rates', { token: admin, body: { items: [{ id: target.id, amount: -1 }] } })).status === 400 &&
+    (await call('PATCH', '/prices/rates', { token: admin, body: { items: [{ id: target.id, amount: 1000.5 }] } })).status === 400 &&
+    (await call('PATCH', '/prices/rates', { token: admin, body: { items: [{ id: uuid(), amount: 1000 }] } })).status === 404 &&
+    (await call('PATCH', '/prices/rates', { token: d1.token, body: { items: [{ id: target.id, amount: 1 }] } })).status === 403);
+
+  // Publish, then the public list.
+  const ref = uuid();
+  const p1 = await call('POST', '/prices/publish', { token: admin, body: { note: 'Daftar harga e2e', client_ref: ref } });
+  const snap1 = p1.data?.snapshot;
+  check('P10 publish → 201, deploy SKIPPED (no hook configured), the snapshot has the new price',
+    p1.status === 201 && p1.data.publication.deploy_status === 'SKIPPED' && snap1?.version === 1 && snap1.zones.find((z) => z.code === 'JAKARTA').rates['toyota-avanza']['12H'] === 775000,
+    JSON.stringify(p1.data?.publication ?? p1.json));
+  const res = await fetch(`${BASE}/public/prices`); // no token, no Origin (a server-side build)
+  const body = await res.json();
+  const snap = body.data;
+  const text = JSON.stringify(body);
+  check('P11 public list (no token, no Origin): the published snapshot, Cache-Control public 5 min, no proposal flags or admin ids',
+    res.status === 200 && snap.published_at === snap1.published_at && snap.zones.find((z) => z.code === 'JAKARTA').rates['toyota-avanza']['12H'] === 775000 &&
+    snap.zones.find((z) => z.code === 'LUAR_KOTA').rates['toyota-rush'].FULLDAY === null &&
+    res.headers.get('cache-control') === 'public, max-age=300' && !/is_proposal|updated_by|published_by|changed_by/.test(text), `${res.status} ${res.headers.get('cache-control')}`);
+  const jkt = snap.zones.find((z) => z.code === 'JAKARTA');
+  check('P12 snapshot shape (website contract v1): cars, zones with rates by car slug (in fleet order), cities by zone code, extras by code',
+    snap.cars.length === 14 && JSON.stringify(snap.cars[0]) === '{"slug":"toyota-avanza","name":"Toyota Avanza","price_class":"Avanza sekelas"}' &&
+    Object.keys(jkt).join(',') === 'code,name,service_package,included,excluded,note,default_for_unlisted,rates,surcharges' &&
+    jkt.service_package === 'ALL-IN X PARKIR' && JSON.stringify(jkt.surcharges[0]) === '{"area":"Tangerang","amount":200000}' &&
+    Object.keys(jkt.rates).join(',') === snap.cars.map((c) => c.slug).join(',') && Object.keys(jkt.rates['toyota-avanza']).join(',') === '12H,FULLDAY' &&
+    JSON.stringify(snap.zones.find((z) => z.code === 'DROP_JABODETABEK').rates['toyota-avanza']) === '{"DROP":500000}' &&
+    JSON.stringify(snap.cities.find((c) => c.slug === 'sewa-mobil-jakarta')) === '{"slug":"sewa-mobil-jakarta","name":"Jakarta","driver_zone":"JABODETABEK","all_in_zone":"JAKARTA","quote":false}' &&
+    JSON.stringify(snap.cities.find((c) => c.slug === 'sewa-mobil-thailand')) === '{"slug":"sewa-mobil-thailand","name":"Thailand","driver_zone":null,"all_in_zone":null,"quote":true}' &&
+    snap.extras.OVERTIME.percent === 10 && snap.extras.DRIVER_LODGING.amount === 150000 && snap.zones.find((z) => z.code === 'SURABAYA').default_for_unlisted === true,
+    JSON.stringify(snap.cars[0]));
+  const site = await fetch(`${BASE}/public/prices`, { headers: { Origin: 'https://arasya-web.vercel.app' } });
+  const other = await fetch(`${BASE}/public/prices`, { headers: { Origin: 'https://evil.example' } });
+  check('P13 CORS: the website origin is allowed, another origin gets no allow header',
+    site.headers.get('access-control-allow-origin') === 'https://arasya-web.vercel.app' && !other.headers.get('access-control-allow-origin'),
+    `${site.headers.get('access-control-allow-origin')} / ${other.headers.get('access-control-allow-origin')}`);
+  const p2 = await call('POST', '/prices/publish', { token: admin, body: { client_ref: ref } });
+  check('P14 publish again with the same client_ref → 200, the same publication, stored once',
+    p2.status === 200 && p2.data.publication.id === p1.data.publication.id && (await prisma.pricePublication.count({ where: { client_ref: ref } })) === 1);
+  const L2 = (await call('GET', '/prices', { token: admin })).data;
+  check('P15 after publishing: unpublished_changes 0, last_publication is it, with who published',
+    L2.unpublished_changes === 0 && L2.last_publication?.id === p1.data.publication.id && L2.last_publication.deploy_status === 'SKIPPED' && L2.users[L2.last_publication.published_by] === 'admin@e2e.local',
+    JSON.stringify({ unpublished: L2.unpublished_changes, last: L2.last_publication }));
+
+  // Area surcharges.
+  const jakarta = zone('JAKARTA');
+  const dup = await call('POST', '/prices/surcharges', { token: admin, body: { zone_id: jakarta.id, area: 'bekasi', amount: 150000 } });
+  check('P16 a surcharge for an area the table already has (any capitalisation) → 409', dup.status === 409 && /sudah ada/.test(dup.json?.message ?? ''), dup.json?.message);
+  const area = `Karawang ${tag}`;
+  const add = await call('POST', '/prices/surcharges', { token: admin, body: { zone_id: jakarta.id, area, amount: 250000 } });
+  const added = add.data?.zones.find((z) => z.code === 'JAKARTA').surcharges.find((s) => s.area === area);
+  check('P17 new surcharge (201) goes last in its table and counts as unpublished', add.status === 201 && added?.amount === 250000 && added.sort_order === 6 && add.data.unpublished_changes === 1, JSON.stringify(added));
+  check('P18 renaming it to an area already listed → 409', (await call('PATCH', `/prices/surcharges/${added.id}`, { token: admin, body: { area: 'Bogor' } })).status === 409);
+  const del = await call('DELETE', `/prices/surcharges/${added.id}`, { token: admin });
+  const delLog = await prisma.priceChangeLog.findFirst({ where: { entity_id: added.id, field: 'deleted' } });
+  check('P19 delete: gone, the log keeps what it was (new_value null)',
+    del.status === 200 && !del.data.zones.find((z) => z.code === 'JAKARTA').surcharges.some((s) => s.id === added.id) && delLog?.old_value === `${area}: 250000` && delLog.new_value === null);
+
+  // Cities, cars, driver costs.
+  const jktCity = city('sewa-mobil-jakarta');
+  check('P20 city: an all-in table as its car + driver table → 400', (await call('PATCH', `/prices/cities/${jktCity.id}`, { token: admin, body: { driver_zone_id: jakarta.id } })).status === 400);
+  const quote = await call('PATCH', `/prices/cities/${jktCity.id}`, { token: admin, body: { quote: true } });
+  const qc = quote.data?.cities.find((c) => c.id === jktCity.id);
+  const backCity = await call('PATCH', `/prices/cities/${jktCity.id}`, { token: admin, body: { quote: false, driver_zone_id: jktCity.driver_zone_id, all_in_zone_id: jktCity.all_in_zone_id } });
+  const bc = backCity.data?.cities.find((c) => c.id === jktCity.id);
+  check('P21 marking a city as quote clears both tables; back to its tables',
+    quote.status === 200 && qc.quote === true && qc.driver_zone_id === null && qc.all_in_zone_id === null &&
+    backCity.status === 200 && bc.quote === false && bc.driver_zone_id === jktCity.driver_zone_id && bc.all_in_zone_id === jktCity.all_in_zone_id);
+  const slug = `test-car-${tag}`;
+  const newCar = await call('POST', '/prices/cars', { token: admin, body: { slug, name: `Test Car ${tag}` } });
+  const nc = newCar.data?.cars.find((c) => c.slug === slug);
+  const ncRates = (newCar.data?.zones ?? []).flatMap((z) => z.rates.filter((r) => r.car_id === nc?.id).map((r) => ({ code: z.code, ...r })));
+  check('P22 new car: last in the list, 11 empty rates (12 jam + Fullday in 5 tables, Drop in the drop table), all proposals',
+    newCar.status === 201 && nc?.sort_order === 14 && ncRates.length === 11 &&
+    ncRates.every((r) => r.amount === null && r.is_proposal && (r.code.startsWith('DROP') ? r.duration === 'DROP' : r.duration !== 'DROP')), JSON.stringify({ status: newCar.status, nc, n: ncRates.length }));
+  check('P23 the same slug again → 409, a slug with spaces → 400',
+    (await call('POST', '/prices/cars', { token: admin, body: { slug, name: 'Dobel' } })).status === 409 &&
+    (await call('POST', '/prices/cars', { token: admin, body: { slug: 'Toyota Baru', name: 'X' } })).status === 400);
+  const ex = await call('PATCH', `/prices/extras/${ot.id}`, { token: admin, body: { percent: 12.5 } });
+  check('P24 overtime percent edited (12,5%)', ex.status === 200 && ex.data.extras.find((e) => e.code === 'OVERTIME').percent === 12.5);
+
+  // History and publications.
+  const hist = await call('GET', '/prices/history?limit=5', { token: admin });
+  const items = hist.data?.items ?? [];
+  const rateLog = (await call('GET', '/prices/history?limit=500', { token: admin })).data?.items.find((i) => i.entity_id === target.id);
+  check('P25 history: newest first, limit, admin emails; a rate log is labelled car · table · duration',
+    hist.status === 200 && items.length === 5 && items[0].field === 'percent' && new Date(items[0].created_at) >= new Date(items[4].created_at) &&
+    Object.values(hist.data.users).includes('admin@e2e.local') && rateLog?.label === 'Toyota Avanza · All-in Jakarta · 12 jam', rateLog?.label);
+  const pubs = await call('GET', '/prices/publications', { token: admin });
+  check('P26 publications list (newest first) without the snapshot body', pubs.status === 200 && pubs.data.items[0]?.id === p1.data.publication.id && !('snapshot' in pubs.data.items[0]));
+
+  // Put the seed back (the logs stay).
+  await call('PATCH', '/prices/rates', { token: admin, body: { items: [{ id: target.id, amount: 750000, note: null }, { id: ask.id, amount: ask.amount, is_proposal: ask.is_proposal }] } });
+  await call('PATCH', `/prices/extras/${ot.id}`, { token: admin, body: { percent: 10 } });
+  if (nc) {
+    await prisma.priceRate.deleteMany({ where: { car_id: nc.id } });
+    await prisma.priceCar.delete({ where: { id: nc.id } });
+  }
+  const L3 = (await call('GET', '/prices', { token: admin })).data;
+  check('P27 seed restored (Avanza all-in Jakarta 750.000, Rush luar kota Fullday 1.000.000, overtime 10%)',
+    L3.zones.find((z) => z.code === 'JAKARTA').rates.find((r) => r.id === target.id).amount === 750000 &&
+    L3.zones.find((z) => z.code === 'LUAR_KOTA').rates.find((r) => r.id === ask.id).amount === 1000000 && L3.cars.length === 14 &&
+    L3.extras.find((e) => e.code === 'OVERTIME').percent === 10);
+
+  // Invoice wording follows the package of the order's days (built file).
+  const { packageNoteLines } = createRequire(import.meta.url)('../../dist/src/utils/packageNotes.js');
+  const xops = packageNoteLines([{ service_package: 'XOPS', line_status: 'SCHEDULED' }]);
+  check('P28 invoice notes, X Ops: car and driver only',
+    xops.length === 2 && xops[0] === 'Harga termasuk mobil dan supir' && xops[1] === 'Belum termasuk BBM, tol, parkir/tiket masuk kawasan, dan makan supir; tips supir seikhlasnya dari Tamu', JSON.stringify(xops));
+  const allIn = packageNoteLines([{ service_package: 'ALL-IN X PARKIR', line_status: 'DONE' }, { service_package: 'XOPS', line_status: 'CANCELLED' }]);
+  check('P29 invoice notes, All-in X Parkir (a cancelled X Ops day ignored): the two all-in lines',
+    allIn.length === 2 && allIn[0] === 'Harga termasuk mobil supir bbm tol makan supir' && allIn[1] === 'Parkir/tiket masuk kawasan dan tips supir seikhlasnya dari Tamu', JSON.stringify(allIn));
+  const mixed = packageNoteLines([{ service_package: 'ALL-IN' }, { service_package: 'ALL-IN X PARKIR' }, { service_package: 'xops' }]);
+  check('P30 invoice notes, mixed order: one prefixed pair per package; unknown/empty = All-in',
+    mixed.length === 4 && mixed[0] === 'Paket All-in: Harga termasuk mobil supir bbm tol makan supir' && mixed[2] === 'Paket X Ops: Harga termasuk mobil dan supir' &&
+    packageNoteLines([{ service_package: null }])[0] === 'Harga termasuk mobil supir bbm tol makan supir', JSON.stringify(mixed));
 });
 
 const failed = summary();

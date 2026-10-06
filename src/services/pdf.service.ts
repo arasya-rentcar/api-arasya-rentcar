@@ -74,7 +74,7 @@ const COMPANY = {
     "BCA 0954840782 a/n PT Ayomi Raya Karsa",
   overtimeTitle: "*Overtime*",
   overtimeNote:
-    "Pemakaian melebihi durasi sewa (12 jam/Full day) atau lewat 23.00 dikenakan biaya overtime 10% per jam",
+    "Pemakaian melebihi durasi sewa (12 jam/Full day) atau lewat 23.00 dikenakan biaya overtime 10% dari harga Full day per jam",
   terms:
     "Terms of Payment :\n" +
     "(1) DP 20% pada saat pemesanan.\n" +
