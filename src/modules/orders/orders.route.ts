@@ -34,6 +34,7 @@ import {
   createOrderRefundController,
   getOrderRefundProofController,
   cancelOrderController,
+  orderCancelQuoteController,
   finalizeOrderController,
 } from "./orders.controller";
 
@@ -49,6 +50,7 @@ router.put("/:id", updateOrderController);
 router.put("/:id/finance", upsertOrderFinanceController);
 router.post("/:id/assign", assignOrderController);
 router.post("/:id/reassign", reassignOrderController);
+router.get("/:id/cancel-quote", orderCancelQuoteController);
 router.post("/:id/cancel", cancelOrderController);
 router.post("/:id/finalize", finalizeOrderController);
 router.post("/:id/adjustments", createOrderAdjustmentController);

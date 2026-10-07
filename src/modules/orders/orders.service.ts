@@ -24,7 +24,7 @@ import { attachLeadToOrder } from "../leads/leads.service";
 import { notifyNewTrips, notifyTripsChanged, notifyTripsRemoved } from "../../services/tripNotify";
 import { defaultDriverFee } from "../../utils/driverFee";
 import { computeMargin, MARGIN_FORMULA_VERSION } from "../../utils/margin";
-import { computeCancellationPenalty } from "./cancellation-policy";
+import { cancelDecisionTime, dayCancellation, dayDateOf, dayStarted, TIER_PCT } from "./cancellation-policy";
 import { recomputeLineMoney } from "../schedule/line-money.service";
 import { rollupOrderFinance } from "../schedule/schedule.service";
 import { assertUnitsFree, lockUnits } from "../schedule/availability";
@@ -34,10 +34,12 @@ import { buildCancellationFeePdf, cancellationLogValue, invoiceView } from "../i
 import { rupiah } from "../../services/adminNotify";
 import {
   addCreditEntry,
+  assertOpenWithinTotal,
   computeOrderMoney,
   lockOrder,
   lockOrderDays,
   moneyState,
+  type MoneyState,
   recomputePaymentStatus,
   rp,
   sen,
@@ -868,6 +870,39 @@ const DAY_SCHEDULE_FIELDS = [
  * to the customer keep it (it is cancelled from Edit Hari instead). One filter
  * for the check and for the delete itself.
  */
+export const DAY_DELETE_NEEDS_CANCEL_MESSAGE =
+  "Batalkan hari itu lewat Edit Hari supaya biaya pembatalan dihitung";
+
+/**
+ * Edit Order may delete a day that counts toward the total (not cancelled,
+ * or cancelled with a fee) only while the order has no money: Net = 0, no
+ * unpaid invoice and no PAID invoice (owner, 7 Oct 2026; finance design
+ * §3.1). Otherwise 409 DAY_DELETE_NEEDS_CANCEL. Under the order lock.
+ */
+async function assertDayDeleteFree(tx: Prisma.TransactionClient, orderId: string, dayIds: string[]) {
+  const counted = await tx.orderServiceItem.count({
+    where: {
+      id: { in: dayIds },
+      order_id: orderId,
+      OR: [{ line_status: { not: "CANCELLED" } }, { cancel_fee: { gt: 0 } }],
+    },
+  });
+  if (counted === 0) return;
+  const [m, paidInvoices] = await Promise.all([
+    moneyState(tx, orderId),
+    tx.invoice.count({ where: { order_id: orderId, status: "PAID" } }),
+  ]);
+  if (!m) return;
+  if (m.net !== 0 || m.open > 0 || paidInvoices > 0) {
+    throw new AppError(`${DAY_DELETE_NEEDS_CANCEL_MESSAGE}.`, 409, {
+      code: "DAY_DELETE_NEEDS_CANCEL",
+      net_paid: rp(m.net),
+      open_billed: rp(m.open),
+      paid_invoices: paidInvoices,
+    });
+  }
+}
+
 const DELETABLE_DAY: Prisma.OrderServiceItemWhereInput = {
   line_status: { in: ["SCHEDULED", "CANCELLED"] },
   driver_id: null,
@@ -1070,6 +1105,13 @@ export async function updateOrder(id: string, input: UpdateOrderInput) {
       if (days) {
         await lockOrderDays(tx, id);
         if (days.deletes.length > 0) {
+          // Owner, 7 Oct 2026 (Q6): removing a day is free only while the
+          // order has no money and no active invoice. Otherwise the day is
+          // cancelled through Edit Hari, so its cancellation fee is charged.
+          // Checked under the order lock (B9: days, then the order), so a
+          // payment recorded at the same moment is seen.
+          await lockOrder(tx, id);
+          await assertDayDeleteFree(tx, id, days.deletes);
           deletesOpenDay =
             (await tx.orderServiceItem.count({
               where: { id: { in: days.deletes }, order_id: id, line_status: { in: OPEN_DAY_STATUSES } },
@@ -1169,11 +1211,6 @@ export async function updateOrder(id: string, input: UpdateOrderInput) {
         },
       });
 
-      // What money already covers plus what open invoices ask (rule set v3),
-      // under the order lock the update above took and before the rollup
-      // can release any of it: the baseline of the price check below.
-      const moneyBefore = await moneyState(tx, id);
-
       if (days) {
         // A day this request did not know about (another tab, or the same
         // save sent twice) was added meanwhile: refuse rather than add a
@@ -1230,15 +1267,11 @@ export async function updateOrder(id: string, input: UpdateOrderInput) {
         Math.round(Number(after.final_price) * 100) !==
         Math.round(Number(order.final_price) * 100);
       if (pricesChanged) {
-        // The total may not drop below what is paid toward it (Covered) plus
-        // what open invoices ask (INV-6). A shortfall or saldo lebih is not
-        // "billed". Lowering a paid price waits for per-day fees (A3).
-        const invoicedTotal = moneyBefore ? rp(moneyBefore.covered + moneyBefore.open) : 0;
-        if (sen(after.final_price) < sen(invoicedTotal)) {
-          throw new AppError(
-            `final_price cannot be lower than active invoice total (${invoicedTotal}). Revise/cancel invoices first.`,
-            409,
-          );
+        // INV-6 (A3): a lower total may leave money beyond it (the rollup
+        // released it as saldo lebih), but unpaid invoices may not ask more
+        // than is still owed (409 OPEN_INVOICE_EXCEEDS with the amounts).
+        if (sen(after.final_price) < sen(order.final_price)) {
+          await assertOpenWithinTotal(tx, id, "Perubahan harga ini");
         }
         await tx.orderChangeLog.create({
           data: {
@@ -1896,119 +1929,323 @@ export async function getOrderRefundProofUrl(orderId: string, refundId: string) 
   return { url, expires_in: 300 };
 }
 
-/** The tier and penalty of cancelling now, from the order and its days. */
-function cancellationQuote(
-  order: { final_price: unknown; service_start_at: Date | null },
-  days: { line_status: string; service_date: Date | null; trip_started_at: Date | null }[],
-  now: Date,
-) {
-  // ── Tier + penalty (base = final_price) ───────────────────────────────
-  const activeLines = days.filter((l) => l.line_status !== "CANCELLED");
-  const firstServiceDate =
-    activeLines
-      .map((l) => l.service_date)
-      .filter((d): d is Date => !!d)
-      .sort((a, b) => a.getTime() - b.getTime())[0] ??
-    order.service_start_at ??
-    null;
-  const anyLineStarted = activeLines.some((l) => l.trip_started_at != null);
-  return computeCancellationPenalty({
-    finalPrice: Number(order.final_price),
-    firstServiceDate,
-    anyLineStarted,
-    now,
-  });
-}
-
 const ALL_DAYS_DONE_MESSAGE =
   "Semua hari order ini sudah selesai, jadi tidak ada yang bisa dibatalkan. Tutup order lewat Finalisasi.";
 const allDaysEnded = (days: { line_status: string }[]) =>
   days.length > 0 && days.every((l) => l.line_status === "DONE" || l.line_status === "CANCELLED");
 
-export interface CancelOrderResult {
+/** A day as the per-day cancellation plan needs it. */
+type PlanDay = {
+  id: string;
+  line_status: string;
+  total_price: unknown;
+  service_date: Date | null;
+  start_at: Date | null;
+  actual_start_at: Date | null;
+  trip_started_at: Date | null;
+  cancel_fee: unknown;
+  cancel_tier: number | null;
+};
+
+export interface CancelPlanDay {
+  id: string;
+  date: string | null;
+  price: number;
+  started: boolean;
   tier: 1 | 2 | 3;
-  penalty: number;
-  originalFinalPrice: number;
-  paidToDate: number;
-  /** Money owed back to the customer (paid more than the penalty). */
-  refundDue: number;
-  /** Money the customer still owes toward the penalty. */
-  stillOwed: number;
-  cancellationInvoiceNumber: string | null;
+  pct: 20 | 50 | 100;
+  fee: number;
+  label: string;
 }
 
 /**
- * Cancel a full order per Arasya cancellation policy.
+ * Batalkan Pesanan per day (owner, 7 Oct 2026; finance design §3.2), worked
+ * out in whole sen from the order's days and money at one decision time:
  *
- * Non-breaking design (reviewed against existing money flows):
- *  - sets order.final_price = penalty, so payment_status and the money model
- *    (order-money.ts) work with zero special-casing: saldo lebih goes to the
- *    fee first, and what the money kept has beyond the penalty is released
- *    into saldo lebih (the refund due, refunded through /refunds).
- *  - voids active invoices (status → CANCELLED) and DECREMENTS total_billed
- *    by their sum, then issues ONE CANCELLATION_FEE invoice (with a real PDF)
- *    for what is still owed (penalty − money already received; none when the
- *    money received covers it) and INCREMENTS total_billed by that amount →
- *    preserves the G9 invariant total_billed = sum(active invoices).
- *  - cancels all active lines → order status derives to CANCELLED; releases
- *    drivers/cars. Days already DONE are kept: the order then stays open and
- *    closes through finalize (decided 6 Oct 2026).
- *  - stores cancelled_at / cancellation_fee / cancellation_reason (what marks
- *    the order as cancelled for rollupOrderFinance and the reports), recomputes
- *    payment_status against the new (penalty) total and re-rolls the order
- *    finance so the order card margin includes the fee.
- *  - does NOT move money or auto-mark refunded: refunds stay manual (bank
- *    transfer) via the existing refund flow. Returns a summary so the UI can
- *    show the admin what to collect/refund.
+ *  - every open day (SCHEDULED / ASSIGNED / IN_PROGRESS) gets its own fee
+ *    (dayCancellation); days already cancelled keep theirs; DONE days keep
+ *    their price; charges stay billed in full, outside the fee base.
+ *  - T_new = Σ DONE prices + Σ fees of every cancelled day + charges.
+ *  - Unpaid invoices (DRAFT/ISSUED) are voided and give back their saldo
+ *    lebih; PAID invoices stay PAID.
+ *  - gross = T_new − Covered (after the voids). gross > 0: saldo lebih goes
+ *    first, a CANCELLATION_FEE invoice asks for the rest. gross ≤ 0: the
+ *    excess becomes saldo lebih (RELEASE).
+ *
+ * Pure over its inputs: GET /orders/:id/cancel-quote shows it and cancelOrder
+ * recomputes it under the locks, so the two agree (R8).
+ */
+function cancelPlan(args: {
+  orderStart: Date | null;
+  days: PlanDay[];
+  money: { net: number; credit: number; charges: number };
+  unpaid: { id: string; invoice_number: string; amount: unknown; credit_applied: unknown }[];
+  decidedAt: Date;
+}) {
+  const { days, money, unpaid, decidedAt } = args;
+  const toCancel: CancelPlanDay[] = [];
+  let doneSen = 0;
+  let earlierSen = 0;
+  for (const d of days) {
+    if (d.line_status === "DONE") doneSen += sen(d.total_price);
+    else if (d.line_status === "CANCELLED") earlierSen += sen(d.cancel_fee);
+    else {
+      const date = dayDateOf(d, args.orderStart);
+      const started = dayStarted(d);
+      const q = dayCancellation({ price: Number(d.total_price), dayDate: date, started, decidedAt });
+      toCancel.push({
+        id: d.id,
+        date: date ? date.toISOString() : null,
+        price: Number(d.total_price),
+        started,
+        ...q,
+      });
+    }
+  }
+  const nowSen = toCancel.reduce((s, d) => s + sen(d.fee), 0);
+  const feeTotalSen = earlierSen + nowSen;
+  const newTotal = doneSen + feeTotalSen + money.charges;
+  const creditBack = unpaid.reduce((s, i) => s + sen(i.credit_applied), 0);
+  const creditAfterVoid = money.credit + creditBack;
+  const covered = money.net - creditAfterVoid;
+  const gross = newTotal - covered;
+  const creditApplied = gross > 0 ? Math.min(creditAfterVoid, gross) : 0;
+  const amount = gross > 0 ? gross - creditApplied : 0;
+  const release = gross < 0 ? -gross : 0;
+  return {
+    days: toCancel,
+    tier: (toCancel.reduce<number>((t, d) => Math.max(t, d.tier), 0) || 1) as 1 | 2 | 3,
+    earlierFeeSen: earlierSen,
+    feeTotalSen,
+    doneSen,
+    newTotal,
+    covered,
+    creditAfterVoid,
+    gross,
+    creditApplied,
+    amount,
+    release,
+    creditAfter: creditAfterVoid - creditApplied + release,
+    voided: unpaid.map((i) => ({
+      id: i.id,
+      number: i.invoice_number,
+      amount: Number(i.amount),
+      credit_applied: Number(i.credit_applied ?? 0),
+    })),
+  };
+}
+type CancelPlan = ReturnType<typeof cancelPlan>;
+
+const planDaySelect = {
+  id: true,
+  line_status: true,
+  total_price: true,
+  service_date: true,
+  start_at: true,
+  actual_start_at: true,
+  trip_started_at: true,
+  cancel_fee: true,
+  cancel_tier: true,
+} as const;
+
+/** The plan from the database (prisma or a transaction), for one order. */
+async function loadCancelPlan(
+  db: Prisma.TransactionClient | typeof prisma,
+  orderId: string,
+  orderStart: Date | null,
+  decidedAt: Date,
+) {
+  const [days, m, unpaid] = await Promise.all([
+    db.orderServiceItem.findMany({
+      where: { order_id: orderId },
+      select: planDaySelect,
+      orderBy: [{ service_date: { sort: "asc", nulls: "last" } }, { sort_order: "asc" }],
+    }),
+    moneyState(db, orderId),
+    db.invoice.findMany({
+      where: { order_id: orderId, status: { in: ["DRAFT", "ISSUED"] } },
+      select: { id: true, invoice_number: true, amount: true, credit_applied: true },
+      orderBy: { id: "asc" },
+    }),
+  ]);
+  if (!m) throw new AppError("Order not found", 404);
+  return {
+    days,
+    money: m,
+    plan: cancelPlan({ orderStart, days, money: m, unpaid, decidedAt }),
+  };
+}
+
+/** The refusals Batalkan Pesanan and its quote share. */
+function assertCancellable(
+  order: { order_status: string; cancellation_fee: unknown },
+  days: { line_status: string }[],
+) {
+  if (order.order_status === "DONE" || order.order_status === "CANCELLED") {
+    throw new AppError(`Cannot cancel an order with status ${order.order_status}`, 409);
+  }
+  if (order.cancellation_fee != null) {
+    throw new AppError("Sisa hari order ini sudah dibatalkan. Tinggal finalisasi.", 409);
+  }
+  // Every day already done (awaiting finalize): nothing is left to cancel.
+  if (allDaysEnded(days)) throw new AppError(ALL_DAYS_DONE_MESSAGE, 409);
+}
+
+/** The cancel-quote shape (finance design §5.5), in rupiah. */
+function planView(plan: CancelPlan, m: MoneyState, decidedAt: Date, requestedAt: Date | null) {
+  return {
+    decided_at: decidedAt.toISOString(),
+    requested_at: requestedAt?.toISOString() ?? null,
+    tier: plan.tier,
+    days: plan.days,
+    earlier_fee_total: rp(plan.earlierFeeSen),
+    fee_total: rp(plan.feeTotalSen),
+    done_total: rp(plan.doneSen),
+    charges: rp(m.charges),
+    original_total: rp(m.total),
+    new_total: rp(plan.newTotal),
+    net_paid: rp(m.net),
+    credit_balance: rp(m.credit),
+    covered: rp(plan.covered),
+    voided_invoices: plan.voided,
+    fee_invoice:
+      plan.amount > 0
+        ? { gross: rp(plan.gross), credit_applied: rp(plan.creditApplied), amount: rp(plan.amount) }
+        : null,
+    credit_applied: rp(plan.creditApplied),
+    credit_release: rp(plan.release),
+    credit_after: rp(plan.creditAfter),
+    still_owed: rp(plan.amount),
+  };
+}
+
+/**
+ * GET /orders/:id/cancel-quote: what "Batalkan Pesanan" would charge now (or
+ * at the customer's request time) per day, and what it does to the money.
+ * Read-only.
+ */
+export async function orderCancelQuote(orderId: string, requestedAt?: string) {
+  const now = new Date();
+  const when = cancelDecisionTime(requestedAt, now);
+  if (when.error) throw new AppError(when.error, 400);
+  const order = await prisma.order.findUnique({
+    where: { id: orderId },
+    select: { order_status: true, cancellation_fee: true, service_start_at: true },
+  });
+  if (!order) throw new AppError("Order not found", 404);
+  const { days, money, plan } = await loadCancelPlan(prisma, orderId, order.service_start_at, when.decidedAt);
+  assertCancellable(order, days);
+  return planView(plan, money, when.decidedAt, when.requestedAt);
+}
+
+export interface CancelOrderResult {
+  /** Highest tier among the days cancelled now. */
+  tier: 1 | 2 | 3;
+  /** Σ cancellation fees of every cancelled day (= orders.cancellation_fee). */
+  penalty: number;
+  originalFinalPrice: number;
+  /** Money received (paid_to_date). */
+  paidToDate: number;
+  /** Saldo lebih after the cancellation (refunded through /refunds). */
+  refundDue: number;
+  /** Cash still owed after saldo lebih (what the fee invoice asks; 0 when covered). */
+  stillOwed: number;
+  cancellationInvoiceNumber: string | null;
+  // A3 (finance design §5.6)
+  rule: "DAY_V2";
+  days: CancelPlanDay[];
+  earlierFeeTotal: number;
+  feeTotal: number;
+  newTotal: number;
+  netPaid: number;
+  creditBalance: number;
+  creditApplied: number;
+  creditReleased: number;
+  voidedInvoices: { id: string; number: string; amount: number; credit_applied: number }[];
+  decidedAt: string;
+}
+
+const samePlan = (a: CancelPlan, b: CancelPlan) =>
+  a.feeTotalSen === b.feeTotalSen &&
+  a.newTotal === b.newTotal &&
+  a.amount === b.amount &&
+  a.creditApplied === b.creditApplied &&
+  a.days.length === b.days.length &&
+  a.voided.length === b.voided.length;
+
+/**
+ * Cancel a full order, per day (owner, 7 Oct 2026; finance design §3.2).
+ *
+ *  - Every open day is cancelled with its own fee (cancel_fee / cancel_tier /
+ *    cancelled_at / cancel_reason / cancel_requested_at on the day); days
+ *    cancelled earlier keep theirs; DONE days keep their price.
+ *  - orders.cancellation_fee = Σ fees of every cancelled day (still the
+ *    "this order was cancelled" marker), cancellation_rule = 'DAY_V2'.
+ *    final_price is not frozen: the rollup computes Σ DONE prices + Σ fees +
+ *    charges, the payment status and the RELEASE of money beyond it.
+ *  - Only unpaid invoices are voided (their saldo lebih comes back,
+ *    UNAPPLIED); PAID invoices stay PAID. One CANCELLATION_FEE invoice (PDF
+ *    built outside the transaction) asks only what is still owed after the
+ *    saldo lebih; none when money already covers it.
+ *  - Drivers/cars of days not started are released. Days already DONE keep
+ *    the order open; it closes through finalize (decided 6 Oct 2026).
+ *  - `expectedFeeTotal` (the quote the admin saw) differing from the server's
+ *    → 409 CANCEL_FEE_CHANGED with the new quote, nothing changed.
+ *  - Money is never moved here: refunds stay manual through /refunds.
  */
 export async function cancelOrder(
   orderId: string,
-  reason: string,
-  actor?: string,
+  input: { reason: string; actor?: string; expected_fee_total?: number; requested_at?: string },
 ): Promise<CancelOrderResult> {
+  const { reason, actor } = input;
+  const now = new Date();
+  const when = cancelDecisionTime(input.requested_at, now);
+  if (when.error) throw new AppError(when.error, 400);
+  const decidedAt = when.decidedAt;
+
   const order = await prisma.order.findUnique({
     where: { id: orderId },
-    include: {
-      customer: true,
-      service_items: { orderBy: { service_date: { sort: "asc", nulls: "last" } } },
-    },
+    include: { customer: true },
   });
   if (!order) throw new AppError("Order not found", 404);
-  if (order.order_status === "DONE" || order.order_status === "CANCELLED") {
+  const before = await loadCancelPlan(prisma, orderId, order.service_start_at, decidedAt);
+  assertCancellable(order, before.days);
+  if (
+    input.expected_fee_total !== undefined &&
+    sen(input.expected_fee_total) !== before.plan.feeTotalSen
+  ) {
     throw new AppError(
-      `Cannot cancel an order with status ${order.order_status}`,
+      `Biaya pembatalan sekarang ${rupiah(rp(before.plan.feeTotalSen))}, bukan ${rupiah(input.expected_fee_total)}. Periksa rinciannya lalu batalkan lagi.`,
       409,
+      { code: "CANCEL_FEE_CHANGED", quote: planView(before.plan, before.money, decidedAt, when.requestedAt) },
     );
   }
-  if (order.cancellation_fee != null) {
-    throw new AppError(
-      "Sisa hari order ini sudah dibatalkan. Tinggal finalisasi.",
-      409,
-    );
-  }
-  // Every day already done (awaiting finalize): nothing is left to cancel.
-  if (allDaysEnded(order.service_items)) throw new AppError(ALL_DAYS_DONE_MESSAGE, 409);
-
-  const now = new Date();
   const originalFinalPrice = Number(order.final_price);
-  const { tier, penalty, label } = cancellationQuote(order, order.service_items, now);
 
-  // What the customer still owes toward the penalty. Money already received
-  // (a DP, or the full price) counts against it; the transaction re-reads it.
-  // Whole rupiah, like the penalty (B12).
-  const owedFor = (paid: number) => Math.max(0, Math.round(penalty - paid));
-  const paidBefore = netPaid(order);
-  const owedBefore = owedFor(paidBefore);
+  // Every cancelled day (earlier ones too) for the fee invoice lines.
+  const feeLines = (plan: CancelPlan, days: PlanDay[]) => {
+    const now = new Map(plan.days.map((d) => [d.id, d]));
+    return days
+      .filter((d) => d.line_status === "CANCELLED" || now.has(d.id))
+      .map((d) => {
+        const q = now.get(d.id);
+        const tier = (q?.tier ?? d.cancel_tier ?? 1) as 1 | 2 | 3;
+        return {
+          date: dayDateOf(d, order.service_start_at),
+          price: Number(d.total_price),
+          pct: TIER_PCT[tier],
+          fee: q ? q.fee : Number(d.cancel_fee ?? 0),
+        };
+      });
+  };
 
   // ── Render the cancellation-fee PDF + reserve its number OUTSIDE the main
   //    tx (slow network work; mirrors generateInvoice). Skip if no customer
   //    is linked (cannot issue a numbered invoice without a customer code),
   //    or when nothing is owed (no invoice to issue).
-  let prepared:
-    | { invoiceNumber: string; invoiceSeq: number; fileUrl: string }
-    | null = null;
-  if (order.customer && owedBefore > 0) {
-    const built = await buildCancellationFeePdf({
+  let prepared: { invoiceNumber: string; invoiceSeq: number; fileUrl: string } | null = null;
+  if (order.customer && before.plan.amount > 0) {
+    prepared = await buildCancellationFeePdf({
       customer: { id: order.customer.id, code: order.customer.code },
       order: {
         order_code: order.order_code,
@@ -2017,16 +2254,15 @@ export async function cancelOrder(
         pickup_location: order.pickup_location,
         dropoff_location: order.dropoff_location,
       },
-      penalty,
-      alreadyPaid: paidBefore,
-      tierLabel: label,
+      days: feeLines(before.plan, before.days),
+      total: rp(before.plan.newTotal),
+      alreadyPaid: rp(before.plan.covered),
+      creditApplied: rp(before.plan.creditApplied),
       reason,
       issueDate: now,
     });
-    prepared = built;
   }
 
-  // ── Mutations in one transaction ────────────────────────────────────────
   let result: CancelOrderResult;
   try {
     result = await prisma.$transaction(async (tx) => {
@@ -2038,7 +2274,7 @@ export async function cancelOrder(
       await lockOrder(tx, orderId);
       const fresh = await tx.order.findUniqueOrThrow({
         where: { id: orderId },
-        select: { order_status: true, cancellation_fee: true, final_price: true, service_start_at: true },
+        select: { order_status: true, cancellation_fee: true },
       });
       if (
         fresh.order_status === "DONE" ||
@@ -2047,117 +2283,83 @@ export async function cancelOrder(
       ) {
         throw new AppError("Order ini sudah dibatalkan atau sudah selesai.", 409);
       }
-      // The days as they are now. A day started, finished, cancelled or
-      // repriced since the fee was worked out (and its PDF built) changes what
-      // is owed: stop and let the admin retry.
-      const days = await tx.orderServiceItem.findMany({ where: { order_id: orderId } });
-      if (allDaysEnded(days)) throw new AppError(ALL_DAYS_DONE_MESSAGE, 409);
-      const quote = cancellationQuote(fresh, days, now);
-      if (
-        quote.tier !== tier ||
-        quote.penalty !== penalty ||
-        Number(fresh.final_price) !== originalFinalPrice
-      ) {
+      // The days and money as they are now. A day started, finished,
+      // cancelled or repriced, a payment or an invoice since the plan was
+      // worked out (and its PDF built) changes what is owed: stop and let the
+      // admin retry.
+      const locked = await loadCancelPlan(tx, orderId, order.service_start_at, decidedAt);
+      if (allDaysEnded(locked.days)) throw new AppError(ALL_DAYS_DONE_MESSAGE, 409);
+      const plan = locked.plan;
+      if (!samePlan(plan, before.plan)) {
         throw new AppError(
-          "Ada perubahan pada hari atau total order saat pesanan dibatalkan. Coba batalkan lagi.",
+          "Ada perubahan pada hari, invoice atau pembayaran order ini saat pesanan dibatalkan. Coba batalkan lagi.",
           409,
         );
       }
 
-      // 1) Void active invoices and decrement the customer's billed total.
-      const activeInvoices = await tx.invoice.findMany({
-        where: {
-          order_id: orderId,
-          status: { notIn: ["REVISED", "CANCELLED"] },
-        },
-        select: { id: true, amount: true, status: true, credit_applied: true, invoice_number: true },
-      });
-      const voidedSum = activeInvoices.reduce(
-        (s, inv) => s + Number(inv.amount),
-        0,
-      );
-      if (activeInvoices.length > 0) {
-        await tx.invoice.updateMany({
-          where: { id: { in: activeInvoices.map((i) => i.id) } },
+      // 1) Void the unpaid invoices only (PAID stay PAID) and give back the
+      //    saldo lebih they used (UNAPPLIED). total_billed = Σ active
+      //    invoices: remove the voided ones.
+      const voidedIds = plan.voided.map((v) => v.id);
+      if (voidedIds.length > 0) {
+        const { count } = await tx.invoice.updateMany({
+          where: { id: { in: voidedIds }, status: { in: ["DRAFT", "ISSUED"] } },
           data: { status: "CANCELLED" },
         });
+        if (count !== voidedIds.length) {
+          throw new AppError("Ada invoice yang baru saja dibayar atau direvisi. Coba batalkan lagi.", 409);
+        }
       }
-      // An unpaid invoice voided here gives back the saldo lebih it used
-      // (UNAPPLIED). A paid one keeps it: that credit settled part of the total.
-      for (const inv of activeInvoices) {
-        if (inv.status === "PAID") continue;
+      for (const inv of plan.voided) {
         await addCreditEntry(tx, {
           orderId,
           kind: "UNAPPLIED",
-          amount: Number(inv.credit_applied ?? 0),
+          amount: inv.credit_applied,
           invoiceId: inv.id,
-          note: `Saldo lebih dikembalikan dari ${inv.invoice_number} (dibatalkan bersama pesanan)`,
+          note: `Saldo lebih dikembalikan dari ${inv.number} (dibatalkan bersama pesanan)`,
           actor: actor ?? "ADMIN",
         });
       }
+      const voidedSum = plan.voided.reduce((s, v) => s + v.amount, 0);
 
-      // Money received, read now under the order lock (markInvoicePaid takes it
-      // first too), so a payment recorded while the fee PDF was being built is
-      // included. The PDF was made for owedBefore; if that changed, stop and
-      // let the admin retry.
-      const money = await tx.order.findUniqueOrThrow({
-        where: { id: orderId },
-        select: { paid_to_date: true, refunded_total: true, credit_balance: true },
-      });
-      const paidToDate = Number(money.paid_to_date ?? 0);
-      const owed = owedFor(netPaid(money));
-      if (owed !== owedBefore) {
-        throw new AppError(
-          "Ada pembayaran yang baru tercatat saat pesanan dibatalkan. Coba batalkan lagi.",
-          409,
-        );
-      }
-
-      // 2) Cancel all active lines; collect drivers/cars to release.
+      // 2) Cancel the open days, each with its own fee; collect drivers/cars
+      //    to release.
       const driverIds = new Set<string>();
       const carIds = new Set<string>();
-      const cancellableIds: string[] = [];
-      const startedIds: string[] = [];
-      for (const l of days) {
-        if (l.line_status === "DONE" || l.line_status === "CANCELLED") continue;
-        cancellableIds.push(l.id);
-        if (l.actual_start_at || l.trip_started_at) startedIds.push(l.id);
-        if (l.driver_id) driverIds.add(l.driver_id);
-        if (l.car_id) carIds.add(l.car_id);
-      }
+      const cancellableIds = plan.days.map((d) => d.id);
+      const full = await tx.orderServiceItem.findMany({
+        where: { id: { in: cancellableIds } },
+        select: { id: true, is_external: true, driver_id: true, car_id: true, actual_start_at: true, trip_started_at: true },
+      });
       // A day already paid out (driver fee / partner RTR) keeps who drove and
       // its amounts, like a started day: the payment stays on record.
       const paidOut = await tx.payable.findMany({
         where: { service_item_id: { in: cancellableIds }, status: "PAID" },
         select: { service_item_id: true },
       });
-      for (const p of paidOut) {
-        if (!startedIds.includes(p.service_item_id)) startedIds.push(p.service_item_id);
-      }
-      const notStartedIds = cancellableIds.filter((id) => !startedIds.includes(id));
-      if (notStartedIds.length > 0) {
-        // Not started: release driver/car; nobody earned anything that day.
-        await tx.orderServiceItem.updateMany({
-          where: { id: { in: notStartedIds }, is_external: false },
+      const paidOutIds = new Set(paidOut.map((p) => p.service_item_id));
+      const byId = new Map(plan.days.map((d) => [d.id, d]));
+      for (const l of full) {
+        const q = byId.get(l.id)!;
+        if (l.driver_id) driverIds.add(l.driver_id);
+        if (l.car_id) carIds.add(l.car_id);
+        const keep = !!(l.actual_start_at || l.trip_started_at) || paidOutIds.has(l.id);
+        const release: Prisma.OrderServiceItemUncheckedUpdateInput = keep
+          ? {}
+          : l.is_external
+            ? { rtr_amount: 0 }
+            : { driver_id: null, car_id: null, driver_fee: 0, driver_fee_note: "Dibatalkan sebelum berangkat" };
+        await tx.orderServiceItem.update({
+          where: { id: l.id },
           data: {
+            ...release,
             line_status: "CANCELLED",
-            driver_id: null,
-            car_id: null,
-            driver_fee: 0,
-            driver_fee_note: "Dibatalkan sebelum berangkat",
+            cancel_fee: q.fee,
+            cancel_tier: q.tier,
+            cancelled_at: now,
+            cancel_reason: reason,
+            cancel_requested_at: when.requestedAt,
           },
-        });
-        await tx.orderServiceItem.updateMany({
-          where: { id: { in: notStartedIds }, is_external: true },
-          data: { line_status: "CANCELLED", rtr_amount: 0 },
-        });
-      }
-      if (startedIds.length > 0) {
-        // Already on the road (or already paid): keep who drove so their pay
-        // stays with them.
-        await tx.orderServiceItem.updateMany({
-          where: { id: { in: startedIds } },
-          data: { line_status: "CANCELLED" },
         });
       }
       for (const id of cancellableIds) await recomputeLineMoney(tx, id);
@@ -2167,21 +2369,28 @@ export async function cancelOrder(
       for (const dId of driverIds) await syncDriverStatus(tx, dId);
       for (const cId of carIds) await syncCarStatus(tx, cId);
 
-      // 4) Issue the CANCELLATION_FEE invoice for what is still owed, with its
-      //    PDF (penalty − already paid = remaining). Nothing owed → no invoice:
-      //    a fee invoice over money already received would be paid twice.
-      // Saldo lebih goes to the fee first (finance design §3.2): the fee is
-      // asked net of all money kept (owed = penalty − Net), so the credit
-      // that is part of Net is used for it (APPLIED), and only what Net has
-      // beyond the penalty stays saldo lebih (the refund due). A credit below
-      // that is topped up by the rollup below (settleCredit, RELEASE).
-      const netSen = sen(netPaid(money));
-      const creditSen = sen(money.credit_balance);
-      const creditUsed = Math.max(0, creditSen - Math.max(0, netSen - sen(penalty)));
+      // 4) The cancellation marks the order (DAY_V2). The rollup computes the
+      //    new total from the days (Σ DONE prices + Σ fees + charges), the
+      //    payment status, and releases money beyond it as saldo lebih
+      //    (settleCredit, RELEASE).
+      await tx.order.update({
+        where: { id: orderId },
+        data: {
+          cancelled_at: now,
+          cancellation_fee: rp(plan.feeTotalSen),
+          cancellation_reason: reason,
+          cancellation_rule: "DAY_V2",
+        },
+      });
+      await rollupOrderFinance(tx, orderId);
+
+      // 5) What is still owed after the saldo lebih: one CANCELLATION_FEE
+      //    invoice with its PDF (none when money covers it). Saldo lebih goes
+      //    first (APPLIED), also when it covers the rest without an invoice.
       let cancellationInvoiceNumber: string | null = null;
-      let invoiced = 0;
       let feeInvoiceId: string | undefined;
-      if (prepared && order.customer && owed > 0) {
+      let invoiced = 0;
+      if (prepared && order.customer && plan.amount > 0) {
         const fee = await tx.invoice.create({
           data: {
             order_id: orderId,
@@ -2190,21 +2399,21 @@ export async function cancelOrder(
             invoice_type: "CANCELLATION_FEE",
             payment_method: "BANK_TRANSFER",
             issue_date: now,
-            amount: owed,
-            note: `${reason}\n${label}`,
+            amount: rp(plan.amount),
+            note: `${reason}\n${feeSummary(plan)}`,
             file_url: prepared.fileUrl,
             status: "ISSUED",
-            credit_applied: rp(creditUsed),
+            credit_applied: rp(plan.creditApplied),
           },
         });
         feeInvoiceId = fee.id;
         cancellationInvoiceNumber = prepared.invoiceNumber;
-        invoiced = owed;
+        invoiced = rp(plan.amount);
       }
       await addCreditEntry(tx, {
         orderId,
         kind: "APPLIED",
-        amount: -rp(creditUsed),
+        amount: -rp(plan.creditApplied),
         invoiceId: feeInvoiceId,
         note: cancellationInvoiceNumber
           ? `Dipotong dari saldo lebih untuk biaya pembatalan ${cancellationInvoiceNumber}`
@@ -2212,7 +2421,7 @@ export async function cancelOrder(
         actor: actor ?? "ADMIN",
       });
 
-      // 5) Keep total_billed = sum(active invoices): remove voided, add the new one.
+      // 6) Keep total_billed = Σ active invoices: remove voided, add the new one.
       if (order.customer) {
         const billedDelta = invoiced - voidedSum;
         if (billedDelta !== 0) {
@@ -2223,55 +2432,44 @@ export async function cancelOrder(
         }
       }
 
-      // 6) The order is now worth the penalty. Set final_price = penalty so the
-      //    existing refund/payment flows compute correctly, and recompute
-      //    payment_status against the new total (money received is unchanged).
-      //    The cancellation fields mark the order as cancelled even when done
-      //    days keep it open, so later roll-ups keep the penalty as its price.
-      // The DP rule's base is the penalty too (dpBaseOf): it is what the
-      // customer owes now, so PAID once it is covered, DP_PAID from 20% of it.
-      const paymentStatus = paymentStatusFor(
-        netPaid(money),
-        penalty,
-        dpBaseOf({ cancellation_fee: penalty }, days),
-      );
-
-      await tx.order.update({
-        where: { id: orderId },
-        data: {
-          final_price: penalty,
-          payment_status: paymentStatus,
-          cancelled_at: now,
-          cancellation_fee: penalty,
-          cancellation_reason: reason,
-        },
-      });
-      // The rollup also releases what Net has beyond the penalty into saldo
-      // lebih (settleCredit, INV-5): the refund due below.
-      await rollupOrderFinance(tx, orderId);
-
-      // 7) Audit log (preserve the original price).
+      // 7) Audit log (keeps the original price and every day's fee).
       await tx.orderChangeLog.create({
         data: {
           order_id: orderId,
           field: "order_status",
           old_value: `${order.order_status} (final_price ${originalFinalPrice})`,
-          new_value: cancellationLogValue(penalty, label),
-          note: reason,
+          new_value: cancellationLogValue(rp(plan.feeTotalSen), feeSummary(plan)),
+          note: [
+            reason,
+            when.requestedAt ? `jam pelanggan membatalkan ${when.requestedAt.toISOString()}` : null,
+          ]
+            .filter(Boolean)
+            .join(" | "),
           actor: actor ?? "ADMIN",
         },
       });
 
-      // Net of any refund already made, like `owed` and payment_status.
-      const refundDue = Math.max(0, Math.round(netPaid(money) - penalty));
+      const after = await moneyState(tx, orderId);
+      if (!after) throw new AppError("Order not found", 404);
       return {
-        tier,
-        penalty,
+        tier: plan.tier,
+        penalty: rp(plan.feeTotalSen),
         originalFinalPrice,
-        paidToDate,
-        refundDue,
-        stillOwed: owed,
+        paidToDate: rp(after.received),
+        refundDue: rp(after.credit),
+        stillOwed: rp(plan.amount),
         cancellationInvoiceNumber,
+        rule: "DAY_V2",
+        days: plan.days,
+        earlierFeeTotal: rp(plan.earlierFeeSen),
+        feeTotal: rp(plan.feeTotalSen),
+        newTotal: rp(after.total),
+        netPaid: rp(after.net),
+        creditBalance: rp(after.credit),
+        creditApplied: rp(plan.creditApplied),
+        creditReleased: rp(plan.release),
+        voidedInvoices: plan.voided,
+        decidedAt: decidedAt.toISOString(),
       } satisfies CancelOrderResult;
     }, {
       // Cancel runs many sequential round-trips (status derive + driver/car sync
@@ -2289,4 +2487,13 @@ export async function cancelOrder(
   }
 
   return result;
+}
+
+/** One line for the invoice note and the change log: the fee of each day. */
+function feeSummary(plan: CancelPlan): string {
+  const parts = plan.days.map(
+    (d) => `${d.date ? wibShortDay(new Date(d.date)) : "tanpa tanggal"} ${d.pct}% ${rupiah(d.fee)}`,
+  );
+  const earlier = plan.earlierFeeSen > 0 ? `; dibatalkan sebelumnya ${rupiah(rp(plan.earlierFeeSen))}` : "";
+  return `Biaya pembatalan per hari: ${parts.join(", ")}${earlier}`;
 }

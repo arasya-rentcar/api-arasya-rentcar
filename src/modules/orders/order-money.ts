@@ -1,6 +1,8 @@
 import type { Prisma } from "@prisma/client";
 import prisma from "../../prisma/client";
-import { dpBaseOf, minDpFor, orderPaymentStatus, rentalBaseOf } from "./assignment-guard";
+import { AppError } from "../../utils/AppError";
+import { rupiah } from "../../services/adminNotify";
+import { dpBaseOf, minDpFor, orderPaymentStatus, rentalBaseOf, rentalLineSelect } from "./assignment-guard";
 
 type Db = Prisma.TransactionClient | typeof prisma;
 
@@ -134,7 +136,8 @@ export async function moneyState(
       refunded_total: true,
       credit_balance: true,
       cancellation_fee: true,
-      service_items: { select: { total_price: true, line_status: true } },
+      cancellation_rule: true,
+      service_items: { select: rentalLineSelect },
       adjustments: { where: { is_billable: true }, select: { amount: true, quantity: true } },
     },
   });
@@ -187,6 +190,38 @@ export async function settleCredit(
 }
 
 /**
+ * INV-6 (Covered + OpenBilled ≤ T, finance design §6) for a change that
+ * lowers T on purpose (a day cancelled in Edit Hari, a day removed or
+ * repriced in Edit Order, a billed trip cost rejected, deleted or lowered).
+ * Unpaid invoices may ask at most what is still owed: refused when
+ * OpenBilled > max(0, T_new − Covered). Money beyond T_new is not refused:
+ * the rollup releases it as saldo lebih (settleCredit, INV-5). Called under
+ * the order lock, after the rollup wrote T_new. The 409 carries the numbers
+ * so the admin knows how far to revise the unpaid invoice.
+ */
+export async function assertOpenWithinTotal(
+  tx: Prisma.TransactionClient,
+  orderId: string,
+  what = "Perubahan ini",
+): Promise<void> {
+  const m = await moneyState(tx, orderId);
+  if (!m) return;
+  const maxOpen = Math.max(0, m.total - m.covered);
+  if (m.open <= maxOpen) return;
+  throw new AppError(
+    `${what} membuat total order ${rupiah(rp(m.total))}, padahal invoice yang belum dibayar masih menagih ${rupiah(rp(m.open))} dan yang masih terutang tinggal ${rupiah(rp(maxOpen))}. Revisi invoice yang belum dibayar menjadi paling banyak ${rupiah(rp(maxOpen))} (atau batalkan), lalu simpan lagi.`,
+    409,
+    {
+      code: "OPEN_INVOICE_EXCEEDS",
+      new_total: rp(m.total),
+      covered: rp(m.covered),
+      open_billed: rp(m.open),
+      max_open_billed: rp(maxOpen),
+    },
+  );
+}
+
+/**
  * INV-9: payment_status from Net, T and base (orderPaymentStatus), written
  * when it changed. For transactions that move Net without a rollup (refunds).
  */
@@ -199,7 +234,8 @@ export async function recomputePaymentStatus(tx: Prisma.TransactionClient, order
       payment_status: true,
       refunded_total: true,
       cancellation_fee: true,
-      service_items: { select: { total_price: true, line_status: true } },
+      cancellation_rule: true,
+      service_items: { select: rentalLineSelect },
     },
   });
   const status = orderPaymentStatus(order, order.service_items);
@@ -251,7 +287,7 @@ export interface OrderMoney {
 export async function computeOrderMoney(db: Db, orderId: string): Promise<OrderMoney | null> {
   const [m, days] = await Promise.all([
     moneyState(db, orderId),
-    db.orderServiceItem.findMany({ where: { order_id: orderId }, select: { total_price: true, line_status: true } }),
+    db.orderServiceItem.findMany({ where: { order_id: orderId }, select: rentalLineSelect }),
   ]);
   if (!m) return null;
   return {

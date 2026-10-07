@@ -10,6 +10,7 @@ import fs from "fs";
 import path from "path";
 import prisma from "../prisma/client";
 import { logger } from "../config/logger";
+import { CANCELLATION_POLICY_TEXT } from "../modules/orders/cancellation-policy";
 
 export interface InvoiceLineItem {
   serviceDate?: Date | string | null;
@@ -90,12 +91,9 @@ const COMPANY = {
     "(2) Pelunasan dibayarkan di hari pertama pelayanan.\n" +
     "(3) Tambahan overtime, reimburse parkir, atau biaya lain yang terjadi (jika ada), " +
     "dibayarkan maksimal H+2 dari selesai kegiatan",
-  // Same tiers as computeCancellationPenalty (orders/cancellation-policy.ts) and the DP caption.
-  cancellation:
-    "Cancellation policy:\n" +
-    "Cancel sebelum hari H = 20% dari total pesanan (DP hangus).\n" +
-    "Cancel hari H sebelum pukul 10.00 WIB (perjalanan belum dimulai) = 50% dari total pesanan.\n" +
-    "Cancel setelahnya = 100% dari total pesanan.",
+  // The one policy text (orders/cancellation-policy.ts), same as the WhatsApp
+  // captions and dayCancellation.
+  cancellation: "Cancellation policy:\n" + CANCELLATION_POLICY_TEXT,
   thankYou: "THANK YOU FOR YOUR BUSINESS!",
 };
 
