@@ -27,7 +27,7 @@ What is covered (about 420 checks):
 | G | DP/settlement/full rules, one receipt per payment (also on a double click), two invoices paid at once, pay vs revise at once, money kept after a cancellation (also on the statement), kwitansi PDF, one "lunas" push, invalid dates, overpayment (with the mismatch acknowledgement) and a refund through `/refunds`, the old `mark-refunded` alias bounded by the saldo lebih |
 | H | website leads: idempotent intake, honeypot, sendBeacon, lead code as order code |
 | I | partner days: allowed before DP, VENDOR payable, WhatsApp confirmation links |
-| J | phone clock clamp, XOPS billing, day-H cancellation, the 10:00 WIB boundary (10:00:00.000 is already 100%, checked on the built rule), old open trips ("Belum ditutup") |
+| J | phone clock clamp, XOPS billing, day-H cancellation, the 10:00 WIB boundary (10:00:00.000 is already 100%, checked on the built rule; the invoice PDF and WhatsApp caption say "sebelum pukul 10.00 WIB", Q25), old open trips ("Belum ditutup") |
 | K | input limits: GPS pairs, file type/size, `client_ref` reuse, push tokens, unassigning |
 | L | admin notification feed (one per real driver action, resends add none; TRIP_COST for receipts; per-admin read state, unread count), e-toll requests (idempotent, already_open, done once with push), `location_name`, `etoll_card`, server stamp on checkpoint photos the phone did not stamp |
 | M | trip costs: "Dibayar oleh" decides what the driver is owed, "Ditagih ke pelanggan" only moves the cost to the invoice (pass-through, margin unchanged); admin Biaya Tambahan never touches the payable; `/analytics/dashboard` margin matches the order card |

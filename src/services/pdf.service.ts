@@ -90,11 +90,11 @@ const COMPANY = {
     "(2) Pelunasan dibayarkan di hari pertama pelayanan.\n" +
     "(3) Tambahan overtime, reimburse parkir, atau biaya lain yang terjadi (jika ada), " +
     "dibayarkan maksimal H+2 dari selesai kegiatan",
-  // Same tiers as computeCancellationPenalty (orders.service) and the DP caption.
+  // Same tiers as computeCancellationPenalty (orders/cancellation-policy.ts) and the DP caption.
   cancellation:
     "Cancellation policy:\n" +
     "Cancel sebelum hari H = 20% dari total pesanan (DP hangus).\n" +
-    "Cancel hari H s.d. pukul 10.00 WIB (perjalanan belum dimulai) = 50% dari total pesanan.\n" +
+    "Cancel hari H sebelum pukul 10.00 WIB (perjalanan belum dimulai) = 50% dari total pesanan.\n" +
     "Cancel setelahnya = 100% dari total pesanan.",
   thankYou: "THANK YOU FOR YOUR BUSINESS!",
 };

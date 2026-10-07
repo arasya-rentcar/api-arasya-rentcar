@@ -141,7 +141,7 @@ const BANK_BLOCK = [
 const CONTACT_LINE = "Info & konfirmasi: WhatsApp 0821-2402-4281 (Arasya Rent Car)";
 
 const CANCELLATION_LINE =
-  "Ketentuan pembatalan: sebelum hari H 20%, hari H s.d. pukul 10.00 WIB (perjalanan belum dimulai) 50%, setelahnya 100% dari total pesanan.";
+  "Ketentuan pembatalan: sebelum hari H 20%, hari H sebelum pukul 10.00 WIB (perjalanan belum dimulai) 50%, setelahnya 100% dari total pesanan.";
 
 export interface CaptionCtx {
   duration: string; // formatted trip duration

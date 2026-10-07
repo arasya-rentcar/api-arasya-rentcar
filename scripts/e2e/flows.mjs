@@ -1736,6 +1736,17 @@ await section('Q. Cancelled days, billed totals, DP minimum (B1, B2, B7, B12)', 
   const pct = (n) => `${new Intl.NumberFormat('id-ID', { maximumFractionDigits: 2 }).format(n)}%`;
   check('Q24 invoice overtime % is the published one, not the unpublished edit',
     dp15Pdf.includes(`${pct(pubPct)} dari harga Full day`) && !dp15Pdf.includes(pct(draftPct)), `published ${pct(pubPct)} draft ${pct(draftPct)} found ${/[\d.,]+% dari harga Full day/.exec(dp15Pdf)?.[0]}`);
+
+  // B12 (owner Q1): 10:00:00 WIB is already 100%, so the policy text says
+  // "sebelum pukul 10.00 WIB", not "s.d." (which would include 10:00).
+  const wa15 = dp15.data?.id
+    ? await call('POST', `/orders/${o15.id}/invoice/${dp15.data.id}/send-whatsapp`, { token: admin, body: { target_phone: '081234567890' } })
+    : { status: 0 };
+  const caption15 = wa15.data?.message_text ?? '';
+  check('Q25 [B12] invoice PDF and WhatsApp caption say "hari H sebelum pukul 10.00 WIB" (no "s.d. pukul 10.00")',
+    /Cancel hari H sebelum pukul 10\.00 WIB/.test(dp15Pdf) && !/s\.d\. pukul 10/.test(dp15Pdf) &&
+    wa15.status === 201 && /hari H sebelum pukul 10\.00 WIB/.test(caption15) && !/s\.d\. pukul 10/.test(caption15),
+    `pdf ${/Cancel hari H sebelum pukul 10\.00 WIB/.test(dp15Pdf)} wa ${wa15.status} ${/hari H sebelum pukul 10\.00 WIB/.test(caption15)}`);
 });
 
 // ── R. Order money, lock order, client_ref, GA4 (finance package A1) ───────
