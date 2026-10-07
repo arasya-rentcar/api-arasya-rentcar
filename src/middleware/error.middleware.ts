@@ -22,6 +22,15 @@ export function errorMiddleware(
     return;
   }
 
+  // Malformed JSON body (express.json): a client error. The error carries the
+  // raw body and its message quotes part of it (passwords, names, map
+  // points), so neither is logged.
+  if ((err as { type?: string }).type === 'entity.parse.failed') {
+    logger.warn('Request body is not valid JSON');
+    res.status(400).json({ status: 'error', message: 'Invalid JSON body' });
+    return;
+  }
+
   if (err instanceof MulterError) {
     res.status(err.code === 'LIMIT_FILE_SIZE' ? 413 : 400).json({
       status: 'error',

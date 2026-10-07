@@ -33,7 +33,10 @@ export async function createPublicLeadController(
       await createPublicLead(parsed.data);
     }
   } catch (err) {
-    logger.error({ err }, "web lead intake failed");
+    // A body that is not JSON: the parser's message quotes part of it (name,
+    // map points), so only the fact is logged.
+    if (err instanceof SyntaxError) logger.warn("web lead rejected: body is not JSON");
+    else logger.error({ err }, "web lead intake failed");
   }
   res.status(204).end();
 }
