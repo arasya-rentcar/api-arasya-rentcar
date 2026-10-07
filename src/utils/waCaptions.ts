@@ -229,6 +229,22 @@ export function buildAdditionalInvoiceCaption(c: CaptionCtx): string {
   ].join("\n");
 }
 
+/** "Invoice Penyesuaian": the shortfall of an earlier payment, billed again. */
+export function buildAdjustmentInvoiceCaption(c: CaptionCtx): string {
+  return [
+    `Selamat *${c.greeting}*, Kak. 🙏🏻😃`,
+    "",
+    "Berikut kami kirimkan *Invoice Penyesuaian* untuk kekurangan pembayaran sebelumnya.",
+    "",
+    `Total tagihan: *${formatRp(c.amount ?? c.total)}*`,
+    "",
+    ...BANK_BLOCK,
+    "",
+    CONTACT_LINE,
+    "Terima kasih 🙏🏻😃",
+  ].join("\n");
+}
+
 export function buildRentalReceiptCaption(c: { sameDay: boolean }): string {
   const handover = c.sameDay
     ? "Selanjutnya, reservasi Kakak sudah kami proses. Data tim yang bertugas akan *segera* kami kirimkan."

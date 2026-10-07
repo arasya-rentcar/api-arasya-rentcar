@@ -80,23 +80,24 @@ export async function assertNotLastOpenDay(
 // Owner rule (3 Oct 2026): the trip with the customer begins only when the
 // order is paid in full. The driver may still leave the garage and record the
 // arrival at the pickup; "Mulai perjalanan" (customer on board) is what waits.
-// "In full" = the money received (paid_to_date, which only moves when an
-// invoice is marked paid) covers the rental price of every day that is not
+// "In full" = the money kept (net of refunds, finance design §2 / Q10: money
+// received − refunded) covers the rental price of every day that is not
 // cancelled. Extra charges (overtime, parking/fuel billed to the customer…)
 // arise on the road and are billed afterwards (Invoice Tambahan), so they do
 // not hold back the next day of a multi-day trip.
 export interface StartPayment {
   rental_total: number;
+  /** Net money kept (received − refunded); the name is kept for older clients. */
   paid_to_date: number;
   ready: boolean;
 }
 
 export function startPayment(
-  order: { paid_to_date: unknown },
+  order: { paid_to_date: unknown; refunded_total?: unknown },
   lines: { total_price: unknown; line_status: string }[],
 ): StartPayment {
   const rental_total = rentalBaseOf(lines);
-  const paid_to_date = Number(order.paid_to_date ?? 0);
+  const paid_to_date = netPaid(order);
   return { rental_total, paid_to_date, ready: paid_to_date >= rental_total };
 }
 
@@ -111,6 +112,7 @@ export function assertOrderPaidForTripStart(state: StartPayment): void {
 /** Prisma select for what startPayment needs from an order. */
 export const startPaymentSelect = {
   paid_to_date: true,
+  refunded_total: true,
   service_items: { select: { total_price: true, line_status: true } },
 } as const;
 
@@ -153,13 +155,24 @@ export function minDpFor(rentalBase: number): number {
   return Math.round(rentalBase * 0.2);
 }
 
-/** Money the customer has paid and Arasya kept (a refund settled is given back). */
+/**
+ * Money the customer has paid and Arasya kept: received − refunded (finance
+ * design §2, "Net"). refunded_total is the sum of every refund (A1 ledger);
+ * callers that did not select it fall back to the old single-refund columns,
+ * which the refund paths keep equal to it (cumulative).
+ */
 export function netPaid(order: {
   paid_to_date: unknown;
+  refunded_total?: unknown;
   is_refunded?: boolean | null;
   refund_amount?: unknown;
 }): number {
-  const refunded = order.is_refunded ? Number(order.refund_amount ?? 0) : 0;
+  const refunded =
+    order.refunded_total !== undefined && order.refunded_total !== null
+      ? Number(order.refunded_total)
+      : order.is_refunded
+        ? Number(order.refund_amount ?? 0)
+        : 0;
   return Number(order.paid_to_date ?? 0) - refunded;
 }
 
@@ -188,6 +201,7 @@ export interface PaymentOrder {
   final_price: unknown;
   paid_to_date: unknown;
   payment_status: string;
+  refunded_total?: unknown;
   is_refunded?: boolean | null;
   refund_amount?: unknown;
   cancellation_fee?: unknown;
@@ -198,6 +212,7 @@ export const paymentOrderSelect = {
   final_price: true,
   paid_to_date: true,
   payment_status: true,
+  refunded_total: true,
   is_refunded: true,
   refund_amount: true,
   cancellation_fee: true,

@@ -12,7 +12,7 @@ import {
   startPayment,
   startPaymentSelect,
 } from '../orders/assignment-guard';
-import { billedSoFar } from '../orders/order-money';
+import { moneyState, settleCredit } from '../orders/order-money';
 import { rupiah } from '../../services/adminNotify';
 import { MARGIN_FORMULA_VERSION } from '../../utils/margin';
 import { staleTripCutoff } from '../../utils/wib';
@@ -68,6 +68,7 @@ function withStartReady<
   T extends {
     order: {
       paid_to_date: unknown;
+      refunded_total?: unknown;
       service_items: { total_price: unknown; line_status: string }[];
     };
   },
@@ -467,6 +468,9 @@ export async function assignScheduleLine(
       where: { id: line.order_id },
       select: { final_price: true },
     });
+    // What money already covers plus what open invoices ask (finance design
+    // §2), read before the rollup can release any of it: the B1.3 baseline.
+    const moneyBefore = await moneyState(tx, line.order_id);
     // Costs, margin and the payable follow the day; then the order totals.
     await recomputeLineMoney(tx, id);
     await rollupOrderFinance(tx, line.order_id);
@@ -490,14 +494,17 @@ export async function assignScheduleLine(
     // B1.3 (owner, 6 Oct 2026): a change here that lowers the order total
     // (a day cancelled) must not leave it below what is already billed, the
     // same rule as Edit Order. The admin revises or cancels the unpaid
-    // invoice first.
+    // invoice first. Rule set v3: "billed" = Covered + OpenBilled (money that
+    // already settles part of the total plus unpaid invoices), so a shortfall
+    // or saldo lebih is not counted as billed. A day of an order paid in full
+    // stays refused until per-day cancellation fees exist (finance A3).
     const totals = await tx.order.findUniqueOrThrow({
       where: { id: line.order_id },
       select: { final_price: true },
     });
     const newTotal = Number(totals.final_price);
     if (toSen(newTotal) < toSen(before.final_price)) {
-      const billed = await billedSoFar(line.order_id, undefined, tx);
+      const billed = moneyBefore ? (moneyBefore.covered + moneyBefore.open) / 100 : 0;
       if (toSen(newTotal) < toSen(billed)) {
         throw new AppError(
           `Total order akan menjadi ${rupiah(newTotal)}, di bawah invoice yang sudah terbit (${rupiah(billed)}). Revisi atau batalkan invoice yang belum dibayar dulu.`,
@@ -571,6 +578,7 @@ export async function rollupOrderFinance(
       final_price: true,
       paid_to_date: true,
       payment_status: true,
+      refunded_total: true,
       is_refunded: true,
       refund_amount: true,
       cancellation_fee: true,
@@ -669,6 +677,11 @@ export async function rollupOrderFinance(
     update: totals,
     create: { order_id: orderId, ...totals },
   });
+  // INV-5: a total that fell below what money already covers (a billed
+  // charge removed) turns the excess into saldo lebih. The callers that lower
+  // the total on purpose (Edit Hari, Edit Order) refuse that before it
+  // commits (B1.3), so in practice this is a charge deleted after payment.
+  await settleCredit(tx, orderId);
 }
 
 /**

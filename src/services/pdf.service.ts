@@ -53,8 +53,17 @@ export interface InvoiceData {
   // Receipt/Statement: list of received payments (DP / pelunasan), and remaining.
   paymentsReceived?: PaymentReceived[];
   remainingBalance?: number | null;
-  // Sprint 2: refund owed when total received exceeds the ORDER total.
-  refundDue?: number | null;
+  // Receipt/Statement: money given back ("Pengembalian dana …"), each line
+  // shown as a positive amount (it raises what is still owed).
+  refundsMade?: PaymentReceived[];
+  // Receipt: this invoice's own lines under the payments ("Dipotong dari
+  // saldo lebih", "Kekurangan … ditagih lewat invoice penyesuaian", "Masuk
+  // saldo lebih"); amount omitted for a text-only line.
+  receiptLines?: { label: string; amount?: number }[];
+  // Receipt/Statement: saldo lebih left on the order (finance design §8).
+  creditBalance?: number | null;
+  // Invoice: saldo lebih deducted from what this invoice asks.
+  creditApplied?: number | null;
   // Force the LUNAS/paid stamp (used by STATEMENT when fully settled).
   showPaidStamp?: boolean;
   // Free-form footer notes shown under the table (pickup/dropoff/inclusions).
@@ -480,28 +489,31 @@ export async function generateInvoicePDF(data: InvoiceData): Promise<Buffer> {
     }
   }
 
-  // Receipt + Statement: payment-received lines as full-width rows under the table.
-  if ((isReceipt || isStatement) && data.paymentsReceived?.length) {
-    y -= 8;
-    for (const p of data.paymentsReceived) {
-      const labelLines = wrapText(
-        p.label,
-        regular,
-        8,
-        jumlahRightX - colDesc - 90,
-      );
-      labelLines.forEach((l, i) => {
-        page.drawText(l, {
-          x: colDesc,
-          y: y - i * 10,
-          size: 8,
-          font: regular,
-          color: rgb(0.3, 0.3, 0.3),
-        });
+  // Receipt + Statement: payment-received lines (negative), refund lines
+  // (money going back, positive) and the invoice's own lines as full-width
+  // rows under the table.
+  const drawMoneyLine = (label: string, amount: string | null) => {
+    const labelLines = wrapText(label, regular, 8, jumlahRightX - colDesc - 90);
+    labelLines.forEach((l, i) => {
+      page.drawText(l, {
+        x: colDesc,
+        y: y - i * 10,
+        size: 8,
+        font: regular,
+        color: rgb(0.3, 0.3, 0.3),
       });
-      drawRightAt(formatRp(-Math.abs(p.amount)), jumlahRightX, y, 8, regular);
-      y -= Math.max(13, labelLines.length * 10 + 2);
-    }
+    });
+    if (amount != null) drawRightAt(amount, jumlahRightX, y, 8, regular);
+    y -= Math.max(13, labelLines.length * 10 + 2);
+  };
+  if (isReceipt || isStatement) {
+    const moneyLines = [
+      ...(data.paymentsReceived ?? []).map((p) => ({ label: p.label, amount: formatRp(-Math.abs(p.amount)) })),
+      ...(data.refundsMade ?? []).map((r) => ({ label: r.label, amount: formatRp(Math.abs(r.amount)) })),
+      ...(data.receiptLines ?? []).map((r) => ({ label: r.label, amount: r.amount == null ? null : formatRp(r.amount) })),
+    ];
+    if (moneyLines.length) y -= 8;
+    for (const line of moneyLines) drawMoneyLine(line.label, line.amount);
   }
 
   // ── Right totals box ────────────────────────────────────────────
@@ -530,15 +542,18 @@ export async function generateInvoicePDF(data: InvoiceData): Promise<Buffer> {
       (s, p) => s + Math.abs(p.amount),
       0,
     );
+    const totalRefunded = (data.refundsMade ?? []).reduce((s, r) => s + Math.abs(r.amount), 0);
     drawTotalRow("TOTAL BIAYA PERJALANAN", formatRp(data.finalPrice));
     // Show total received on receipts too (not just statements) so overpayment
     // is visible against the trip total.
     drawTotalRow("TOTAL DIBAYAR", formatRp(totalReceived));
+    if (totalRefunded > 0) drawTotalRow("DIKEMBALIKAN", formatRp(totalRefunded));
+    // Piutang: total − (received − refunded), never below 0.
     const remaining =
       data.remainingBalance != null
         ? data.remainingBalance
-        : Math.max(data.finalPrice - totalReceived, 0);
-    const refundDue = data.refundDue != null ? Number(data.refundDue) : 0;
+        : Math.max(data.finalPrice - (totalReceived - totalRefunded), 0);
+    const credit = data.creditBalance != null ? Number(data.creditBalance) : 0;
     ty -= 4;
     page.drawLine({
       start: { x: totalsLabelX, y: ty + 6 },
@@ -547,10 +562,11 @@ export async function generateInvoicePDF(data: InvoiceData): Promise<Buffer> {
       color: rgb(0.7, 0.7, 0.7),
     });
     drawTotalRow("SISA TAGIHAN", formatRp(remaining), { bold: true });
-    if (refundDue > 0) {
-      // Overpaid past the order total -> refund due (flagged red).
+    if (credit > 0) {
+      // Saldo lebih held for the customer: reduces the next bill or is
+      // refunded (flagged red).
       const rowSize = 9;
-      page.drawText(sanitizeText("KELEBIHAN BAYAR (REFUND)"), {
+      page.drawText(sanitizeText("SALDO LEBIH"), {
         x: totalsLabelX,
         y: ty,
         size: rowSize,
@@ -558,7 +574,7 @@ export async function generateInvoicePDF(data: InvoiceData): Promise<Buffer> {
         color: rgb(0.8, 0.1, 0.1),
       });
       drawRightAt(
-        formatRp(refundDue),
+        formatRp(credit),
         jumlahRightX,
         ty,
         rowSize,
@@ -580,7 +596,13 @@ export async function generateInvoicePDF(data: InvoiceData): Promise<Buffer> {
       });
     };
     const total = data.finalPrice;
-    const dueNow = data.amountPaid; // amount this invoice asks for
+    const dueNow = data.amountPaid; // the part of the total this invoice covers
+    // Saldo lebih taken off what this invoice asks (finance design §8).
+    const credit = data.creditApplied != null ? Number(data.creditApplied) : 0;
+    const creditRow = () => {
+      if (credit > 0) drawTotalRow("Dipotong dari saldo lebih", formatRp(-credit));
+    };
+    const cash = (v: number) => Math.max(v - credit, 0);
 
     if (kind === "DP") {
       // #9: a DP invoice shows the full rental price, the DP being paid now,
@@ -589,8 +611,9 @@ export async function generateInvoicePDF(data: InvoiceData): Promise<Buffer> {
       drawTotalRow("Total Tagihan", formatRp(total));
       drawTotalRow("DP (dibayar sekarang)", formatRp(dueNow));
       drawTotalRow("Sisa Tagihan", formatRp(sisa));
+      creditRow();
       divider();
-      drawTotalRow("TOTAL (dibayar sekarang)", formatRp(dueNow), {
+      drawTotalRow("TOTAL (dibayar sekarang)", formatRp(cash(dueNow)), {
         bold: true,
         size: 11,
       });
@@ -601,19 +624,22 @@ export async function generateInvoicePDF(data: InvoiceData): Promise<Buffer> {
       drawTotalRow("Total Tagihan", formatRp(total));
       drawTotalRow("DP sudah dibayar", formatRp(alreadyPaid));
       drawTotalRow("Sisa harus dibayar", formatRp(sisa));
+      creditRow();
       divider();
-      drawTotalRow("TOTAL", formatRp(sisa), { bold: true, size: 11 });
+      drawTotalRow("TOTAL", formatRp(cash(sisa)), { bold: true, size: 11 });
     } else if (kind === "ADDITIONAL") {
       // Additional invoice bills only the extra charge, not the whole trip.
       drawTotalRow("Total Tambahan", formatRp(dueNow));
+      creditRow();
       divider();
-      drawTotalRow("TOTAL", formatRp(dueNow), { bold: true, size: 11 });
+      drawTotalRow("TOTAL", formatRp(cash(dueNow)), { bold: true, size: 11 });
     } else {
       // FULL / COMBINED: bill the whole amount.
       drawTotalRow("SUBTOTAL", formatRp(total));
       drawTotalRow("LAIN-LAIN", "Rp -");
+      creditRow();
       divider();
-      drawTotalRow("TOTAL", formatRp(total), { bold: true, size: 11 });
+      drawTotalRow("TOTAL", formatRp(cash(total)), { bold: true, size: 11 });
     }
     if (data.dueDate) {
       drawTotalRow("Jatuh tempo", formatDateId(data.dueDate), { size: 8 });

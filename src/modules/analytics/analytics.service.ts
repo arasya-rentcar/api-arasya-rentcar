@@ -872,6 +872,11 @@ export async function revenueReport(opts: RevenueOpts = {}) {
 // Accounting rules (LOCKED — do not change without bumping the rule set):
 // Rule set v2 (2026-10-06): extra charges, cancellation fees and the costs of
 // cancelled days are in; the order card (rollupOrderFinance) uses the same rule.
+// Rule set v3 (2026-10-07, finance A2): CASH counts refunds and OUTSTANDING
+// uses Net (money received − refunded), the same `money` model as GET
+// /orders/:id (order-money.ts); saldo lebih held for customers is shown on
+// its own (customer_credit). ACCRUAL and the order card are unchanged, so
+// MARGIN_FORMULA_VERSION is not bumped.
 //
 //   ACCRUAL
 //     day_revenue   = Σ total_price of days in range (by service_date, WIB)
@@ -899,15 +904,19 @@ export async function revenueReport(opts: RevenueOpts = {}) {
 //     Revenue is the customer price, partner days included (decided 6 Oct 2026);
 //     the partner's RTR is a cost, so the markup shows in the margin.
 //
-//   CASH (basis = payment_date / paid_at WIB in range)
+//   CASH (basis = payment_date / refunded_at / paid_at WIB in range)
 //     collected     = Σ Receipt.amount        (any payment_method)
+//     refunded      = Σ OrderRefund.amount    WHERE refunded_at∈range
 //     paid_out      = Σ Payable.total_amount  WHERE status=PAID AND paid_at∈range
-//     net_cash      = collected − paid_out
+//     net_cash      = collected − refunded − paid_out
+//     (saldo lebih used on an invoice is not cash: it moves nothing)
 //
 //   OUTSTANDING (current snapshot; NOT period-scoped)
-//     ar_outstanding = Σ (Order.final_price − Order.paid_to_date) > 0
+//     ar_outstanding = Σ (Order.final_price − (paid_to_date − refunded_total)) > 0
 //                      WHERE payment_status≠PAID (a cancelled order's
 //                      final_price is its fee, so an unpaid fee is owed)
+//     customer_credit = Σ Order.credit_balance (saldo lebih: money held for
+//                      customers, to use on their next bill or refund)
 //     ap_outstanding = Σ Payable.total_amount WHERE status=UNPAID
 //
 //     Overdue rule (Arasya: due day-1 of service):
@@ -1093,10 +1102,14 @@ async function accrualSlice(
 }
 
 async function cashSlice(start: Date, end: Date) {
-  const [receipts, settledPayables] = await Promise.all([
+  const [receipts, refunds, settledPayables] = await Promise.all([
     prisma.receipt.aggregate({
       _sum: { amount: true },
       where: { payment_date: { gte: start, lte: end } },
+    }),
+    prisma.orderRefund.aggregate({
+      _sum: { amount: true },
+      where: { refunded_at: { gte: start, lte: end } },
     }),
     prisma.payable.aggregate({
       _sum: { total_amount: true },
@@ -1104,8 +1117,9 @@ async function cashSlice(start: Date, end: Date) {
     }),
   ]);
   const collected = n(receipts._sum.amount);
+  const refunded = n(refunds._sum.amount);
   const paid_out = n(settledPayables._sum.total_amount);
-  return { collected, paid_out, net_cash: collected - paid_out };
+  return { collected, refunded, paid_out, net_cash: collected - refunded - paid_out };
 }
 
 // Per-channel accrual (internal vs vendor) for the Channel Split panel.
@@ -1174,6 +1188,7 @@ async function outstandingSnapshot() {
       customer_name: true,
       final_price: true,
       paid_to_date: true,
+      refunded_total: true,
       order_date: true,
       cancelled_at: true,
       service_items: {
@@ -1190,7 +1205,8 @@ async function outstandingSnapshot() {
   };
   const arOverdue: AROverdue[] = [];
   for (const o of arOrders) {
-    const due = n(o.final_price) - n(o.paid_to_date);
+    // Piutang on Net: money refunded is owed again.
+    const due = n(o.final_price) - (n(o.paid_to_date) - n(o.refunded_total));
     if (due <= 0) continue;
     ar_outstanding += due;
     // Earliest service line determines the due date (Arasya: due day-1); a
@@ -1251,8 +1267,12 @@ async function outstandingSnapshot() {
   }
   apOverdue.sort((a, b) => b.amount * (b.days_overdue + 1) - a.amount * (a.days_overdue + 1));
 
+  // Saldo lebih held for customers (not piutang, not revenue).
+  const credit = await prisma.order.aggregate({ _sum: { credit_balance: true } });
+
   return {
     ar_outstanding,
+    customer_credit: n(credit._sum.credit_balance),
     ap_outstanding,
     ar_overdue_count: arOverdue.length,
     ap_overdue_count: apOverdue.length,

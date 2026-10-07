@@ -24,13 +24,24 @@ import { attachLeadToOrder } from "../leads/leads.service";
 import { notifyNewTrips, notifyTripsChanged, notifyTripsRemoved } from "../../services/tripNotify";
 import { defaultDriverFee } from "../../utils/driverFee";
 import { computeMargin, MARGIN_FORMULA_VERSION } from "../../utils/margin";
+import { computeCancellationPenalty } from "./cancellation-policy";
 import { recomputeLineMoney } from "../schedule/line-money.service";
 import { rollupOrderFinance } from "../schedule/schedule.service";
 import { assertUnitsFree, lockUnits } from "../schedule/availability";
 import { nextOrderCode } from "../../utils/codes";
 import { wibShortDay } from "../../utils/wib";
-import { buildCancellationFeePdf, cancellationLogValue } from "../invoices/invoices.service";
-import { computeOrderMoney, lockOrder, lockOrderDays, setLegacyRefundCredit } from "./order-money";
+import { buildCancellationFeePdf, cancellationLogValue, invoiceView } from "../invoices/invoices.service";
+import { rupiah } from "../../services/adminNotify";
+import {
+  addCreditEntry,
+  computeOrderMoney,
+  lockOrder,
+  lockOrderDays,
+  moneyState,
+  recomputePaymentStatus,
+  rp,
+  sen,
+} from "./order-money";
 import {
   deriveAndSetOrderStatus,
   refreshCarStatuses,
@@ -780,9 +791,11 @@ export async function getOrderById(id: string) {
   });
 
   if (!order) throw new AppError("Order not found", 404);
-  const { refunds, credit_entries, ...rest } = order;
+  const { refunds, credit_entries, invoices, ...rest } = order;
   return {
     ...rest,
+    // Per invoice also: gross (cash asked + saldo lebih used) and shortfall.
+    invoices: invoices.map(invoiceView),
     // Paid in full = trips may start (driver app "Berangkat"); see startPayment.
     // Kept for older clients; `money` carries the same numbers.
     start_payment: startPayment(order, order.service_items),
@@ -1156,6 +1169,11 @@ export async function updateOrder(id: string, input: UpdateOrderInput) {
         },
       });
 
+      // What money already covers plus what open invoices ask (rule set v3),
+      // under the order lock the update above took and before the rollup
+      // can release any of it: the baseline of the price check below.
+      const moneyBefore = await moneyState(tx, id);
+
       if (days) {
         // A day this request did not know about (another tab, or the same
         // save sent twice) was added meanwhile: refuse rather than add a
@@ -1212,12 +1230,11 @@ export async function updateOrder(id: string, input: UpdateOrderInput) {
         Math.round(Number(after.final_price) * 100) !==
         Math.round(Number(order.final_price) * 100);
       if (pricesChanged) {
-        const active = await tx.invoice.aggregate({
-          where: { order_id: id, status: { notIn: ["REVISED", "CANCELLED"] } },
-          _sum: { amount: true },
-        });
-        const invoicedTotal = Number(active._sum.amount ?? 0);
-        if (Number(after.final_price) < invoicedTotal) {
+        // The total may not drop below what is paid toward it (Covered) plus
+        // what open invoices ask (INV-6). A shortfall or saldo lebih is not
+        // "billed". Lowering a paid price waits for per-day fees (A3).
+        const invoicedTotal = moneyBefore ? rp(moneyBefore.covered + moneyBefore.open) : 0;
+        if (sen(after.final_price) < sen(invoicedTotal)) {
           throw new AppError(
             `final_price cannot be lower than active invoice total (${invoicedTotal}). Revise/cancel invoices first.`,
             409,
@@ -1689,78 +1706,163 @@ export async function finalizeOrder(orderId: string, actor?: string) {
   );
 }
 
-// Sprint 5: how much refund the order owes the customer = money received beyond
-// the order total. paid_to_date holds actual money received (Sprint 2).
-export function computeRefundDue(order: {
-  paid_to_date: unknown;
-  final_price: unknown;
-}): number {
-  const paid = Number(order.paid_to_date ?? 0);
-  const total = Number(order.final_price ?? 0);
-  return Math.max(paid - total, 0);
-}
-
-// Sprint 5: mark an order's refund as settled. A refund proof file is REQUIRED
-// (cash-flow must be evidenced, per Ten). Idempotent-safe: re-marking updates
-// the proof/amount/note. Refund amount is derived live (paid_to_date - total)
-// unless explicitly provided.
-export async function markOrderRefunded(
+/**
+ * Refunds (finance design §3.5, owner decision 7 Oct 2026): several per
+ * order, each at most the saldo lebih (INV-7, checked under the order lock).
+ * One transaction writes the refund row, its REFUND credit entry,
+ * refunded_total and the old single-refund columns (is_refunded,
+ * refund_amount = the cumulative total, refunded_at / refund_proof_url /
+ * refund_note = the latest), then recomputes payment_status on Net.
+ * Refunding credit while the customer still owes (a prepayment) is allowed;
+ * outstanding_after tells the admin the piutang it leaves.
+ *
+ * `amount` undefined = the whole saldo lebih (the old endpoint's default).
+ * `created` is false when the client_ref already made this refund.
+ */
+async function recordRefund(
   orderId: string,
-  input: { note?: string; amount?: number; proof?: UploadedFile },
+  input: { amount?: number; note?: string; clientRef?: string; proof?: UploadedFile; actor?: string },
 ) {
   const proofFile = assertValidUpload(input.proof);
-  const order = await prisma.order.findUnique({ where: { id: orderId } });
-  if (!order) throw new AppError("Order not found", 404);
+  const byRef = async (db: Prisma.TransactionClient | typeof prisma) => {
+    if (!input.clientRef) return null;
+    const seen = await db.orderRefund.findUnique({ where: { client_ref: input.clientRef } });
+    if (seen && seen.order_id !== orderId) throw new AppError("client_ref sudah dipakai untuk order lain.", 409);
+    return seen;
+  };
+  const replay = await byRef(prisma);
+  if (replay) return { refund: replay, created: false };
 
-  const refundDue = computeRefundDue(order);
-  const amount = input.amount != null ? input.amount : refundDue;
+  const before = await moneyState(prisma, orderId);
+  if (!before) throw new AppError("Order not found", 404);
+  // The amount is fixed here (what the admin confirmed), then bounded again
+  // by the saldo lebih under the lock: a double submit cannot refund twice.
+  const amount = input.amount != null ? sen(input.amount) : before.credit;
   if (amount <= 0) {
     throw new AppError(
-      "No refund is due on this order (paid amount does not exceed the order total).",
+      "Tidak ada saldo lebih untuk dikembalikan di order ini (No refund is due on this order).",
       400,
     );
   }
+  const tooMuch = (credit: number) =>
+    new AppError(
+      `Pengembalian ${rupiah(rp(amount))} melebihi saldo lebih. Saldo lebih tinggal ${rupiah(rp(credit))}.`,
+      409,
+      { credit_balance: rp(credit) },
+    );
+  if (amount > before.credit) throw tooMuch(before.credit);
 
   const proofUpload = await uploadFile(proofFile, {
     bucket: PAYMENT_PROOFS_BUCKET,
     prefix: `refunds/${orderId}`,
   });
-
   const refundedAt = new Date();
-  return prisma.$transaction(async (tx) => {
-    // B9 lock order (order-money.ts): the order row.
-    await lockOrder(tx, orderId);
-    await tx.order.update({
-      where: { id: orderId },
-      data: {
-        is_refunded: true,
-        refunded_at: refundedAt,
-        refund_amount: amount,
-        refund_proof_url: proofUpload.path,
-        refund_note: input.note ?? null,
-        // The ledger mirror of this single (overwritten) refund, like the A1
-        // migration: refunded_total = Σ order_refunds, one 'legacy-' row.
-        refunded_total: amount,
-      },
-    });
-    const legacy = {
-      amount,
-      refunded_at: refundedAt,
-      proof_url: proofUpload.path,
-      note: input.note ?? null,
-    };
-    const refund = await tx.orderRefund.upsert({
-      where: { client_ref: `legacy-${orderId}` },
-      create: { order_id: orderId, client_ref: `legacy-${orderId}`, created_by: "ADMIN", ...legacy },
-      update: legacy,
-    });
-    // Money given back comes out of the saldo lebih first (INV-2).
-    await setLegacyRefundCredit(tx, orderId, refund.id, amount);
-    return tx.order.findUniqueOrThrow({ where: { id: orderId } });
-  }, { maxWait: 15000, timeout: 20000 });
+  try {
+    return await prisma.$transaction(async (tx) => {
+      // B9 lock order (order-money.ts): the order row; the refund and its
+      // credit entry are inserts.
+      await lockOrder(tx, orderId);
+      const seen = await byRef(tx);
+      if (seen) return { refund: seen, created: false };
+      const m = await moneyState(tx, orderId);
+      if (!m) throw new AppError("Order not found", 404);
+      if (amount > m.credit) throw tooMuch(m.credit);
+      const refund = await tx.orderRefund.create({
+        data: {
+          order_id: orderId,
+          amount: rp(amount),
+          refunded_at: refundedAt,
+          proof_url: proofUpload.path,
+          note: input.note ?? null,
+          client_ref: input.clientRef ?? null,
+          created_by: input.actor ?? "ADMIN",
+        },
+      });
+      await addCreditEntry(tx, {
+        orderId,
+        kind: "REFUND",
+        amount: -rp(amount),
+        refundId: refund.id,
+        note: input.note ? `Pengembalian dana: ${input.note}` : "Pengembalian dana",
+        actor: input.actor ?? "ADMIN",
+      });
+      const refundedTotal = rp(m.refunded + amount);
+      await tx.order.update({
+        where: { id: orderId },
+        data: {
+          refunded_total: refundedTotal,
+          // The old single-refund columns, for older clients: the total so
+          // far and the latest refund.
+          is_refunded: true,
+          refund_amount: refundedTotal,
+          refunded_at: refundedAt,
+          refund_proof_url: proofUpload.path,
+          refund_note: input.note ?? null,
+        },
+      });
+      // INV-9: Net fell, so the status may too (a prepayment refunded).
+      await recomputePaymentStatus(tx, orderId);
+      return { refund, created: true };
+    }, { maxWait: 15000, timeout: 20000 });
+  } catch (err) {
+    // Not recorded: the proof must not stay behind in the bucket.
+    void removeFile(PAYMENT_PROOFS_BUCKET, proofUpload.path);
+    if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
+      const seen = await byRef(prisma);
+      if (seen) return { refund: seen, created: false };
+    }
+    throw err;
+  }
 }
 
-// Sprint 5: short-lived signed URL for the (private) refund proof.
+/** The refund as the API returns it: no storage path, only whether there is a proof. */
+const refundView = ({ proof_url, ...r }: { proof_url: string | null } & Record<string, unknown>) => ({
+  ...r,
+  has_proof: !!proof_url,
+});
+
+/**
+ * POST /orders/:id/refunds (multipart: proof, amount, note, client_ref).
+ * 201 { refund, order_money, outstanding_after }; a resend of the same
+ * client_ref → 200 with the same refund and nothing deducted again.
+ */
+export async function createOrderRefund(
+  orderId: string,
+  input: { amount: number; note?: string; client_ref: string; proof?: UploadedFile },
+) {
+  const { refund, created } = await recordRefund(orderId, {
+    amount: input.amount,
+    note: input.note,
+    clientRef: input.client_ref,
+    proof: input.proof,
+  });
+  const money = await computeOrderMoney(prisma, orderId);
+  return {
+    created,
+    data: {
+      refund: refundView(refund),
+      order_money: money,
+      outstanding_after: money?.outstanding ?? 0,
+    },
+  };
+}
+
+/**
+ * The old "refund settled" endpoint (POST /orders/:id/mark-refunded), kept
+ * as an alias for one release so the dashboard in production keeps working:
+ * each call is a new refund, its amount defaults to the whole saldo lebih and
+ * is bounded by it (a second click finds no credit left). Answers the order,
+ * as before.
+ */
+export async function markOrderRefunded(
+  orderId: string,
+  input: { note?: string; amount?: number; proof?: UploadedFile },
+) {
+  await recordRefund(orderId, { amount: input.amount, note: input.note, proof: input.proof });
+  return prisma.order.findUniqueOrThrow({ where: { id: orderId } });
+}
+
+// Sprint 5: short-lived signed URL for the (private) proof of the latest refund.
 export async function getRefundProofUrl(orderId: string) {
   const order = await prisma.order.findUnique({
     where: { id: orderId },
@@ -1777,83 +1879,16 @@ export async function getRefundProofUrl(orderId: string) {
   return { url, expires_in: 3600 };
 }
 
-// ── Jakarta timezone helpers ──────────────────────────────────────────────
-const JAKARTA_OFFSET_MS = 7 * 60 * 60 * 1000;
-
-function jakartaDate(d: Date | number | string): string {
-  return new Date(
-    new Date(d).getTime() + JAKARTA_OFFSET_MS,
-  )
-    .toISOString()
-    .slice(0, 10);
-}
-
-/**
- * Compute the cancellation tier + penalty per Arasya policy. Penalty base is
- * ALWAYS final_price (confirmed with Ten): an order with no invoice yet still
- * incurs the policy %, and the invoice total should equal final_price anyway.
- *
- *  Tier 1 (cancel on any day before H)        → 20% of final_price (DP forfeit)
- *  Tier 2 (H-day, before 10:00, no driver yet) → 50% of final_price
- *  Tier 3 (H-day ≥10:00, driver arrived, or after H) → 100% of final_price
- */
-function computeCancellationPenalty(args: {
-  finalPrice: number;
-  firstServiceDate: Date | null;
-  anyLineStarted: boolean;
-  now: Date;
-}): { tier: 1 | 2 | 3; penalty: number; label: string } {
-  const { finalPrice, firstServiceDate, anyLineStarted, now } = args;
-  // Penalties are in whole rupiah (B12): the fee is billed to the customer.
-  const todayJakarta = jakartaDate(now);
-  const jakartaNow = new Date(now.getTime() + JAKARTA_OFFSET_MS);
-  const jakartaHour = jakartaNow.getUTCHours();
-  const jakartaMin = jakartaNow.getUTCMinutes();
-
-  // No service date at all → treat as early cancel (Tier 1).
-  if (!firstServiceDate) {
-    return {
-      tier: 1,
-      penalty: Math.round(finalPrice * 0.2),
-      label: "Tier 1 (tanpa tanggal layanan) — DP 20% hangus",
-    };
-  }
-
-  const firstDayJakarta = jakartaDate(firstServiceDate);
-
-  if (todayJakarta < firstDayJakarta) {
-    // Cancel on any calendar day before the service date → forfeit DP (20%).
-    return {
-      tier: 1,
-      penalty: Math.round(finalPrice * 0.2),
-      label: "Tier 1 (sebelum hari H) — DP 20% hangus",
-    };
-  }
-
-  if (todayJakarta === firstDayJakarta) {
-    const before10 =
-      jakartaHour < 10 || (jakartaHour === 10 && jakartaMin === 0);
-    if (before10 && !anyLineStarted) {
-      return {
-        tier: 2,
-        penalty: Math.round(finalPrice * 0.5),
-        label: "Tier 2 (hari H sebelum pukul 10.00) — 50% dari total",
-      };
-    }
-    return {
-      tier: 3,
-      penalty: Math.round(finalPrice),
-      label:
-        "Tier 3 (hari H setelah pukul 10.00 / driver tiba) — 100% dari total",
-    };
-  }
-
-  // Cancel after the first service day has passed → 100%.
-  return {
-    tier: 3,
-    penalty: Math.round(finalPrice),
-    label: "Tier 3 (setelah hari H) — 100% dari total",
-  };
+/** GET /orders/:id/refunds/:refundId/proof: a fresh 5-minute signed URL per click. */
+export async function getOrderRefundProofUrl(orderId: string, refundId: string) {
+  const refund = await prisma.orderRefund.findUnique({
+    where: { id: refundId },
+    select: { order_id: true, proof_url: true },
+  });
+  if (!refund || refund.order_id !== orderId) throw new AppError("Refund not found", 404);
+  if (!refund.proof_url) throw new AppError("No proof on file for this refund", 404);
+  const url = await getSignedUrl(PAYMENT_PROOFS_BUCKET, refund.proof_url, 5 * 60);
+  return { url, expires_in: 300 };
 }
 
 /** The tier and penalty of cancelling now, from the order and its days. */
@@ -1901,9 +1936,10 @@ export interface CancelOrderResult {
  * Cancel a full order per Arasya cancellation policy.
  *
  * Non-breaking design (reviewed against existing money flows):
- *  - sets order.final_price = penalty, so the EXISTING refund flow
- *    (computeRefundDue = paid_to_date - final_price) and payment_status
- *    recompute both work with zero special-casing.
+ *  - sets order.final_price = penalty, so payment_status and the money model
+ *    (order-money.ts) work with zero special-casing: saldo lebih goes to the
+ *    fee first, and what the money kept has beyond the penalty is released
+ *    into saldo lebih (the refund due, refunded through /refunds).
  *  - voids active invoices (status → CANCELLED) and DECREMENTS total_billed
  *    by their sum, then issues ONE CANCELLATION_FEE invoice (with a real PDF)
  *    for what is still owed (penalty − money already received; none when the
@@ -2029,7 +2065,7 @@ export async function cancelOrder(
           order_id: orderId,
           status: { notIn: ["REVISED", "CANCELLED"] },
         },
-        select: { id: true, amount: true },
+        select: { id: true, amount: true, status: true, credit_applied: true, invoice_number: true },
       });
       const voidedSum = activeInvoices.reduce(
         (s, inv) => s + Number(inv.amount),
@@ -2041,6 +2077,19 @@ export async function cancelOrder(
           data: { status: "CANCELLED" },
         });
       }
+      // An unpaid invoice voided here gives back the saldo lebih it used
+      // (UNAPPLIED). A paid one keeps it: that credit settled part of the total.
+      for (const inv of activeInvoices) {
+        if (inv.status === "PAID") continue;
+        await addCreditEntry(tx, {
+          orderId,
+          kind: "UNAPPLIED",
+          amount: Number(inv.credit_applied ?? 0),
+          invoiceId: inv.id,
+          note: `Saldo lebih dikembalikan dari ${inv.invoice_number} (dibatalkan bersama pesanan)`,
+          actor: actor ?? "ADMIN",
+        });
+      }
 
       // Money received, read now under the order lock (markInvoicePaid takes it
       // first too), so a payment recorded while the fee PDF was being built is
@@ -2048,7 +2097,7 @@ export async function cancelOrder(
       // let the admin retry.
       const money = await tx.order.findUniqueOrThrow({
         where: { id: orderId },
-        select: { paid_to_date: true, is_refunded: true, refund_amount: true },
+        select: { paid_to_date: true, refunded_total: true, credit_balance: true },
       });
       const paidToDate = Number(money.paid_to_date ?? 0);
       const owed = owedFor(netPaid(money));
@@ -2116,10 +2165,19 @@ export async function cancelOrder(
       // 4) Issue the CANCELLATION_FEE invoice for what is still owed, with its
       //    PDF (penalty − already paid = remaining). Nothing owed → no invoice:
       //    a fee invoice over money already received would be paid twice.
+      // Saldo lebih goes to the fee first (finance design §3.2): the fee is
+      // asked net of all money kept (owed = penalty − Net), so the credit
+      // that is part of Net is used for it (APPLIED), and only what Net has
+      // beyond the penalty stays saldo lebih (the refund due). A credit below
+      // that is topped up by the rollup below (settleCredit, RELEASE).
+      const netSen = sen(netPaid(money));
+      const creditSen = sen(money.credit_balance);
+      const creditUsed = Math.max(0, creditSen - Math.max(0, netSen - sen(penalty)));
       let cancellationInvoiceNumber: string | null = null;
       let invoiced = 0;
+      let feeInvoiceId: string | undefined;
       if (prepared && order.customer && owed > 0) {
-        await tx.invoice.create({
+        const fee = await tx.invoice.create({
           data: {
             order_id: orderId,
             invoice_number: prepared.invoiceNumber,
@@ -2131,11 +2189,23 @@ export async function cancelOrder(
             note: `${reason}\n${label}`,
             file_url: prepared.fileUrl,
             status: "ISSUED",
+            credit_applied: rp(creditUsed),
           },
         });
+        feeInvoiceId = fee.id;
         cancellationInvoiceNumber = prepared.invoiceNumber;
         invoiced = owed;
       }
+      await addCreditEntry(tx, {
+        orderId,
+        kind: "APPLIED",
+        amount: -rp(creditUsed),
+        invoiceId: feeInvoiceId,
+        note: cancellationInvoiceNumber
+          ? `Dipotong dari saldo lebih untuk biaya pembatalan ${cancellationInvoiceNumber}`
+          : "Dipakai untuk biaya pembatalan",
+        actor: actor ?? "ADMIN",
+      });
 
       // 5) Keep total_billed = sum(active invoices): remove voided, add the new one.
       if (order.customer) {
@@ -2171,6 +2241,8 @@ export async function cancelOrder(
           cancellation_reason: reason,
         },
       });
+      // The rollup also releases what Net has beyond the penalty into saldo
+      // lebih (settleCredit, INV-5): the refund due below.
       await rollupOrderFinance(tx, orderId);
 
       // 7) Audit log (preserve the original price).

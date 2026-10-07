@@ -7,7 +7,17 @@ import {
   rentalBaseOf,
   startPayment,
 } from "../orders/assignment-guard";
-import { addCreditEntry, billedSoFar, lockOrder } from "../orders/order-money";
+import {
+  addCreditEntry,
+  computeOrderMoney,
+  lockOrder,
+  moneyState,
+  rp,
+  sen,
+  settleCredit,
+  type MoneyState,
+} from "../orders/order-money";
+import { rupiah } from "../../services/adminNotify";
 import { notifyOrderPaidInFull } from "../../services/driverNotify";
 import { reportLeadPurchase, sendsNoPurchase } from "../../services/ga4.service";
 import { Prisma, type Invoice } from "@prisma/client";
@@ -20,6 +30,7 @@ import {
   buildDpInvoiceCaption,
   buildSettlementInvoiceCaption,
   buildAdditionalInvoiceCaption,
+  buildAdjustmentInvoiceCaption,
   buildRentalReceiptCaption,
   buildAdditionalReceiptCaption,
   formatTripDuration,
@@ -63,6 +74,7 @@ const INVOICE_TYPE_LABEL: Record<string, string> = {
   FULL: "Full Payment",
   ADDITIONAL: "Additional Charge",
   COMBINED: "Rental + Additional (Combined)",
+  ADJUSTMENT: "Invoice Penyesuaian",
 };
 const PAYMENT_METHOD_LABEL: Record<string, string> = {
   CASH: "Cash",
@@ -75,7 +87,25 @@ const PAYMENT_RECEIVED_LABEL: Record<string, string> = {
   SETTLEMENT: "Pelunasan diterima",
   FULL: "Pembayaran diterima",
   ADDITIONAL: "Pembayaran tambahan diterima",
+  ADJUSTMENT: "Pembayaran kekurangan diterima",
 };
+
+/** The part of the order total an invoice covers: cash asked + saldo lebih used. */
+export const grossOf = (inv: { amount: unknown; credit_applied?: unknown }) =>
+  rp(sen(inv.amount) + sen(inv.credit_applied));
+
+/** Money short on a paid invoice (asked − received), 0 when none. */
+export const shortfallOf = (inv: { status: string; amount: unknown; amount_received?: unknown }) =>
+  inv.status === "PAID" && inv.amount_received != null
+    ? rp(Math.max(0, sen(inv.amount) - sen(inv.amount_received)))
+    : 0;
+
+/** An invoice as the API returns it: the stored row plus its gross and shortfall. */
+export const invoiceView = <T extends { status: string; amount: unknown; credit_applied?: unknown; amount_received?: unknown }>(inv: T) => ({
+  ...inv,
+  gross: grossOf(inv),
+  shortfall: shortfallOf(inv),
+});
 
 /** "3 Oktober 2026" in WIB. */
 function fmtLongWibDate(d: Date): string {
@@ -355,42 +385,91 @@ function assertDpAmount(amount: number, rentalBase: number): void {
 }
 
 /** What the invoice caps are checked against: read before the PDF, and again under the order lock. */
-async function invoiceCapState(db: Prisma.TransactionClient | typeof prisma, orderId: string) {
-  const [order, billed, activeCombined] = await Promise.all([
-    db.order.findUniqueOrThrow({
-      where: { id: orderId },
-      select: {
-        final_price: true,
-        service_items: { select: { total_price: true, line_status: true } },
-      },
-    }),
-    billedSoFar(orderId, undefined, db),
+async function invoiceCapState(
+  db: Prisma.TransactionClient | typeof prisma,
+  orderId: string,
+  opts: { excludeInvoiceId?: string; adjustsInvoiceId?: string | null } = {},
+) {
+  const [m, days, activeCombined, adjusted] = await Promise.all([
+    moneyState(db, orderId, { excludeInvoiceId: opts.excludeInvoiceId }),
+    db.orderServiceItem.findMany({ where: { order_id: orderId }, select: { total_price: true, line_status: true } }),
     db.invoice.count({
       where: {
         order_id: orderId,
         invoice_type: "COMBINED",
         status: { notIn: ["REVISED", "CANCELLED"] },
+        ...(opts.excludeInvoiceId ? { id: { not: opts.excludeInvoiceId } } : {}),
       },
     }),
+    opts.adjustsInvoiceId
+      ? db.invoice.findUnique({
+          where: { id: opts.adjustsInvoiceId },
+          select: {
+            id: true,
+            order_id: true,
+            invoice_number: true,
+            status: true,
+            amount: true,
+            amount_received: true,
+            adjusted_by: {
+              where: {
+                status: { notIn: ["REVISED", "CANCELLED"] },
+                ...(opts.excludeInvoiceId ? { id: { not: opts.excludeInvoiceId } } : {}),
+              },
+              select: { amount: true, credit_applied: true },
+            },
+          },
+        })
+      : Promise.resolve(null),
   ]);
+  if (!m) throw new AppError("Order not found", 404);
   return {
-    finalPrice: Number(order.final_price),
-    rentalBase: rentalBaseOf(order.service_items),
-    alreadyInvoiced: billed,
+    money: m,
+    rentalBase: rentalBaseOf(days),
     hasActiveCombined: activeCombined > 0,
+    adjusted,
   };
 }
+type CapState = Awaited<ReturnType<typeof invoiceCapState>>;
 
-/** The rules a new invoice must pass (unchanged by B8, now also checked under the lock). */
+/**
+ * The most an ADJUSTMENT invoice for `adjusted` may cover (sen): that
+ * invoice's shortfall less what other active adjustments of it already bill.
+ * Refused when it is not a paid, underpaid invoice of this order.
+ */
+function adjustmentRoom(orderId: string, adjusted: CapState["adjusted"]): number {
+  if (!adjusted || adjusted.order_id !== orderId)
+    throw new AppError("Invoice yang disesuaikan tidak ditemukan di order ini.", 404);
+  const short =
+    adjusted.status === "PAID" && adjusted.amount_received != null
+      ? sen(adjusted.amount) - sen(adjusted.amount_received)
+      : 0;
+  if (short <= 0)
+    throw new AppError(
+      `Invoice ${adjusted.invoice_number} tidak kurang bayar, jadi tidak ada yang ditagih lewat invoice penyesuaian.`,
+      409,
+    );
+  const billed = adjusted.adjusted_by.reduce((s, a) => s + sen(a.amount) + sen(a.credit_applied), 0);
+  return short - billed;
+}
+
+/**
+ * The rules a new invoice must pass (B8: also checked under the lock).
+ * Finance design §5.7: the amount is the gross, capped by Billable (T −
+ * Covered − OpenBilled, INV-6); the DP rule checks the gross.
+ */
 function assertNewInvoiceAllowed(
-  input: GenerateInvoiceInput,
-  state: Awaited<ReturnType<typeof invoiceCapState>>,
+  orderId: string,
+  input: Pick<GenerateInvoiceInput, "invoice_type" | "amount">,
+  state: CapState,
 ): void {
-  const { finalPrice, rentalBase, alreadyInvoiced } = state;
-  const remaining = finalPrice - alreadyInvoiced;
+  const { money: m, rentalBase } = state;
+  const gross = sen(input.amount);
+  // Already paid toward the total, or billed and not paid yet.
+  const alreadyBilled = m.covered + m.open;
 
   // Validate: FULL invoice requires no previous payments
-  if (input.invoice_type === "FULL" && alreadyInvoiced > 0) {
+  if (input.invoice_type === "FULL" && alreadyBilled > 0) {
     throw new AppError(
       "Cannot generate FULL invoice when partial payments already exist",
       409,
@@ -399,14 +478,14 @@ function assertNewInvoiceAllowed(
 
   // COMBINED bills rental + all billable additionals as one invoice, so like FULL
   // it must be the only/first active invoice on the order.
-  if (input.invoice_type === "COMBINED" && alreadyInvoiced > 0) {
+  if (input.invoice_type === "COMBINED" && alreadyBilled > 0) {
     throw new AppError(
       "Cannot generate a Combined invoice when other active invoices already exist",
       409,
     );
   }
 
-  // Prevent double-billing: a separate ADDITIONAL invoice can't coexist with an
+  // Prevent double-billing: a separate ADDITIONAL invoice cannot coexist with an
   // active COMBINED invoice (which already includes the additionals), and vice-versa.
   if (input.invoice_type === "ADDITIONAL" && state.hasActiveCombined) {
     throw new AppError(
@@ -416,7 +495,7 @@ function assertNewInvoiceAllowed(
   }
 
   // Validate: SETTLEMENT requires a previous DP
-  if (input.invoice_type === "SETTLEMENT" && alreadyInvoiced === 0) {
+  if (input.invoice_type === "SETTLEMENT" && alreadyBilled <= 0) {
     throw new AppError(
       "Cannot generate SETTLEMENT invoice without a prior DP payment",
       409,
@@ -425,15 +504,32 @@ function assertNewInvoiceAllowed(
 
   if (input.invoice_type === "DP") assertDpAmount(input.amount, rentalBase);
 
-  // Guard: active invoice total must never exceed order.final_price.
+  // An ADJUSTMENT bills a shortfall again: allowed below the DP minimum (it
+  // is not a DP), but never more than that invoice is still short.
+  if (input.invoice_type === "ADJUSTMENT") {
+    const room = adjustmentRoom(orderId, state.adjusted);
+    if (gross > room) {
+      throw new AppError(
+        `Invoice penyesuaian (${rupiah(rp(gross))}) melebihi kekurangan ${state.adjusted!.invoice_number} yang belum ditagih (${rupiah(rp(Math.max(0, room)))}).`,
+        409,
+      );
+    }
+  }
+
+  // Guard: never bill past the order total (INV-6: Covered + Open ≤ T).
   // Extra charges should update the order final_price first, then create an invoice.
-  if (input.amount > remaining) {
+  if (gross > m.billable) {
     throw new AppError(
-      `Amount (${input.amount}) exceeds remaining balance (${remaining}). Order total: ${finalPrice}, already invoiced: ${alreadyInvoiced}`,
+      `Amount (${input.amount}) exceeds remaining balance (${rp(Math.max(0, m.billable))}). Order total: ${rp(m.total)}, already paid or invoiced: ${rp(alreadyBilled)}`,
       409,
+      { billable_remaining: rp(Math.max(0, m.billable)) },
     );
   }
 }
+
+/** Saldo lebih (sen) an invoice of `gross` uses: all it can, when asked. */
+const creditToApply = (applyCredit: boolean, m: MoneyState, gross: number) =>
+  applyCredit ? Math.max(0, Math.min(m.credit, gross)) : 0;
 
 /**
  * B8: the invoice a client_ref already made on this order (a resend), or
@@ -456,10 +552,52 @@ const isClientRefConflict = (err: unknown) =>
   err.code === "P2002" &&
   String((err.meta as { target?: unknown } | undefined)?.target ?? "").includes("client_ref");
 
+/** The PDF printed one saldo lebih amount; the ledger moved before the save. */
+const CREDIT_CHANGED =
+  "Saldo lebih order ini baru saja berubah saat invoice dibuat. Muat ulang halaman lalu coba lagi.";
+
+/**
+ * An invoice saldo lebih pays in full (cash asked 0, owner decision Q12): it
+ * is PAID at once with amount_received 0 and a receipt of 0, in the caller's
+ * transaction (B9 lock order: the order is already locked; the receipt
+ * counter is the customer row, last). Net does not move, so payment_status
+ * does not either.
+ */
+async function settleFromCredit(
+  tx: Prisma.TransactionClient,
+  inv: Invoice,
+  customer: { id: string; code: string },
+  paidAt: Date,
+): Promise<Invoice> {
+  const paid = await tx.invoice.update({
+    where: { id: inv.id },
+    data: { status: "PAID", paid_at: paidAt, amount_received: 0 },
+  });
+  const { number: receiptNumber, seq: receiptSeq } = await nextReceiptNumber(tx, customer, paidAt);
+  await tx.receipt.create({
+    data: {
+      receipt_number: receiptNumber,
+      invoice_id: inv.id,
+      customer_id: customer.id,
+      customer_seq: receiptSeq,
+      payment_date: paidAt,
+      amount: 0,
+      payment_method: inv.payment_method,
+      note: "Dibayar dari saldo lebih",
+    },
+  });
+  return paid;
+}
+
 /**
  * Issue an invoice. `created` is false when the client_ref was already used
  * on this order: the first invoice is returned and nothing else happens (no
  * second number, no PDF).
+ *
+ * input.amount is the gross (the part of the total this invoice covers). By
+ * default saldo lebih is applied (APPLIED entry) and `amount` stores the cash
+ * asked; an invoice the credit covers in full is created PAID (kwitansi
+ * "Dibayar dari saldo lebih", no GA4).
  */
 export async function generateInvoice(
   orderId: string,
@@ -486,8 +624,11 @@ export async function generateInvoice(
       409,
     );
   }
+  const customer = { id: order.customer.id, code: order.customer.code };
 
   const isCombined = input.invoice_type === "COMBINED";
+  const isAdjustment = input.invoice_type === "ADJUSTMENT";
+  const capOpts = { adjustsInvoiceId: input.adjusts_invoice_id };
 
   // Billable additional charges (overtime/parking/etc.) — only used for COMBINED,
   // which rolls rental + extras into a single invoice (and a single Kwitansi).
@@ -500,21 +641,19 @@ export async function generateInvoice(
   // The caps (the DP rule's rental base = the days that are not cancelled;
   // additionals are billed separately), checked here so a refused invoice
   // burns no number, and again under the order lock below (B8).
-  const capState = await invoiceCapState(prisma, orderId);
-  assertNewInvoiceAllowed(input, capState);
-  const { finalPrice, alreadyInvoiced } = capState;
+  const capState = await invoiceCapState(prisma, orderId, capOpts);
+  assertNewInvoiceAllowed(orderId, input, capState);
+  const finalPrice = rp(capState.money.total);
+  const gross = sen(input.amount);
+  // The PDF prints the credit used; the transaction refuses if it changed.
+  const plannedCredit = creditToApply(input.apply_credit, capState.money, gross);
 
   // Reserve the invoice number atomically (per-customer invoice_seq) in a short
   // transaction BEFORE building the PDF, so the pooler never times out and two
-  // concurrent invoices for the same customer can't collide.
+  // concurrent invoices for the same customer cannot collide.
   const issueDate = input.issue_date ? new Date(input.issue_date) : new Date();
   const { seq: invoiceSeq, number: invoiceNumber } = await prisma.$transaction(
-    (tx) =>
-      nextInvoiceNumber(
-        tx,
-        { id: order.customer!.id, code: order.customer!.code },
-        issueDate,
-      ),
+    (tx) => nextInvoiceNumber(tx, customer, issueDate),
   );
 
   // Settlement (remaining rental balance) is due on the first day of service
@@ -542,13 +681,16 @@ export async function generateInvoice(
 
   // The PDF line items depend on the invoice type:
   //  - ADDITIONAL bills ONLY the billable adjustments (no rental day lines).
+  //  - ADJUSTMENT bills one line: the shortfall of the invoice it adjusts.
   //  - everything else (DP / SETTLEMENT / FULL / COMBINED) lists the rental
   //    service days; COMBINED also appends additionalItems above.
-  const additionalLineItems = billableAdjustments.map(adjustmentToLineItem);
-  const pdfItems =
+  const adjustedNumber = capState.adjusted?.invoice_number ?? "";
+  const pdfItems: InvoiceLineItem[] =
     input.invoice_type === "ADDITIONAL"
-      ? additionalLineItems
-      : await rentalDocumentItems(order, input.invoice_type, isCombined ? additionalsTotal : 0);
+      ? billableAdjustments.map(adjustmentToLineItem)
+      : isAdjustment
+        ? [adjustmentLineItem(adjustedNumber, input.amount)]
+        : await rentalDocumentItems(order, input.invoice_type, isCombined ? additionalsTotal : 0);
 
   const pdfBuffer = await generateInvoicePDF({
     invoiceNumber,
@@ -559,14 +701,19 @@ export async function generateInvoice(
     pickupLocation: order.pickup_location,
     dropoffLocation: order.dropoff_location,
     finalPrice,
-    invoiceType: INVOICE_TYPE_LABEL[input.invoice_type] ?? input.invoice_type,
+    invoiceType: isAdjustment
+      ? adjustmentTitle(adjustedNumber)
+      : (INVOICE_TYPE_LABEL[input.invoice_type] ?? input.invoice_type),
     paymentMethod: PAYMENT_METHOD_LABEL[input.payment_method] ?? input.payment_method,
     amountPaid: input.amount,
-    previouslyPaid: alreadyInvoiced,
+    // Already paid toward the total or billed (Covered + Open).
+    previouslyPaid: rp(capState.money.covered + capState.money.open),
+    creditApplied: rp(plannedCredit),
     documentMode: "INVOICE",
-    invoiceKind: input.invoice_type,
+    // An adjustment uses the single-amount layout ("Total Tambahan").
+    invoiceKind: isAdjustment ? "ADDITIONAL" : input.invoice_type,
     dueDate,
-    noteLines: isFeeOnly(order) ? undefined : buildNoteLines(order),
+    noteLines: isAdjustment || isFeeOnly(order) ? undefined : buildNoteLines(order),
     items: pdfItems,
     additionalItems,
   });
@@ -577,7 +724,7 @@ export async function generateInvoice(
   // PDF (customer name, amounts) must not stay behind in the public bucket.
   const dropPdf = () => void removeFile(env.SUPABASE_STORAGE_BUCKET, `invoices/${fileName}`);
 
-  let result: { invoice: Invoice; created: boolean };
+  let result: { invoice: Invoice; created: boolean; fromCredit: boolean };
   try {
     result = await prisma.$transaction(
       async (tx) => {
@@ -585,9 +732,13 @@ export async function generateInvoice(
         // of one order (or a resend) are decided one after the other.
         await lockOrder(tx, orderId);
         const seen = await invoiceByClientRef(tx, input.client_ref, orderId);
-        if (seen) return { invoice: seen, created: false };
+        if (seen) return { invoice: seen, created: false, fromCredit: false };
         // B8: the caps again, on what is committed now.
-        assertNewInvoiceAllowed(input, await invoiceCapState(tx, orderId));
+        const fresh = await invoiceCapState(tx, orderId, capOpts);
+        assertNewInvoiceAllowed(orderId, input, fresh);
+        const credit = creditToApply(input.apply_credit, fresh.money, gross);
+        if (credit !== plannedCredit) throw new AppError(CREDIT_CHANGED, 409);
+        const cash = gross - credit;
 
         const newInvoice = await tx.invoice.create({
           data: {
@@ -597,7 +748,9 @@ export async function generateInvoice(
             invoice_type: input.invoice_type,
             payment_method: input.payment_method,
             issue_date: issueDate,
-            amount: input.amount,
+            amount: rp(cash),
+            credit_applied: rp(credit),
+            adjusts_invoice_id: input.adjusts_invoice_id ?? null,
             note: input.note,
             file_url: fileUrl,
             status: "ISSUED",
@@ -605,16 +758,30 @@ export async function generateInvoice(
             client_ref: input.client_ref ?? null,
           },
         });
+        await addCreditEntry(tx, {
+          orderId,
+          kind: "APPLIED",
+          amount: -rp(credit),
+          invoiceId: newInvoice.id,
+          note: `Dipotong dari saldo lebih untuk ${invoiceNumber}`,
+          actor: "ADMIN",
+        });
 
-        // Keep the customer's billed total in sync (G9: total_billed = sum invoices).
+        // Keep the customer's billed total in sync (G9: total_billed = sum of
+        // the active invoices' cash asked).
         await tx.customer.update({
-          where: { id: order.customer!.id },
-          data: { total_billed: { increment: input.amount } },
+          where: { id: customer.id },
+          data: { total_billed: { increment: rp(cash) } },
         });
 
         // NOTE: issuing an invoice does NOT change payment_status.
-        // payment_status only advances when an invoice is marked PAID (see markInvoicePaid).
-        return { invoice: newInvoice, created: true };
+        // payment_status only advances when an invoice is marked PAID (see
+        // markInvoicePaid); an invoice paid from saldo lebih moves no money.
+        if (cash === 0) {
+          const paid = await settleFromCredit(tx, newInvoice, customer, issueDate);
+          return { invoice: paid, created: true, fromCredit: true };
+        }
+        return { invoice: newInvoice, created: true, fromCredit: false };
       },
       { maxWait: 15000, timeout: 20000 },
     );
@@ -627,17 +794,44 @@ export async function generateInvoice(
     throw err;
   }
   if (!result.created) dropPdf();
-  return result;
+  if (result.fromCredit) {
+    // The kwitansi "Dibayar dari saldo lebih". No GA4: no money came in.
+    try {
+      await attachReceiptPdf(result.invoice.id, {
+        paidAt: issueDate,
+        paymentMethod: input.payment_method,
+        amountReceived: 0,
+      });
+    } catch (err) {
+      console.error("Receipt PDF generation failed:", err);
+    }
+    result.invoice = await prisma.invoice.findUniqueOrThrow({ where: { id: result.invoice.id } });
+  }
+  return { invoice: result.invoice, created: result.created };
 }
+
+/** The one line of an ADJUSTMENT invoice and its kwitansi. */
+function adjustmentLineItem(adjustedNumber: string, amount: number): InvoiceLineItem {
+  return {
+    // The PDF prints no document title, so the line says what this invoice is.
+    description: adjustmentTitle(adjustedNumber),
+    quantity: 1,
+    unitPrice: amount,
+    totalPrice: amount,
+  };
+}
+const adjustmentTitle = (adjustedNumber: string) =>
+  `Invoice Penyesuaian — kekurangan pembayaran ${adjustedNumber}`.trim();
 
 export async function getInvoicesByOrder(orderId: string) {
   const order = await prisma.order.findUnique({ where: { id: orderId } });
   if (!order) throw new AppError("Order not found", 404);
 
-  return prisma.invoice.findMany({
+  const rows = await prisma.invoice.findMany({
     where: { order_id: orderId },
     orderBy: { created_at: "desc" },
   });
+  return rows.map(invoiceView);
 }
 
 // Sprint 3: return a short-lived signed URL for an invoice's payment proof.
@@ -657,6 +851,68 @@ export async function getPaymentProofUrl(invoiceId: string) {
   return { url, expires_in: 3600 };
 }
 
+/** What a payment did, returned with mark-paid (finance design §5.9). */
+function paymentOf(inv: { amount: unknown; amount_received?: unknown }) {
+  const asked = sen(inv.amount);
+  const received = inv.amount_received != null ? sen(inv.amount_received) : asked;
+  return {
+    received: rp(received),
+    shortfall: rp(Math.max(0, asked - received)),
+    overpayment: rp(Math.max(0, received - asked)),
+    // An overpayment becomes saldo lebih (OVERPAYMENT entry).
+    credit_added: rp(Math.max(0, received - asked)),
+  };
+}
+
+const STATUS_LABEL: Record<string, string> = {
+  UNPAID: "Belum bayar",
+  DP_PAID: "DP terbayar",
+  PAID: "Lunas",
+};
+
+/**
+ * Owner decision (7 Oct 2026, finance design §3.4): money received that
+ * differs from the invoice amount is recorded only with an explicit
+ * acknowledgement. Without it: 409 with both numbers and what would happen,
+ * and nothing is recorded (also no proof uploaded).
+ */
+async function assertAmountAcknowledged(
+  invoice: { order_id: string; invoice_number: string; amount: unknown },
+  received: number,
+  ack: boolean,
+): Promise<void> {
+  const asked = sen(invoice.amount);
+  const got = sen(received);
+  if (got === asked || ack) return;
+  const [m, days] = await Promise.all([
+    moneyState(prisma, invoice.order_id),
+    prisma.orderServiceItem.findMany({ where: { order_id: invoice.order_id }, select: { total_price: true, line_status: true } }),
+  ]);
+  const order = await prisma.order.findUniqueOrThrow({
+    where: { id: invoice.order_id },
+    select: { cancellation_fee: true },
+  });
+  const netAfter = rp((m?.net ?? 0) + got);
+  const statusAfter = paymentStatusFor(netAfter, rp(m?.total ?? 0), dpBaseOf(order, days));
+  const short = Math.max(0, asked - got);
+  const over = Math.max(0, got - asked);
+  const effect = short
+    ? `kurang ${rupiah(rp(short))}: invoice tetap ditandai terbayar, kekurangannya bisa ditagih lewat Invoice Penyesuaian`
+    : `lebih ${rupiah(rp(over))}: kelebihannya masuk saldo lebih order ini`;
+  throw new AppError(
+    `Uang diterima ${rupiah(received)} berbeda dari nilai invoice ${invoice.invoice_number} ${rupiah(rp(asked))} (${effect}; status order menjadi ${STATUS_LABEL[statusAfter] ?? statusAfter}). Bila jumlahnya benar, centang konfirmasi selisih lalu simpan lagi.`,
+    409,
+    {
+      code: "AMOUNT_MISMATCH",
+      invoice_amount: rp(asked),
+      amount_received: rp(got),
+      shortfall: rp(short),
+      overpayment: rp(over),
+      payment_status_after: statusAfter,
+    },
+  );
+}
+
 // Mark an invoice paid: money received, kwitansi (receipt PDF), order payment status.
 export async function markInvoicePaid(
   invoiceId: string,
@@ -664,6 +920,7 @@ export async function markInvoicePaid(
     payment_method?: string;
     paid_at?: string;
     amount_received?: number;
+    amount_mismatch_ack?: boolean;
     proof?: UploadedFile;
   } = {},
 ) {
@@ -677,11 +934,16 @@ export async function markInvoicePaid(
     },
   });
   if (!invoice) throw new AppError("Invoice not found", 404);
+  const respond = async (inv: Invoice) => ({
+    ...invoiceView(inv),
+    payment: paymentOf(inv),
+    order_money: await computeOrderMoney(prisma, inv.order_id),
+  });
   // Already paid: return the plain invoice row (the loaded order/customer
   // carries personal data such as the NIK and must not reach the client).
   if (invoice.status === "PAID") {
     const { order: _order, ...plain } = invoice;
-    return plain;
+    return respond(plain);
   }
   if (["REVISED", "CANCELLED"].includes(invoice.status)) {
     throw new AppError(
@@ -693,10 +955,12 @@ export async function markInvoicePaid(
   const paidAt = input.paid_at ? new Date(input.paid_at) : new Date();
   const paymentMethod = (input.payment_method ||
     invoice.payment_method) as string;
-  // Sprint 2 payment model: record the ACTUAL money received, which may be more
-  // than the invoice amount (overpayment). Defaults to the invoice amount.
+  // The ACTUAL money received. Defaults to the invoice amount; a different
+  // amount needs amount_mismatch_ack (an invoice's amount never changes: a
+  // revision is a new invoice, so this check needs no lock).
   const amountReceived =
     input.amount_received != null ? Number(input.amount_received) : Number(invoice.amount);
+  await assertAmountAcknowledged(invoice, amountReceived, input.amount_mismatch_ack === true);
   const customer = invoice.order.customer;
 
   // Upload the payment proof to the private bucket (signed URLs are minted on
@@ -722,11 +986,10 @@ export async function markInvoicePaid(
           {
             final_price: unknown;
             paid_to_date: unknown;
-            is_refunded: boolean;
-            refund_amount: unknown;
+            refunded_total: unknown;
             cancellation_fee: unknown;
           }[]
-        >`SELECT final_price, paid_to_date, is_refunded, refund_amount, cancellation_fee
+        >`SELECT final_price, paid_to_date, refunded_total, cancellation_fee
           FROM "orders" WHERE id = ${invoice.order_id} FOR NO KEY UPDATE`;
         const { count } = await tx.invoice.updateMany({
           where: { id: invoiceId, status: { notIn: ["PAID", "REVISED", "CANCELLED"] } },
@@ -742,14 +1005,14 @@ export async function markInvoicePaid(
         });
         if (count === 0) return null;
         // More money than the invoice asked: the difference is saldo lebih
-        // (one OVERPAYMENT per invoice, unique index). Nothing reads it for a
-        // rule in A1; the numbers below are unchanged.
-        const over = Math.round(amountReceived * 100) - Math.round(Number(invoice.amount) * 100);
+        // (one OVERPAYMENT per invoice, unique index). Less: the invoice stays
+        // PAID and the shortfall is billable again (Billable is on Covered).
+        const over = sen(amountReceived) - sen(invoice.amount);
         if (over > 0) {
           await addCreditEntry(tx, {
             orderId: invoice.order_id,
             kind: "OVERPAYMENT",
-            amount: over / 100,
+            amount: rp(over),
             invoiceId: invoice.id,
             note: `Lebih bayar ${invoice.invoice_number}`,
             actor: "ADMIN",
@@ -769,7 +1032,7 @@ export async function markInvoicePaid(
               customer_id: customer.id,
               customer_seq: receiptSeq,
               payment_date: paidAt,
-              // ACTUAL money received (may exceed the invoice amount on overpayment).
+              // ACTUAL money received (may differ from the invoice amount).
               amount: amountReceived,
               payment_method: paymentMethod as never,
               // Private storage path; resolved to a signed URL on read.
@@ -793,7 +1056,8 @@ export async function markInvoicePaid(
         await tx.order.update({
           where: { id: invoice.order_id },
           data: {
-            // Less than the 20% DP received stays UNPAID (B2).
+            // Net (received − refunded) against the total and the DP base:
+            // less than the 20% DP stays UNPAID (B2).
             payment_status: paymentStatusFor(
               netPaid({ ...locked, paid_to_date: paidTotal }),
               locked.final_price,
@@ -802,11 +1066,14 @@ export async function markInvoicePaid(
             paid_to_date: paidTotal,
           },
         });
-        // Did this payment make the rental paid in full? Decided under the
-        // lock, so two invoices paid at once notify the drivers only once.
+        // INV-5: a payment on an order whose total meanwhile fell below what
+        // money covers (a cancellation) puts the excess in saldo lebih.
+        await settleCredit(tx, invoice.order_id);
+        // Did this payment make the rental paid in full (Net)? Decided under
+        // the lock, so two invoices paid at once notify the drivers only once.
         const becameReady =
-          !startPayment({ paid_to_date: locked.paid_to_date }, days).ready &&
-          startPayment({ paid_to_date: paidTotal }, days).ready;
+          !startPayment(locked, days).ready &&
+          startPayment({ ...locked, paid_to_date: paidTotal }, days).ready;
         return { becameReady };
       },
       { maxWait: 15000, timeout: 20000 },
@@ -822,7 +1089,7 @@ export async function markInvoicePaid(
     // and answer with the invoice as it is now.
     void removeFile(PAYMENT_PROOFS_BUCKET, proofUpload.path);
     const current = await prisma.invoice.findUnique({ where: { id: invoiceId } });
-    if (current?.status === "PAID") return current;
+    if (current?.status === "PAID") return respond(current);
     throw new AppError(`Cannot mark a ${current?.status ?? "missing"} invoice as paid`, 409);
   }
 
@@ -844,13 +1111,27 @@ export async function markInvoicePaid(
   // customer (app unlocks "Mulai perjalanan") and get a notification.
   if (applied.becameReady) void notifyOrderPaidInFull(invoice.order_id);
 
-  return prisma.invoice.findUniqueOrThrow({ where: { id: invoiceId } });
+  return respond(await prisma.invoice.findUniqueOrThrow({ where: { id: invoiceId } }));
+}
+
+/** "Pengembalian dana" lines for a kwitansi or statement (shown as money going back). */
+function refundLines(refunds: { amount: unknown; refunded_at: Date }[]) {
+  return refunds.map((r) => ({
+    label: `Pengembalian dana tanggal ${fmtLongWibDate(r.refunded_at)}`,
+    amount: Number(r.amount),
+  }));
 }
 
 /**
  * Regenerate the invoice as a Kwitansi/Receipt (LUNAS stamp, payment date)
  * and attach it. Stored in receipt_url, NOT file_url: the original invoice PDF
  * is kept so the order keeps BOTH documents paired.
+ *
+ * Finance design §8: the money actually received; the saldo lebih used
+ * ("Dipotong dari saldo lebih", or "Dibayar dari saldo lebih" when it paid
+ * the whole invoice); a shortfall ("Kekurangan … ditagih lewat invoice
+ * penyesuaian") or an overpayment ("Masuk saldo lebih"); refunds; the
+ * remaining balance max(0, T − Net) and the saldo lebih left.
  */
 async function attachReceiptPdf(
   invoiceId: string,
@@ -859,10 +1140,12 @@ async function attachReceiptPdf(
   const invoice = await prisma.invoice.findUniqueOrThrow({
     where: { id: invoiceId },
     include: {
+      adjusts_invoice: { select: { invoice_number: true } },
       order: {
         include: {
           service_items: { orderBy: { sort_order: "asc" } },
           adjustments: { orderBy: { created_at: "asc" } },
+          refunds: { orderBy: { refunded_at: "asc" }, select: { amount: true, refunded_at: true } },
         },
       },
     },
@@ -872,18 +1155,22 @@ async function attachReceiptPdf(
 
   // For a COMBINED invoice the kwitansi mirrors the invoice: rental lines plus
   // an Additional Charges section. An ADDITIONAL receipt lists ONLY the
-  // additional charges; every other type lists the rental service days.
+  // additional charges; an ADJUSTMENT its one shortfall line; every other
+  // type lists the rental service days.
   const billable = order.adjustments.filter((a) => a.is_billable);
   const additionalItems =
     invoice.invoice_type === "COMBINED" ? billable.map(adjustmentToLineItem) : undefined;
+  const adjustedNumber = invoice.adjusts_invoice?.invoice_number ?? "";
   const items =
     invoice.invoice_type === "ADDITIONAL"
       ? billable.map(adjustmentToLineItem)
-      : await rentalDocumentItems(
-          order,
-          invoice.invoice_type,
-          (additionalItems ?? []).reduce((s, a) => s + a.totalPrice, 0),
-        );
+      : invoice.invoice_type === "ADJUSTMENT"
+        ? [adjustmentLineItem(adjustedNumber, grossOf(invoice))]
+        : await rentalDocumentItems(
+            order,
+            invoice.invoice_type,
+            (additionalItems ?? []).reduce((s, a) => s + a.totalPrice, 0),
+          );
 
   // Sum of the other active invoices, for the receipt summary.
   const priorAgg = await prisma.invoice.aggregate({
@@ -898,14 +1185,38 @@ async function attachReceiptPdf(
 
   // "Payments received" lines: the payments made up to this one (a later one,
   // recorded before this PDF was built, belongs on its own kwitansi), then this.
+  // Invoices paid from saldo lebih moved no money and get no payment line.
   const all = await paymentsOnOrder(prisma, invoice.order_id, invoice.id);
   const earlier = all.items.filter((p) => !p.paid_at || p.paid_at.getTime() <= pay.paidAt.getTime());
   const others = { items: earlier, total: earlier.reduce((s, p) => s + p.received, 0) };
-  const paymentsReceived = paymentLines([
-    ...others.items,
-    { invoice_type: invoice.invoice_type, paid_at: pay.paidAt, issue_date: invoice.issue_date, received: pay.amountReceived },
-  ]);
+  const paymentsReceived = paymentLines(
+    [
+      ...others.items,
+      { invoice_type: invoice.invoice_type, paid_at: pay.paidAt, issue_date: invoice.issue_date, received: pay.amountReceived },
+    ].filter((p) => p.received !== 0),
+  );
   const totalReceived = others.total + pay.amountReceived;
+  // Refunds made so far, so the balance is on Net like the order card.
+  const refunds = order.refunds;
+  const refunded = refunds.reduce((s, r) => s + Number(r.amount), 0);
+
+  // This invoice's own lines.
+  const receiptLines: { label: string; amount?: number }[] = [];
+  const creditUsed = Number(invoice.credit_applied ?? 0);
+  if (creditUsed > 0) {
+    receiptLines.push({
+      label: Number(invoice.amount) === 0 ? "Dibayar dari saldo lebih" : "Dipotong dari saldo lebih",
+      amount: -creditUsed,
+    });
+  }
+  const short = sen(invoice.amount) - sen(pay.amountReceived);
+  if (short > 0) {
+    receiptLines.push({
+      label: `Kekurangan ${rupiah(rp(short))} (ditagih lewat invoice penyesuaian)`,
+    });
+  } else if (short < 0) {
+    receiptLines.push({ label: "Masuk saldo lebih", amount: rp(-short) });
+  }
 
   const pdfBuffer = await generateInvoicePDF({
     invoiceNumber: invoice.invoice_number,
@@ -916,18 +1227,25 @@ async function attachReceiptPdf(
     pickupLocation: order.pickup_location,
     dropoffLocation: order.dropoff_location,
     finalPrice: orderTotal,
-    invoiceType: INVOICE_TYPE_LABEL[invoice.invoice_type] ?? invoice.invoice_type,
+    invoiceType:
+      invoice.invoice_type === "ADJUSTMENT"
+        ? adjustmentTitle(adjustedNumber)
+        : (INVOICE_TYPE_LABEL[invoice.invoice_type] ?? invoice.invoice_type),
     paymentMethod: PAYMENT_METHOD_LABEL[pay.paymentMethod] ?? pay.paymentMethod,
     amountPaid: pay.amountReceived,
     previouslyPaid,
     documentMode: "RECEIPT",
     paidAt: pay.paidAt,
     paymentsReceived,
-    remainingBalance: Math.max(orderTotal - totalReceived, 0),
-    // Sprint 2: overpayment/refund details live ONLY in the PDF. Refund is due
-    // only when total received exceeds the ORDER total (never the DP).
-    refundDue: Math.max(totalReceived - orderTotal, 0),
-    noteLines: isFeeOnly(order, invoice.invoice_type) ? undefined : buildNoteLines(order),
+    refundsMade: refundLines(refunds),
+    receiptLines,
+    // Piutang: max(0, T − Net).
+    remainingBalance: Math.max(orderTotal - (totalReceived - refunded), 0),
+    creditBalance: Number(order.credit_balance ?? 0),
+    noteLines:
+      invoice.invoice_type === "ADJUSTMENT" || isFeeOnly(order, invoice.invoice_type)
+        ? undefined
+        : buildNoteLines(order),
     items,
     additionalItems,
   });
@@ -939,9 +1257,10 @@ async function attachReceiptPdf(
 }
 
 // Build a single combined STATEMENT PDF for the whole order: all service-day
-// line items + billable adjustments + every payment received + running balance
-// (LUNAS stamp when fully settled). Kept separate from per-payment invoice /
-// kuitansi documents which remain individually accessible.
+// line items + billable adjustments + every payment received + every refund
+// + running balance (LUNAS stamp when fully settled) + the saldo lebih left.
+// Kept separate from per-payment invoice / kuitansi documents which remain
+// individually accessible.
 export async function generateOrderStatement(
   orderId: string,
   invoiceIds?: string[],
@@ -952,6 +1271,7 @@ export async function generateOrderStatement(
       service_items: { orderBy: { sort_order: "asc" } },
       adjustments: { orderBy: { created_at: "asc" } },
       invoices: { orderBy: { issue_date: "asc" } },
+      refunds: { orderBy: { refunded_at: "asc" }, select: { amount: true, refunded_at: true } },
     },
   });
   if (!order) throw new AppError("Order not found", 404);
@@ -987,14 +1307,19 @@ export async function generateOrderStatement(
   );
 
   // Every payment actually received on the chosen invoices (the money on the
-  // receipt, also for an invoice voided later by a cancellation).
+  // receipt, also for an invoice voided later by a cancellation). Invoices
+  // paid from saldo lebih moved no money and get no line.
   const chosen = new Set(order.invoices.map((i) => i.id));
   const paymentsReceived = paymentLines(
-    (await paymentsOnOrder(prisma, order.id)).items.filter((p) => chosen.has(p.id)),
+    (await paymentsOnOrder(prisma, order.id)).items.filter((p) => chosen.has(p.id) && p.received !== 0),
   );
   const totalReceived = paymentsReceived.reduce((s, p) => s + p.amount, 0);
-  const remainingBalance = Math.max(finalPrice - totalReceived, 0);
+  // Refunds are order-level money going back: always listed.
+  const refundsMade = refundLines(order.refunds);
+  const totalRefunded = refundsMade.reduce((s, r) => s + r.amount, 0);
+  const remainingBalance = Math.max(finalPrice - (totalReceived - totalRefunded), 0);
   const fullyPaid = remainingBalance <= 0 && finalPrice > 0;
+  const creditBalance = Number(order.credit_balance ?? 0);
 
   const invoiceNumber = `${order.order_code ?? order.id}-STATEMENT`;
   const pdfBuffer = await generateInvoicePDF({
@@ -1012,7 +1337,9 @@ export async function generateOrderStatement(
     previouslyPaid: 0,
     documentMode: "STATEMENT",
     paymentsReceived,
+    refundsMade,
     remainingBalance,
+    creditBalance,
     showPaidStamp: fullyPaid,
     noteLines: isFeeOnly(order) ? undefined : buildNoteLines(order),
     items,
@@ -1029,7 +1356,9 @@ export async function generateOrderStatement(
     statement_url: fileUrl,
     final_price: finalPrice,
     total_received: totalReceived,
+    total_refunded: totalRefunded,
     remaining_balance: remainingBalance,
+    credit_balance: creditBalance,
     fully_paid: fullyPaid,
   };
 }
@@ -1043,6 +1372,10 @@ const isRevisionOf = (
 /**
  * Revise an unpaid invoice. `created` is false when the client_ref already
  * made this revision: it is returned and nothing else happens (B8).
+ *
+ * input.amount is the new gross, as on generate. The old invoice's saldo
+ * lebih comes back (UNAPPLIED) and the revision applies it again by default
+ * (APPLIED); a revision the credit covers in full is PAID at once.
  */
 export async function reviseInvoice(
   invoiceId: string,
@@ -1051,10 +1384,12 @@ export async function reviseInvoice(
   const invoice = await prisma.invoice.findUnique({
     where: { id: invoiceId },
     include: {
+      adjusts_invoice: { select: { invoice_number: true } },
       order: {
         include: {
           service_items: { orderBy: { sort_order: "asc" } },
           adjustments: { orderBy: { created_at: "asc" } },
+          customer: { select: { id: true, code: true } },
         },
       },
     },
@@ -1082,6 +1417,10 @@ export async function reviseInvoice(
   const issueDate = new Date();
   const paymentMethod = input.payment_method || invoice.payment_method;
   const amount = input.amount;
+  const gross = sen(amount);
+  const oldCredit = sen(invoice.credit_applied);
+  const isAdjustment = invoice.invoice_type === "ADJUSTMENT";
+  const adjustedNumber = invoice.adjusts_invoice?.invoice_number ?? "";
 
   const typeLabels: Record<string, string> = {
     DP: "Down Payment Revision",
@@ -1090,25 +1429,43 @@ export async function reviseInvoice(
     ADDITIONAL: "Additional Charge Revision",
   };
 
-
-
-  // For a revision, exclude the invoice being revised from the "previously paid" total.
-  const previouslyPaid = await billedSoFar(invoice.order_id, invoice.id);
-  const finalPrice = Number(invoice.order.final_price);
-
-  if (previouslyPaid + amount > finalPrice) {
-    throw new AppError(
-      `Revised invoice total (${previouslyPaid + amount}) exceeds order final price (${finalPrice}). Update order price first or reduce the invoice amount.`,
-      409,
-    );
-  }
-  // B2: a revised DP keeps the 20% minimum, like a new one.
-  if (invoice.invoice_type === "DP")
-    assertDpAmount(amount, rentalBaseOf(invoice.order.service_items));
+  /**
+   * The caps of the revision, on the money as it would be once the old
+   * invoice is set aside (its cash leaves Open, its credit comes back).
+   * Returns the saldo lebih (sen) the revision would use.
+   */
+  const checkRevision = (state: CapState, creditBack: number) => {
+    const m = state.money;
+    const credit = m.credit + creditBack;
+    const covered = m.covered - creditBack;
+    const billable = m.total - covered - m.open;
+    if (gross > billable) {
+      throw new AppError(
+        `Revised invoice total (${rp(covered + m.open + gross)}) exceeds order final price (${rp(m.total)}). Update order price first or reduce the invoice amount.`,
+        409,
+        { billable_remaining: rp(Math.max(0, billable)) },
+      );
+    }
+    // B2: a revised DP keeps the 20% minimum, like a new one.
+    if (invoice.invoice_type === "DP") assertDpAmount(amount, state.rentalBase);
+    if (isAdjustment) {
+      const room = adjustmentRoom(invoice.order_id, state.adjusted);
+      if (gross > room)
+        throw new AppError(
+          `Invoice penyesuaian (${rupiah(amount)}) melebihi kekurangan ${adjustedNumber} yang belum ditagih (${rupiah(rp(Math.max(0, room)))}).`,
+          409,
+        );
+    }
+    return input.apply_credit ? Math.max(0, Math.min(credit, gross)) : 0;
+  };
+  const capOpts = { excludeInvoiceId: invoice.id, adjustsInvoiceId: invoice.adjusts_invoice_id };
+  const before = await invoiceCapState(prisma, invoice.order_id, capOpts);
+  const plannedCredit = checkRevision(before, oldCredit);
+  const finalPrice = rp(before.money.total);
 
   // Mirror the original invoice's line items: an ADDITIONAL revision lists ONLY
-  // the additional charges; COMBINED lists rental + an Additional Charges
-  // section; the rest list the rental service days.
+  // the additional charges; an ADJUSTMENT its shortfall line; COMBINED lists
+  // rental + an Additional Charges section; the rest list the rental service days.
   const reviseBillableAdjustments = invoice.order.adjustments.filter(
     (a) => a.is_billable,
   );
@@ -1120,11 +1477,13 @@ export async function reviseInvoice(
   const reviseItems =
     invoice.invoice_type === "ADDITIONAL"
       ? reviseAdjustmentItems
-      : await rentalDocumentItems(
-          invoice.order,
-          invoice.invoice_type,
-          (reviseAdditionalItems ?? []).reduce((s, a) => s + a.totalPrice, 0),
-        );
+      : isAdjustment
+        ? [adjustmentLineItem(adjustedNumber, amount)]
+        : await rentalDocumentItems(
+            invoice.order,
+            invoice.invoice_type,
+            (reviseAdditionalItems ?? []).reduce((s, a) => s + a.totalPrice, 0),
+          );
 
   const pdfBuffer = await generateInvoicePDF({
     invoiceNumber,
@@ -1133,15 +1492,20 @@ export async function reviseInvoice(
     pickupLocation: invoice.order.pickup_location,
     dropoffLocation: invoice.order.dropoff_location,
     finalPrice,
-    invoiceType:
-      typeLabels[invoice.invoice_type] ?? `${invoice.invoice_type} Revision`,
+    invoiceType: isAdjustment
+      ? `${adjustmentTitle(adjustedNumber)} (revisi)`
+      : (typeLabels[invoice.invoice_type] ?? `${invoice.invoice_type} Revision`),
     paymentMethod: PAYMENT_METHOD_LABEL[paymentMethod] ?? paymentMethod,
     amountPaid: amount,
-    previouslyPaid,
-    invoiceKind: invoice.invoice_type,
+    // Already paid toward the total or billed elsewhere (Covered + Open,
+    // without this invoice and its credit).
+    previouslyPaid: rp(before.money.covered - oldCredit + before.money.open),
+    creditApplied: rp(plannedCredit),
+    invoiceKind: isAdjustment ? "ADDITIONAL" : invoice.invoice_type,
     // Same notes as the original; a cancellation fee keeps none (its own
     // notes, the reason and tier, are not stored).
-    noteLines: isFeeOnly(invoice.order, invoice.invoice_type) ? undefined : buildNoteLines(invoice.order),
+    noteLines:
+      isAdjustment || isFeeOnly(invoice.order, invoice.invoice_type) ? undefined : buildNoteLines(invoice.order),
     items: reviseItems,
     additionalItems: reviseAdditionalItems,
   });
@@ -1151,13 +1515,13 @@ export async function reviseInvoice(
   const fileName = `${invoiceNumber}-${Date.now().toString(36)}.pdf`;
   const fileUrl = await uploadInvoicePDF(pdfBuffer, fileName);
 
-  let result: { invoice: Invoice; created: boolean };
+  let result: { invoice: Invoice; created: boolean; fromCredit: boolean };
   try {
     result = await prisma.$transaction(async (tx) => {
       // B9 lock order (order-money.ts): the order row, then the invoice.
       await lockOrder(tx, invoice.order_id);
       const seen = await replayOf(tx);
-      if (seen) return { invoice: seen, created: false };
+      if (seen) return { invoice: seen, created: false, fromCredit: false };
       // Conditional: an invoice paid (or revised) by someone else since it was
       // read above is left alone (the revision would bill the customer twice).
       const { count } = await tx.invoice.updateMany({
@@ -1170,16 +1534,21 @@ export async function reviseInvoice(
           409,
         );
       }
-      // B8: the caps again, under the lock, on what is committed now.
-      const fresh = await invoiceCapState(tx, invoice.order_id);
-      const billedElsewhere = await billedSoFar(invoice.order_id, invoice.id, tx);
-      if (billedElsewhere + amount > fresh.finalPrice) {
-        throw new AppError(
-          `Revised invoice total (${billedElsewhere + amount}) exceeds order final price (${fresh.finalPrice}). Update order price first or reduce the invoice amount.`,
-          409,
-        );
-      }
-      if (invoice.invoice_type === "DP") assertDpAmount(amount, fresh.rentalBase);
+      // The old invoice's saldo lebih comes back (UNAPPLIED).
+      await addCreditEntry(tx, {
+        orderId: invoice.order_id,
+        kind: "UNAPPLIED",
+        amount: rp(oldCredit),
+        invoiceId: invoice.id,
+        note: `Saldo lebih dikembalikan dari ${invoice.invoice_number} (direvisi)`,
+        actor: "ADMIN",
+      });
+      // B8: the caps again, under the lock, on what is committed now (the old
+      // invoice is REVISED and its credit back, so nothing more to set aside).
+      const fresh = await invoiceCapState(tx, invoice.order_id, capOpts);
+      const credit = checkRevision(fresh, 0);
+      if (credit !== plannedCredit) throw new AppError(CREDIT_CHANGED, 409);
+      const cash = gross - credit;
       const revised = await tx.invoice.create({
         data: {
           order_id: invoice.order_id,
@@ -1187,7 +1556,9 @@ export async function reviseInvoice(
           invoice_type: invoice.invoice_type,
           payment_method: paymentMethod,
           issue_date: issueDate,
-          amount,
+          amount: rp(cash),
+          credit_applied: rp(credit),
+          adjusts_invoice_id: invoice.adjusts_invoice_id,
           note: input.note || invoice.note,
           file_url: fileUrl,
           status: "ISSUED",
@@ -1195,6 +1566,14 @@ export async function reviseInvoice(
           parent_id: invoice.parent_id || invoice.id,
           client_ref: input.client_ref ?? null,
         },
+      });
+      await addCreditEntry(tx, {
+        orderId: invoice.order_id,
+        kind: "APPLIED",
+        amount: -rp(credit),
+        invoiceId: revised.id,
+        note: `Dipotong dari saldo lebih untuk ${invoiceNumber}`,
+        actor: "ADMIN",
       });
       // payment_status is NOT recomputed here: it follows the money received
       // (markInvoicePaid), never the amount billed. Revising an unpaid invoice
@@ -1205,7 +1584,7 @@ export async function reviseInvoice(
           order_id: invoice.order_id,
           field: "invoice_revision",
           old_value: `${invoice.invoice_number}: ${invoice.amount}`,
-          new_value: `${invoiceNumber}: ${input.amount}`,
+          new_value: `${invoiceNumber}: ${rp(cash)}`,
           note: input.note,
           actor: "ADMIN",
         },
@@ -1213,7 +1592,7 @@ export async function reviseInvoice(
       // Keep total_billed = sum of active invoices (G9): the old amount is
       // replaced by the new one.
       if (invoice.order.customer_id) {
-        const delta = amount - Number(invoice.amount);
+        const delta = rp(cash - sen(invoice.amount));
         if (delta !== 0) {
           await tx.customer.update({
             where: { id: invoice.order.customer_id },
@@ -1221,7 +1600,11 @@ export async function reviseInvoice(
           });
         }
       }
-      return { invoice: revised, created: true };
+      if (cash === 0 && invoice.order.customer) {
+        const paid = await settleFromCredit(tx, revised, invoice.order.customer, issueDate);
+        return { invoice: paid, created: true, fromCredit: true };
+      }
+      return { invoice: revised, created: true, fromCredit: false };
     }, { maxWait: 15000, timeout: 20000 });
   } catch (err) {
     // Not recorded: the revision PDF (customer name, amounts) must not stay
@@ -1234,7 +1617,15 @@ export async function reviseInvoice(
     throw err;
   }
   if (!result.created) void removeFile(env.SUPABASE_STORAGE_BUCKET, `invoices/${fileName}`);
-  return result;
+  if (result.fromCredit) {
+    try {
+      await attachReceiptPdf(result.invoice.id, { paidAt: issueDate, paymentMethod, amountReceived: 0 });
+    } catch (err) {
+      console.error("Receipt PDF generation failed:", err);
+    }
+    result.invoice = await prisma.invoice.findUniqueOrThrow({ where: { id: result.invoice.id } });
+  }
+  return { invoice: result.invoice, created: result.created };
 }
 
 function normalizePhone(phone = ""): string {
@@ -1363,6 +1754,9 @@ export async function sendInvoiceWhatsapp(
       break;
     case "ADDITIONAL":
       baseCaption = buildAdditionalInvoiceCaption(captionCtx);
+      break;
+    case "ADJUSTMENT":
+      baseCaption = buildAdjustmentInvoiceCaption(captionCtx);
       break;
     // DP / FULL / COMBINED all use the DP-style "please pay" caption.
     default:

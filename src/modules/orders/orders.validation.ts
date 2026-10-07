@@ -158,11 +158,20 @@ export const createChangeLogSchema = z.object({
   actor: z.string().optional(),
 });
 
-// Sprint 5: mark refund settled. Amount optional (defaults to derived refund
-// due); proof file is required and validated in the controller/service.
+// The old "refund settled" endpoint, kept as an alias for one release:
+// amount optional (defaults to the whole saldo lebih, bounded by it); proof
+// file is required and validated in the service.
 export const markOrderRefundedSchema = z.object({
   note: z.string().optional(),
   amount: z.coerce.number().positive().optional(),
+});
+
+// POST /orders/:id/refunds (multipart; proof file required, field "proof").
+// The amount is at most the saldo lebih; client_ref makes a resend a no-op.
+export const createRefundSchema = z.object({
+  amount: z.coerce.number().positive("Nominal pengembalian harus lebih dari 0"),
+  note: z.string().trim().max(500).optional(),
+  client_ref: z.string().uuid(),
 });
 
 // Full-order cancellation. A reason is required (kept in the audit log + on the
@@ -180,4 +189,5 @@ export type AssignOrderInput = z.infer<typeof assignOrderSchema>;
 export type CreateAdjustmentInput = z.infer<typeof createAdjustmentSchema>;
 export type CreateChangeLogInput = z.infer<typeof createChangeLogSchema>;
 export type MarkOrderRefundedInput = z.infer<typeof markOrderRefundedSchema>;
+export type CreateRefundInput = z.infer<typeof createRefundSchema>;
 export type CancelOrderInput = z.infer<typeof cancelOrderSchema>;

@@ -1,6 +1,6 @@
 import type { Prisma } from "@prisma/client";
 import prisma from "../../prisma/client";
-import { dpBaseOf, minDpFor, netPaid, startPayment } from "./assignment-guard";
+import { dpBaseOf, minDpFor, orderPaymentStatus, rentalBaseOf } from "./assignment-guard";
 
 type Db = Prisma.TransactionClient | typeof prisma;
 
@@ -39,17 +39,22 @@ export async function lockOrder(tx: Prisma.TransactionClient, orderId: string): 
 }
 
 /** Whole sen, so sums of DECIMAL(12,2) values stay exact. */
-const sen = (v: unknown) => Math.round(Number(v ?? 0) * 100);
-const rp = (s: number) => s / 100;
+export const sen = (v: unknown) => Math.round(Number(v ?? 0) * 100);
+export const rp = (s: number) => s / 100;
 
 /*
  * ── Saldo lebih ledger (INV-1, INV-2) ──────────────────────────────────────
  * orders.credit_balance = Σ order_credit_entries.amount, always ≥ 0. Only
- * these helpers write entries, each in the caller's transaction and under the
- * order lock (lockOrder), together with the cached balance. The migration's
- * OPENING entries follow the same rule.
- * In A1 nothing reads the balance for a rule: billable_remaining, start_ready
- * and payment_status do not use it (see computeOrderMoney).
+ * addCreditEntry writes entries, each in the caller's transaction and under
+ * the order lock (lockOrder), together with the cached balance. The A1
+ * migration's OPENING entries follow the same rule.
+ *
+ * Where credit comes from (finance design §3.3): OVERPAYMENT (mark-paid with
+ * more than the invoice asked), RELEASE (the total fell below what money
+ * already covers: settleCredit), UNAPPLIED (an unpaid invoice that used
+ * credit is revised or voided), OPENING (backfill). Where it goes: APPLIED
+ * (invoice create / revise, the cancellation fee) and REFUND. Credit stays on
+ * its order (owner, 7 Oct 2026); it is never moved to another one.
  */
 type CreditKind = "OPENING" | "OVERPAYMENT" | "RELEASE" | "APPLIED" | "UNAPPLIED" | "REFUND";
 
@@ -87,86 +92,132 @@ export async function addCreditEntry(
 }
 
 /**
- * The old "refund settled" endpoint keeps one refund per order and overwrites
- * it when re-marked. Its REFUND entry (one per refund, INV-8) follows: the
- * refund uses saldo lebih up to min(amount, credit available before it), and
- * a re-mark moves the same entry instead of adding a second one.
+ * The money of one order in whole sen (finance design §2). Read it under the
+ * order lock whenever a rule depends on it.
+ *
+ *   T        = final_price
+ *   Net      = paid_to_date − refunded_total
+ *   C        = credit_balance (saldo lebih)
+ *   Covered  = Net − C             the part of T settled with money
+ *   Open     = Σ amount (cash asked) of DRAFT/ISSUED invoices
+ *   Billable = T − Covered − Open  the most a new invoice may cover (gross)
+ *
+ * `excludeInvoiceId` leaves one unpaid invoice out of Open (the one a
+ * revision replaces).
  */
-export async function setLegacyRefundCredit(
-  tx: Prisma.TransactionClient,
+export interface MoneyState {
+  total: number;
+  /** DP / "lunas" base (dpBaseOf). */
+  base: number;
+  charges: number;
+  received: number;
+  refunded: number;
+  net: number;
+  credit: number;
+  covered: number;
+  open: number;
+  billable: number;
+  paymentStatus: string;
+}
+
+export async function moneyState(
+  db: Db,
   orderId: string,
-  refundId: string,
-  amount: number,
-): Promise<void> {
-  const [order, existing] = await Promise.all([
-    tx.order.findUniqueOrThrow({ where: { id: orderId }, select: { credit_balance: true } }),
-    tx.orderCreditEntry.findFirst({ where: { refund_id: refundId, kind: "REFUND" } }),
-  ]);
-  const before = existing ? -sen(existing.amount) : 0;
-  const available = sen(order.credit_balance) + before;
-  const use = Math.max(0, Math.min(sen(amount), available));
-  if (use === before) return;
-  if (!existing) {
-    await addCreditEntry(tx, {
-      orderId,
-      kind: "REFUND",
-      amount: -rp(use),
-      refundId,
-      note: "Pengembalian dana (tandai sudah direfund)",
-      actor: "ADMIN",
-    });
-    return;
-  }
-  if (use === 0) await tx.orderCreditEntry.delete({ where: { id: existing.id } });
-  else await tx.orderCreditEntry.update({ where: { id: existing.id }, data: { amount: -rp(use) } });
-  await tx.order.update({
+  opts: { excludeInvoiceId?: string } = {},
+): Promise<MoneyState | null> {
+  const order = await db.order.findUnique({
     where: { id: orderId },
-    data: { credit_balance: { increment: rp(before - use) } },
+    select: {
+      final_price: true,
+      paid_to_date: true,
+      payment_status: true,
+      refunded_total: true,
+      credit_balance: true,
+      cancellation_fee: true,
+      service_items: { select: { total_price: true, line_status: true } },
+      adjustments: { where: { is_billable: true }, select: { amount: true, quantity: true } },
+    },
   });
+  if (!order) return null;
+  const open = await db.invoice.aggregate({
+    where: {
+      order_id: orderId,
+      status: { in: ["DRAFT", "ISSUED"] },
+      ...(opts.excludeInvoiceId ? { id: { not: opts.excludeInvoiceId } } : {}),
+    },
+    _sum: { amount: true },
+  });
+  const total = sen(order.final_price);
+  const net = sen(order.paid_to_date) - sen(order.refunded_total);
+  const credit = sen(order.credit_balance);
+  const covered = net - credit;
+  const openSen = sen(open._sum.amount);
+  return {
+    total,
+    base: sen(dpBaseOf(order, order.service_items)),
+    charges: order.adjustments.reduce((s, a) => s + sen(a.amount) * (a.quantity ?? 1), 0),
+    received: sen(order.paid_to_date),
+    refunded: sen(order.refunded_total),
+    net,
+    credit,
+    covered,
+    open: openSen,
+    billable: total - covered - openSen,
+    paymentStatus: order.payment_status,
+  };
 }
 
 /**
- * What is already billed on an order, for the "never bill more than the order
- * total" checks: the active invoices plus money received on invoices that a
- * cancellation voided. That money still counts toward the cancellation fee
- * (cancelOrder bills only the rest), so it must not be billed again. Only
- * cancelOrder voids invoices, so other orders are unaffected.
+ * INV-5 (Covered ≤ T): when the total fell below what money already covers
+ * (a billed charge removed, a cancellation fee lower than the money kept),
+ * the excess becomes saldo lebih (RELEASE). Called under the order lock, at
+ * the end of rollupOrderFinance, mark-paid and cancel. Returns the rupiah
+ * released.
  */
-export async function billedSoFar(
+export async function settleCredit(
+  tx: Prisma.TransactionClient,
   orderId: string,
-  excludeInvoiceId?: string,
-  db: Db = prisma,
+  note = "Total order turun di bawah uang yang sudah diterima",
 ): Promise<number> {
-  const [active, voidedPaid] = await Promise.all([
-    db.invoice.aggregate({
-      where: {
-        order_id: orderId,
-        ...(excludeInvoiceId ? { id: { not: excludeInvoiceId } } : {}),
-        status: { notIn: ["REVISED", "CANCELLED"] },
-      },
-      _sum: { amount: true },
-    }),
-    db.invoice.aggregate({
-      where: { order_id: orderId, status: "CANCELLED", paid_at: { not: null } },
-      _sum: { amount: true },
-    }),
-  ]);
-  return Number(active._sum.amount ?? 0) + Number(voidedPaid._sum.amount ?? 0);
+  const m = await moneyState(tx, orderId);
+  if (!m || m.covered <= m.total) return 0;
+  const release = m.covered - m.total;
+  await addCreditEntry(tx, { orderId, kind: "RELEASE", amount: rp(release), note, actor: "SYSTEM" });
+  return rp(release);
+}
+
+/**
+ * INV-9: payment_status from Net, T and base (orderPaymentStatus), written
+ * when it changed. For transactions that move Net without a rollup (refunds).
+ */
+export async function recomputePaymentStatus(tx: Prisma.TransactionClient, orderId: string): Promise<string> {
+  const order = await tx.order.findUniqueOrThrow({
+    where: { id: orderId },
+    select: {
+      final_price: true,
+      paid_to_date: true,
+      payment_status: true,
+      refunded_total: true,
+      cancellation_fee: true,
+      service_items: { select: { total_price: true, line_status: true } },
+    },
+  });
+  const status = orderPaymentStatus(order, order.service_items);
+  if (status !== order.payment_status) {
+    await tx.order.update({ where: { id: orderId }, data: { payment_status: status } });
+  }
+  return status;
 }
 
 /**
  * The money of one order (finance design §2), returned as `money` by
- * GET /orders/:id. All amounts in rupiah.
+ * GET /orders/:id and as `order_money` by the money endpoints. All amounts in
+ * rupiah.
  *
- * Rule set "v3-a1" (PR A1): the ledger columns exist, but the numbers are
- * today's rules, so nothing an admin sees changes yet:
- *  - billable_remaining is the cap generateInvoice enforces today: total −
- *    billedSoFar (invoice amounts), not total − covered − open_billed.
- *  - start_ready is startPayment (money received before refunds ≥ base).
- *  - credit_balance is 0 unless the migration opened it (OPENING); nothing
- *    adds to or uses it yet.
- * PR A2 moves billable_remaining to covered and start_ready to net_paid and
- * sets the rule to "v3".
+ * Rule set "v3" (PR A2): new invoices are capped by Billable (on Covered, so
+ * an underpaid invoice's shortfall can be billed again and saldo lebih is
+ * not billed twice); payment_status and start_ready use Net (money received
+ * − refunded).
  */
 export interface OrderMoney {
   /** T: the order total (final_price). */
@@ -187,61 +238,38 @@ export interface OrderMoney {
   covered: number;
   /** Cash asked on active unpaid invoices (DRAFT/ISSUED). */
   open_billed: number;
-  /** The most a new invoice may ask for. */
+  /** The most a new invoice may cover (gross, before saldo lebih): total − covered − open_billed. */
   billable_remaining: number;
   /** Piutang: max(0, total − net_paid). */
   outstanding: number;
   payment_status: string;
+  /** "Mulai perjalanan" allowed: net_paid ≥ rental price of the days not cancelled. */
   start_ready: boolean;
-  rule: "v3-a1";
+  rule: "v3";
 }
 
 export async function computeOrderMoney(db: Db, orderId: string): Promise<OrderMoney | null> {
-  const order = await db.order.findUnique({
-    where: { id: orderId },
-    select: {
-      final_price: true,
-      paid_to_date: true,
-      payment_status: true,
-      is_refunded: true,
-      refund_amount: true,
-      refunded_total: true,
-      credit_balance: true,
-      cancellation_fee: true,
-      service_items: { select: { total_price: true, line_status: true } },
-      adjustments: { where: { is_billable: true }, select: { amount: true, quantity: true } },
-    },
-  });
-  if (!order) return null;
-  const [billed, open] = await Promise.all([
-    billedSoFar(orderId, undefined, db),
-    db.invoice.aggregate({
-      where: { order_id: orderId, status: { in: ["DRAFT", "ISSUED"] } },
-      _sum: { amount: true },
-    }),
+  const [m, days] = await Promise.all([
+    moneyState(db, orderId),
+    db.orderServiceItem.findMany({ where: { order_id: orderId }, select: { total_price: true, line_status: true } }),
   ]);
-
-  const total = sen(order.final_price);
-  // minDp from the same float the DP rule uses today (minDpFor), so the two agree.
-  const base = dpBaseOf(order, order.service_items);
-  const charges = order.adjustments.reduce((s, a) => s + sen(a.amount) * (a.quantity ?? 1), 0);
-  const net = sen(netPaid(order));
-  const credit = sen(order.credit_balance);
+  if (!m) return null;
   return {
-    total: rp(total),
-    base: rp(sen(base)),
-    min_dp: minDpFor(base),
-    charges: rp(charges),
-    received: rp(sen(order.paid_to_date)),
-    refunded: rp(sen(order.refunded_total)),
-    net_paid: rp(net),
-    credit_balance: rp(credit),
-    covered: rp(net - credit),
-    open_billed: rp(sen(open._sum.amount)),
-    billable_remaining: rp(Math.max(0, total - sen(billed))),
-    outstanding: rp(Math.max(0, total - net)),
-    payment_status: order.payment_status,
-    start_ready: startPayment(order, order.service_items).ready,
-    rule: "v3-a1",
+    total: rp(m.total),
+    base: rp(m.base),
+    // minDp from the same float the DP rule uses (minDpFor), so the two agree.
+    min_dp: minDpFor(rp(m.base)),
+    charges: rp(m.charges),
+    received: rp(m.received),
+    refunded: rp(m.refunded),
+    net_paid: rp(m.net),
+    credit_balance: rp(m.credit),
+    covered: rp(m.covered),
+    open_billed: rp(m.open),
+    billable_remaining: rp(Math.max(0, m.billable)),
+    outstanding: rp(Math.max(0, m.total - m.net)),
+    payment_status: m.paymentStatus,
+    start_ready: m.net >= sen(rentalBaseOf(days)),
+    rule: "v3",
   };
 }
