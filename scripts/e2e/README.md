@@ -24,7 +24,7 @@ What is covered (about 320 checks):
 | E | cancellation tier 1, releasing drivers, no cancellation-fee invoice when the DP covers the fee, fee/date/reason stored on the order; the days of a cancelled order are locked (T5) |
 | F | login with any phone format, roles, duplicate phone numbers |
 | G | DP/settlement/full rules, one receipt per payment (also on a double click), two invoices paid at once, pay vs revise at once, money kept after a cancellation (also on the statement), kwitansi PDF, one "lunas" push, invalid dates, overpayment and refund |
-| H | website leads: idempotent intake, honeypot, sendBeacon, lead code as order code |
+| H | website leads: idempotent intake, honeypot, sendBeacon, lead code as order code; map points (a valid side stored and returned, an invalid or half point dropped without losing the lead); day points on orders (returned on detail and schedule, kept when left out of Edit Order, cleared by null, half a point / out of range / place id without a point → 400) |
 | I | partner days: allowed before DP, VENDOR payable, WhatsApp confirmation links |
 | J | phone clock clamp, XOPS billing, day-H cancellation, old open trips ("Belum ditutup") |
 | K | input limits: GPS pairs, file type/size, `client_ref` reuse, push tokens, unassigning |

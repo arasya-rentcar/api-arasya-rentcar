@@ -425,6 +425,14 @@ model OrderServiceItem {
   pickup_location        String
   dropoff_location       String
   driver_origin_location String?
+  // Map points of the pickup and drop-off (2026-10-07, website maps picker):
+  // set together (lat + lng) or not at all; place_id is the map provider's id.
+  pickup_lat             Float?
+  pickup_lng             Float?
+  pickup_place_id        String?
+  dropoff_lat            Float?
+  dropoff_lng            Float?
+  dropoff_place_id       String?
   quantity               Int       @default(1)
   unit_price             Decimal   @default(0) @db.Decimal(12, 2)
   total_price            Decimal   @default(0) @db.Decimal(12, 2)
@@ -892,32 +900,42 @@ enum WebLeadStatus {
 }
 
 model WebLead {
-  id                   String        @id @default(uuid())
-  lead_code            String        @unique
-  status               WebLeadStatus @default(NEW)
-  name                 String
-  trip_date            String?
-  pickup_time          String?
-  pickup_location      String
-  destination          String?
-  unit                 String?
-  passenger_count      Int?
-  duration             String?
+  id                     String        @id @default(uuid())
+  lead_code              String        @unique
+  status                 WebLeadStatus @default(NEW)
+  name                   String
+  trip_date              String?
+  pickup_time            String?
+  pickup_location        String
+  destination            String?
+  /// Map points picked on the website (2026-10-07): a side is stored only
+  /// when both lat and lng were valid; place_id/name are the map provider's.
+  pickup_lat             Float?
+  pickup_lng             Float?
+  pickup_place_id        String?
+  pickup_place_name      String?
+  destination_lat        Float?
+  destination_lng        Float?
+  destination_place_id   String?
+  destination_place_name String?
+  unit                   String?
+  passenger_count        Int?
+  duration               String?
   /// Website's duration choice: 12h | allin | oneway | return | multi.
-  duration_key         String?
-  notes                String?
-  page_path            String?
-  language             String?
-  campaign             String?
-  gclid                String?
-  ga_client_id         String?
-  ga_session_id        String?
-  ignore_reason        String?
-  order_id             String?       @unique
-  order                Order?        @relation(fields: [order_id], references: [id], onDelete: SetNull)
-  purchase_reported_at DateTime?
-  created_at           DateTime      @default(now())
-  updated_at           DateTime      @updatedAt
+  duration_key           String?
+  notes                  String?
+  page_path              String?
+  language               String?
+  campaign               String?
+  gclid                  String?
+  ga_client_id           String?
+  ga_session_id          String?
+  ignore_reason          String?
+  order_id               String?       @unique
+  order                  Order?        @relation(fields: [order_id], references: [id], onDelete: SetNull)
+  purchase_reported_at   DateTime?
+  created_at             DateTime      @default(now())
+  updated_at             DateTime      @updatedAt
 
   @@index([status])
   @@index([created_at])

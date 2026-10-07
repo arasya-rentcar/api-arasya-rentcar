@@ -644,6 +644,74 @@ await section('H. Website leads', async () => {
   check('H8 ignoring a converted lead refused (409)', (await call('POST', `/leads/${L.id}/ignore`, { token: admin, body: {} })).status === 409);
   const again = await makeOrder('H9', { extra: { web_lead_id: L.id } }).catch((e) => e);
   check('H9 second order from the same lead refused', again instanceof Error && / 409 /.test(again.message));
+
+  // Map points from the website (maps picker F1): a side is kept only with
+  // both lat and lng valid; a bad point never loses the lead.
+  const c4 = code();
+  await post({
+    ...lead, lead_code: c4,
+    pickup_lat: -6.5971, pickup_lng: 106.806, pickup_place_id: 'ChIJ-pickup', pickup_place_name: 'Botani Square',
+    destination_lat: '-6.9175', destination_lng: '107.6191', destination_place_id: 'ChIJ-dest', destination_place_name: 'Gedung Sate',
+  });
+  const P = await prisma.webLead.findUnique({ where: { lead_code: c4 } });
+  check('H10 lead with map points stored (numeric strings too)', P?.pickup_lat === -6.5971 && P.pickup_lng === 106.806 && P.pickup_place_id === 'ChIJ-pickup' && P.pickup_place_name === 'Botani Square' && P.destination_lat === -6.9175 && P.destination_lng === 107.6191 && P.destination_place_name === 'Gedung Sate', JSON.stringify(P));
+  const pd = (await call('GET', `/leads/${P?.id}`, { token: admin })).data;
+  check('H11 lead detail returns the points as numbers', pd?.pickup_lat === -6.5971 && pd.destination_lng === 107.6191 && pd.pickup_place_id === 'ChIJ-pickup' && pd.destination_place_name === 'Gedung Sate');
+  const pl = (await call('GET', `/leads?q=${c4}`, { token: admin })).data;
+  check('H12 lead list returns the points', pl?.length === 1 && pl[0].pickup_lng === 106.806 && pl[0].destination_place_id === 'ChIJ-dest');
+  const c5 = code();
+  const r5 = await post({
+    ...lead, lead_code: c5,
+    pickup_lat: 200, pickup_lng: 106.8, pickup_place_id: 'ChIJ-bad', pickup_place_name: 'Out of range',
+    destination_lat: -6.9175, destination_lng: 107.6191, destination_place_name: 'Gedung Sate',
+  });
+  const B = await prisma.webLead.findUnique({ where: { lead_code: c5 } });
+  check('H13 invalid pickup point: lead stored, pickup side null, valid destination kept', r5.status === 204 && B?.pickup_location === 'Bogor' && B.pickup_lat === null && B.pickup_lng === null && B.pickup_place_id === null && B.pickup_place_name === null && B.destination_lat === -6.9175 && B.destination_place_name === 'Gedung Sate', JSON.stringify(B));
+  const c6 = code();
+  await post({ ...lead, lead_code: c6, pickup_lat: -6.6, pickup_place_name: 'Lat only', destination_lat: -6.9, destination_lng: 'abc', destination_place_id: 'x'.repeat(301) });
+  const HP = await prisma.webLead.findUnique({ where: { lead_code: c6 } });
+  check('H14 half / non-numeric points: lead stored, both sides null', HP != null && HP.pickup_lat === null && HP.pickup_place_name === null && HP.destination_lat === null && HP.destination_lng === null && HP.destination_place_id === null, JSON.stringify(HP));
+  check('H15 lead without points: points null', L.pickup_lat === null && L.pickup_lng === null && L.destination_lat === null && L.destination_place_name === null);
+
+  // Order days carry map points (F4 copies the lead's into "Buat order").
+  const pts = { pickup_lat: -6.5971, pickup_lng: 106.806, pickup_place_id: 'ChIJ-pickup', dropoff_lat: -6.9175, dropoff_lng: 107.6191, dropoff_place_id: 'ChIJ-dest' };
+  const day = (n, extra = {}) => ({
+    service_date: wibIso(n, '00:00'), start_at: wibIso(n, '08:00'), end_at: wibIso(n, '20:00'),
+    pickup_location: 'Botani Square', dropoff_location: 'Gedung Sate', service_kind: '12H', service_package: 'ALL-IN', unit_price: 1_000_000, ...extra,
+  });
+  const newOrder = (items) => call('POST', '/orders', {
+    token: admin,
+    body: {
+      customer_name: `TEST HP ${tag}`, customer_phone: `0857${rnd()}`, pickup_location: 'Botani Square', dropoff_location: 'Gedung Sate',
+      order_date: new Date().toISOString(), final_price: 2_000_000, service_items: items,
+    },
+  });
+  const po = await newOrder([day(5, pts), day(6)]);
+  let pt = await order(po.data?.id);
+  const [p1, p2] = pt?.service_items ?? [];
+  check('H16 order detail returns the day points; a day without points has nulls', po.status < 300 && p1?.pickup_lat === -6.5971 && p1.pickup_lng === 106.806 && p1.pickup_place_id === 'ChIJ-pickup' && p1.dropoff_lat === -6.9175 && p1.dropoff_place_id === 'ChIJ-dest' && p2?.pickup_lat === null && p2.dropoff_place_id === null, `${po.status} ${JSON.stringify(po.json?.errors ?? po.json?.message ?? '')}`);
+  const sch = await call('GET', `/schedule?search=${encodeURIComponent(pt.order_code)}`, { token: admin });
+  check('H17 schedule list returns the day points', sch.json?.items?.find((l) => l.id === p1.id)?.dropoff_lng === 107.6191);
+  const keep = await call('PUT', `/orders/${pt.id}`, { token: admin, body: editBody(pt, { notes: 'titik tetap' }) });
+  pt = await order(pt.id);
+  check('H18 edit without point fields keeps the points', keep.status === 200 && pt.service_items[0].notes === 'titik tetap' && pt.service_items[0].pickup_lat === -6.5971 && pt.service_items[0].dropoff_place_id === 'ChIJ-dest', keep.json?.message);
+  const body = editBody(pt);
+  body.service_items[0] = { ...body.service_items[0], pickup_lat: null, pickup_lng: null };
+  body.service_items[1] = { ...body.service_items[1], dropoff_lat: -6.2, dropoff_lng: 106.85 };
+  const clear = await call('PUT', `/orders/${pt.id}`, { token: admin, body });
+  pt = await order(pt.id);
+  const [q1, q2] = pt.service_items;
+  check('H19 point sent as null clears it and its place id; other side kept; new point on day 2', clear.status === 200 && q1.pickup_lat === null && q1.pickup_lng === null && q1.pickup_place_id === null && q1.dropoff_lat === -6.9175 && q1.dropoff_place_id === 'ChIJ-dest' && q2.dropoff_lat === -6.2 && q2.dropoff_lng === 106.85 && q2.dropoff_place_id === null, clear.json?.message);
+  const half = await newOrder([day(5, { pickup_lat: -6.5971 })]);
+  check('H20 half a point on a new order refused (400)', half.status === 400 && (half.json?.errors ?? []).some((e) => e.field.endsWith('pickup_lng')), JSON.stringify(half.json?.errors));
+  const range = editBody(pt);
+  range.service_items[0] = { ...range.service_items[0], dropoff_lat: 95, dropoff_lng: 106.8 };
+  check('H21 latitude out of range refused (400)', (await call('PUT', `/orders/${pt.id}`, { token: admin, body: range })).status === 400);
+  const orphan = editBody(pt);
+  orphan.service_items[1] = { ...orphan.service_items[1], pickup_place_id: 'ChIJ-x', pickup_lat: null, pickup_lng: null };
+  check('H22 place id without a point refused (400)', (await call('PUT', `/orders/${pt.id}`, { token: admin, body: orphan })).status === 400);
+  const unchanged = (await order(pt.id)).service_items;
+  check('H23 refused edits changed nothing', unchanged[0].dropoff_lat === -6.9175 && unchanged[1].pickup_place_id === null && unchanged[1].dropoff_lat === -6.2);
 });
 
 // ── I. Partner days ────────────────────────────────────────────────────────
