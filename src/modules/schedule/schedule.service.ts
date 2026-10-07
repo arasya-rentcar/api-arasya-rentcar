@@ -12,7 +12,7 @@ import {
   startPayment,
   startPaymentSelect,
 } from '../orders/assignment-guard';
-import { billedSoFar } from '../invoices/invoices.service';
+import { billedSoFar } from '../orders/order-money';
 import { rupiah } from '../../services/adminNotify';
 import { MARGIN_FORMULA_VERSION } from '../../utils/margin';
 import { staleTripCutoff } from '../../utils/wib';
@@ -460,8 +460,8 @@ export async function assignScheduleLine(
   const updated = await prisma.$transaction(async (tx) => {
     await tx.orderServiceItem.update({ where: { id }, data });
     // The order total before this change, read under the order lock (day →
-    // order, like every caller): the baseline of the B1.3 check below. The
-    // total read before the transaction may already be out of date.
+    // order, B9 lock order in order-money.ts): the baseline of the B1.3 check
+    // below. The total read before the transaction may already be out of date.
     await tx.$queryRaw`SELECT id FROM "orders" WHERE id = ${line.order_id} FOR NO KEY UPDATE`;
     const before = await tx.order.findUniqueOrThrow({
       where: { id: line.order_id },
@@ -560,7 +560,7 @@ export async function rollupOrderFinance(
   tx: Prisma.TransactionClient,
   orderId: string,
 ) {
-  // Lock the order row (day → order, like every caller) so a payment
+  // Lock the order row (day → order, B9 lock order in order-money.ts) so a payment
   // recorded meanwhile cannot slip between reading the money and writing
   // payment_status below.
   await tx.$queryRaw`SELECT id FROM "orders" WHERE id = ${orderId} FOR NO KEY UPDATE`;

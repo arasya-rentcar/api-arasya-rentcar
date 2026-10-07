@@ -1,10 +1,12 @@
-// Local stand-in for Supabase Storage + Expo Push, for API e2e checks.
+// Local stand-in for Supabase Storage, Expo Push and the GA4 collector, for API e2e checks.
 import http from 'node:http';
 
 const pushes = [];
 const objects = new Map();
 // Website deploy hook (price list publish): calls counted, can be made to fail.
 const deployHook = { calls: 0, fail: false };
+// GA4 Measurement Protocol sends (GA4_COLLECT_URL points here).
+const ga4 = [];
 
 const server = http.createServer((req, res) => {
   const chunks = [];
@@ -30,6 +32,11 @@ const server = http.createServer((req, res) => {
       if (url.searchParams.has('fail')) deployHook.fail = url.searchParams.get('fail') === '1';
       return json(200, deployHook);
     }
+    if (url.pathname === '/ga4/collect' && req.method === 'POST') {
+      ga4.push({ at: new Date().toISOString(), measurement_id: url.searchParams.get('measurement_id'), ...JSON.parse(body.toString() || '{}') });
+      return json(200, {});
+    }
+    if (url.pathname === '/__ga4') return json(200, ga4);
     if (url.pathname === '/__pushes') return json(200, pushes);
     if (url.pathname === '/__objects') return json(200, [...objects.keys()]);
     // The stored bytes of one upload ("<bucket>/<path>"), e.g. to see a stamp.
@@ -49,6 +56,13 @@ const server = http.createServer((req, res) => {
     if (obj && (req.method === 'POST' || req.method === 'PUT')) {
       objects.set(`${obj[1]}/${obj[2]}`, body);
       return json(200, { Key: `${obj[1]}/${obj[2]}`, Id: 'id' });
+    }
+    // remove([paths]): DELETE /storage/v1/object/<bucket> { prefixes }.
+    const del = url.pathname.match(/^\/storage\/v1\/object\/([^/]+)$/);
+    if (del && req.method === 'DELETE') {
+      const { prefixes = [] } = JSON.parse(body.toString() || '{}');
+      for (const p of prefixes) objects.delete(`${del[1]}/${p}`);
+      return json(200, []);
     }
     if (req.method === 'DELETE') return json(200, []);
     return json(200, {});

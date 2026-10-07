@@ -1710,7 +1710,252 @@ await section('Q. Cancelled days, billed totals, DP minimum (B1, B2, B7, B12)', 
   await call('PATCH', `/prices/extras/${otRow.id}`, { token: admin, body: { percent: otRow.percent } });
   const pct = (n) => `${new Intl.NumberFormat('id-ID', { maximumFractionDigits: 2 }).format(n)}%`;
   check('Q24 invoice overtime % is the published one, not the unpublished edit',
-    dp15Pdf.includes(`${pct(pubPct)} dari harga Full day`) && !dp15Pdf.includes(pct(draftPct)), `published ${pct(pubPct)} draft ${pct(draftPct)} found ${/\S+% dari harga Full day/.exec(dp15Pdf)?.[0]}`);
+    dp15Pdf.includes(`${pct(pubPct)} dari harga Full day`) && !dp15Pdf.includes(pct(draftPct)), `published ${pct(pubPct)} draft ${pct(draftPct)} found ${/[\d.,]+% dari harga Full day/.exec(dp15Pdf)?.[0]}`);
+});
+
+// ── R. Order money, lock order, client_ref, GA4 (finance package A1) ───────
+// The parts of group R (finance design §11) that PR A1 covers: R22–R25, R33.
+await section('R. Order money, one lock order, client_ref, GA4 (finance A1: B8, B9, B12)', async () => {
+  const dR = await makeDriver(50);
+  const carR = await makeCar('Rush');
+  const sen = (v) => Math.round(Number(v ?? 0) * 100);
+  const cancel = (o, reason = 'R batal') => call('POST', `/orders/${o.id}/cancel`, { token: admin, body: { reason } });
+  // Answers a race may give: done, refused (409) or gone (404). Never a 500.
+  const fine = (r) => [200, 201, 404, 409].includes(r.status);
+
+  /** What must hold for one order after any interleaving (today's money rules). */
+  async function moneyProblems(orderId) {
+    const o = await prisma.order.findUnique({
+      where: { id: orderId },
+      include: {
+        service_items: true,
+        adjustments: true,
+        invoices: { include: { receipts: { orderBy: { created_at: 'asc' }, take: 1 } } },
+      },
+    });
+    const bad = [];
+    const money = o.invoices.filter((i) => i.status === 'PAID' || (i.status === 'CANCELLED' && i.paid_at));
+    const received = money.reduce((s, i) => s + sen(i.receipts[0]?.amount ?? i.amount), 0);
+    if (received !== sen(o.paid_to_date)) bad.push(`paid_to_date ${o.paid_to_date} ≠ receipts ${received / 100}`);
+    const net = sen(o.paid_to_date) - (o.is_refunded ? sen(o.refund_amount) : 0);
+    const total = sen(o.final_price);
+    let base;
+    if (o.cancellation_fee != null) {
+      if (total !== sen(o.cancellation_fee)) bad.push(`total ${o.final_price} ≠ fee ${o.cancellation_fee}`);
+      if (o.service_items.some((l) => l.line_status !== 'CANCELLED' && l.line_status !== 'DONE')) bad.push('a day still open after the cancel');
+      if (o.invoices.some((i) => !['REVISED', 'CANCELLED'].includes(i.status) && i.invoice_type !== 'CANCELLATION_FEE')) bad.push('an invoice still active after the cancel');
+      base = sen(o.cancellation_fee);
+    } else {
+      base = o.service_items.filter((l) => l.line_status !== 'CANCELLED').reduce((s, l) => s + sen(l.total_price), 0);
+      const charges = o.adjustments.filter((a) => a.is_billable).reduce((s, a) => s + sen(a.amount) * (a.quantity ?? 1), 0);
+      if (total !== base + charges) bad.push(`total ${o.final_price} ≠ days + charges ${(base + charges) / 100}`);
+      if (o.service_items.some((l) => l.line_status === 'CANCELLED' && l.driver_id && !l.actual_start_at && !l.trip_started_at)) bad.push('a cancelled day that never started keeps its driver');
+    }
+    const minDp = Math.round((base / 100) * 0.2) * 100;
+    const want = total > 0 && net >= total ? 'PAID' : net > 0 && net >= minDp ? 'DP_PAID' : 'UNPAID';
+    if (o.payment_status !== want) bad.push(`payment_status ${o.payment_status}, rule says ${want}`);
+    return bad;
+  }
+
+  // R22 (B9): one lock order. Before, cancelOrder locked order → days while
+  // Edit Hari and the driver app lock day → order, and markInvoicePaid locked
+  // invoice → order: a deadlock answered 500. Even rounds: both requests queue
+  // behind a lock the test holds on the order row, so they meet inside their
+  // transactions (cancel sent first, then the other one first). Odd rounds: no
+  // held lock, the second request a little later each time.
+  async function race(orderId, i, first, second) {
+    if (i % 2 === 1) return Promise.all([first(), sleep((i % 5) * 60).then(second)]);
+    let both;
+    await prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM "orders" WHERE id = ${orderId} FOR UPDATE`;
+      const [a, b] = i % 4 === 0 ? [0, 40] : [40, 0];
+      both = Promise.all([sleep(a).then(first), sleep(b).then(second)]);
+      await sleep(1500);
+    }, { timeout: 15000 });
+    return both;
+  }
+  const races = { pay: {}, start: {}, edit: {} };
+  const tally = (k, a, b) => (races[k][`${a.status}/${b.status}`] = (races[k][`${a.status}/${b.status}`] ?? 0) + 1);
+  const bad22 = { pay: [], start: [], edit: [] };
+  for (let i = 0; i < 10; i++) {
+    const oa = await makeOrder(`R22a${i}`, { startDay: 60 + i });
+    const dpa = await invoice(oa.id, 'DP', 300_000);
+    const [ca, pa] = await race(oa.id, i, () => cancel(oa), () => markPaid(oa.id, dpa.data.id));
+    tally('pay', ca, pa);
+    for (const r of [ca, pa]) if (!fine(r)) bad22.pay.push(`#${i} ${r.status} ${r.json?.message ?? ''}`);
+    bad22.pay.push(...(await moneyProblems(oa.id)).map((m) => `#${i} ${m}`));
+
+    const ob = await makeOrder(`R22b${i}`, { startDay: 80 + i });
+    await payDp(ob, 300_000);
+    const lb = ob.service_items[0].id;
+    await putLine(lb, { is_external: false, driver_id: dR.id, car_id: carR.id, line_status: 'ASSIGNED' });
+    await act(dR, lb, 'accept');
+    const [cb, sb] = await race(ob.id, i, () => cancel(ob), () => act(dR, lb, 'start'));
+    tally('start', cb, sb);
+    for (const r of [cb, sb]) if (!fine(r)) bad22.start.push(`#${i} ${r.status} ${r.json?.message ?? ''}`);
+    bad22.start.push(...(await moneyProblems(ob.id)).map((m) => `#${i} ${m}`));
+    const dayB = await prisma.orderServiceItem.findUnique({ where: { id: lb } });
+    if (cb.status === 200 && dayB.line_status !== 'CANCELLED') bad22.start.push(`#${i} cancelled order, day ${dayB.line_status}`);
+    if (dayB.actual_start_at && dayB.driver_id !== dR.id) bad22.start.push(`#${i} a started day lost its driver`);
+
+    const oc = await makeOrder(`R22c${i}`, { days: 2, startDay: 100 + 2 * i });
+    await payDp(oc, 400_000);
+    const [cc, ec] = await race(oc.id, i, () => cancel(oc), () => putLine(oc.service_items[1].id, { is_external: false, line_status: 'CANCELLED' }));
+    tally('edit', cc, ec);
+    for (const r of [cc, ec]) if (!fine(r)) bad22.edit.push(`#${i} ${r.status} ${r.json?.message ?? ''}`);
+    bad22.edit.push(...(await moneyProblems(oc.id)).map((m) => `#${i} ${m}`));
+  }
+  const show = (k) => `${JSON.stringify(races[k])} ${bad22[k].slice(0, 3).join(' | ')}`;
+  check('R22a [B9] cancel + "Tandai terbayar" at once, 10×: no 500, money consistent', bad22.pay.length === 0, show('pay'));
+  check('R22b [B9] cancel + driver "Berangkat" at once, 10×: no 500, money and days consistent', bad22.start.length === 0, show('start'));
+  check('R22c [B9] cancel + Edit Hari cancelling a day at once, 10×: no 500, money consistent', bad22.edit.length === 0, show('edit'));
+
+  // R23 (B8): client_ref on invoices.
+  const gen = (o, body) => call('POST', `/orders/${o.id}/generate-invoice`, { token: admin, body: { payment_method: 'BANK_TRANSFER', ...body } });
+  const seqOf = async (o) => (await prisma.customer.findUnique({ where: { id: o.customer_id } })).invoice_seq;
+  const o23 = await makeOrder('R23');
+  const ref23 = uuid();
+  const body23 = { invoice_type: 'DP', amount: 300_000, client_ref: ref23 };
+  const [g1, g2] = await Promise.all([gen(o23, body23), gen(o23, body23)]);
+  const rows23 = await prisma.invoice.findMany({ where: { order_id: o23.id } });
+  check('R23a same client_ref twice at once → one invoice (201 + 200, same number)',
+    [g1.status, g2.status].sort().join() === '200,201' && rows23.length === 1 && g1.data?.invoice_number === g2.data?.invoice_number && g1.data?.id === rows23[0].id,
+    `${g1.status}/${g2.status} rows ${rows23.length} ${g1.data?.invoice_number} ${g2.data?.invoice_number}`);
+  const cust23 = await prisma.customer.findUnique({ where: { id: o23.customer_id } });
+  const pdfs23 = (await (await fetch(`${MOCK}/__objects`)).json()).filter((k) => new RegExp(`/INV-\\d+-${cust23.code}-\\d+\\.pdf$`).test(k));
+  check('R23b one total_billed (300.000) and one invoice PDF left in storage', Number(cust23.total_billed) === 300000 && pdfs23.length === 1, `${cust23.total_billed} ${pdfs23.join(',')}`);
+  const seq23 = await seqOf(o23);
+  const g3 = await gen(o23, body23);
+  check('R23c a later resend → 200 with the same invoice, no new number reserved', g3.status === 200 && g3.data?.id === rows23[0].id && (await seqOf(o23)) === seq23, `${g3.status} seq ${seq23}`);
+  const o23b = await makeOrder('R23d');
+  const [x1, x2] = await Promise.all([
+    gen(o23b, { invoice_type: 'DP', amount: 600_000, client_ref: uuid() }),
+    gen(o23b, { invoice_type: 'DP', amount: 600_000, client_ref: uuid() }),
+  ]);
+  const rows23b = await prisma.invoice.findMany({ where: { order_id: o23b.id } });
+  check('R23d two different refs that together pass the total, at once → one 201, one 409 (cap checked under the lock)',
+    [x1.status, x2.status].sort().join() === '201,409' && rows23b.length === 1, `${x1.status}/${x2.status} rows ${rows23b.length}`);
+  check('R23e a client_ref of another order → 409', (await gen(o23b, body23)).status === 409);
+  const rev = (o, inv, amount, client_ref) => call('POST', `/orders/${o.id}/invoice/${inv.id}/revise`, { token: admin, body: { amount, client_ref } });
+  const rref = uuid();
+  const [rv1, rv2] = await Promise.all([rev(o23, rows23[0], 350_000, rref), rev(o23, rows23[0], 350_000, rref)]);
+  const rv3 = await rev(o23, rows23[0], 350_000, rref);
+  const revs = await prisma.invoice.findMany({ where: { order_id: o23.id, parent_id: rows23[0].id } });
+  check('R23f revise with the same client_ref twice at once, then again → one revision (201, 200, 200)',
+    [rv1.status, rv2.status].sort().join() === '200,201' && rv3.status === 200 && revs.length === 1 && rv3.data?.id === revs[0].id,
+    `${rv1.status}/${rv2.status}/${rv3.status} revisions ${revs.length}`);
+  check('R23g total_billed follows the one revision (350.000)', Number((await prisma.customer.findUnique({ where: { id: o23.customer_id } })).total_billed) === 350000);
+  const o23c = await makeOrder('R23h');
+  const dp23c = await invoice(o23c.id, 'DP', 300_000);
+  const [s1, s2] = await Promise.all([gen(o23c, { invoice_type: 'SETTLEMENT', amount: 700_000 }), rev(o23c, dp23c.data, 400_000, uuid())]);
+  const billed23c = (await prisma.invoice.findMany({ where: { order_id: o23c.id, status: { notIn: ['REVISED', 'CANCELLED'] } } })).reduce((s, i) => s + Number(i.amount), 0);
+  check('R23h settlement + raising the DP at once never bill past the total', billed23c <= 1_000_000 && [s1.status, s2.status].includes(409), `${s1.status}/${s2.status} billed ${billed23c}`);
+  check('R23i without client_ref (older dashboards) still 201', (await gen(await makeOrder('R23i'), { invoice_type: 'DP', amount: 200_000 })).status === 201);
+
+  // R24 (B8): client_ref on charges.
+  const adj = (o, client_ref, amount = 150_000) =>
+    call('POST', `/orders/${o.id}/adjustments`, { token: admin, body: { type: 'OVERTIME', description: 'Overtime 2 jam', amount, ...(client_ref ? { client_ref } : {}) } });
+  const o24 = await makeOrder('R24');
+  const aref = uuid();
+  const [a1, a2] = await Promise.all([adj(o24, aref), adj(o24, aref)]);
+  const a3 = await adj(o24, aref);
+  const rows24 = await prisma.orderAdjustment.findMany({ where: { order_id: o24.id } });
+  const o24a = await order(o24.id);
+  check('R24a same client_ref twice at once, then again → one charge (201, 200, 200), total 1.150.000',
+    [a1.status, a2.status].sort().join() === '200,201' && a3.status === 200 && rows24.length === 1 && a3.data?.id === rows24[0].id && Number(o24a.final_price) === 1150000,
+    `${a1.status}/${a2.status}/${a3.status} rows ${rows24.length} total ${o24a.final_price}`);
+  check('R24b a charge client_ref of another order → 409', (await adj(await makeOrder('R24b'), aref)).status === 409);
+  check('R24c without client_ref still 201', (await adj(o24, null, 50_000)).status === 201);
+  await cancel(o24);
+  check('R24d a resend after the order was cancelled → 200 with the same charge (no new one)', (await adj(o24, aref)).status === 200 && (await prisma.orderAdjustment.count({ where: { order_id: o24.id } })) === 2);
+
+  // R25 (B12): GA4 through the mock collector (GA4_COLLECT_URL).
+  const ga4 = async () => (await fetch(`${MOCK}/__ga4`)).json();
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  async function gaLead() {
+    const code = `ARS-${Array.from({ length: 5 }, () => alphabet[Math.floor(Math.random() * alphabet.length)]).join('')}`;
+    const cid = `${rnd()}.${rnd()}`;
+    await fetch(`${BASE}/public/leads`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Origin: 'https://arasya-web.vercel.app' },
+      body: JSON.stringify({ lead_code: code, name: `GA ${tag}`, trip_date: '2026-11-20', pickup_time: '08:00', pickup_location: 'Bogor', destination: 'Bandung', unit: 'Innova Reborn', passenger_count: 4, duration_key: 'return', ga_client_id: cid }),
+    });
+    return { ...(await prisma.webLead.findUnique({ where: { lead_code: code } })), cid };
+  }
+  const sentTo = async (lead) => (await ga4()).filter((e) => e.client_id === lead.cid);
+  const l1 = await gaLead();
+  const o25a = await makeOrder('R25a', { startDay: 5, extra: { web_lead_id: l1.id } });
+  await payDp(o25a, 300_000);
+  await sleep(800);
+  const sent1 = await sentTo(l1);
+  check('R25a control: a paid DP reports one purchase to the collector (value = order total)',
+    sent1.length === 1 && sent1[0].events?.[0]?.name === 'purchase' && sent1[0].events[0].params.value === 1000000 && sent1[0].events[0].params.transaction_id === o25a.order_code,
+    JSON.stringify(sent1).slice(0, 200));
+  const l2 = await gaLead();
+  const o25b = await makeOrder('R25b', { startDay: -1, extra: { web_lead_id: l2.id } });
+  await cancel(o25b);
+  const fee25 = (await order(o25b.id)).invoices.find((i) => i.invoice_type === 'CANCELLATION_FEE');
+  const paid25 = fee25 ? await markPaid(o25b.id, fee25.id) : { status: 0 };
+  await sleep(800);
+  check('R25b paying the cancellation-fee invoice of a cancelled order sends no purchase',
+    paid25.status === 200 && (await sentTo(l2)).length === 0 && !(await prisma.webLead.findUnique({ where: { id: l2.id } })).purchase_reported_at,
+    `pay ${paid25.status}, sends ${(await sentTo(l2)).length}`);
+  const o25c = await makeOrder('R25c', { startDay: 3 });
+  await payDp(o25c, 300_000);
+  await cancel(o25c);
+  const l3 = await gaLead();
+  const link = await call('POST', `/leads/${l3.id}/link`, { token: admin, body: { order_id: o25c.id } });
+  await sleep(800);
+  check('R25c linking a lead to a cancelled order that has money sends no purchase',
+    link.status === 200 && (await order(o25c.id)).payment_status !== 'UNPAID' && (await sentTo(l3)).length === 0,
+    `link ${link.status} ${link.json?.message ?? ''}, sends ${(await sentTo(l3)).length}`);
+
+  // R33: invariants over every order this run made (finance design §6). In A1
+  // the ledger is only opened (no OVERPAYMENT/RELEASE yet), so INV-5/INV-6
+  // are checked in today's form: invoices never bill past the total.
+  const mine = await prisma.order.findMany({
+    where: { customer_name: { contains: tag } },
+    include: {
+      invoices: { include: { receipts: { orderBy: { created_at: 'asc' }, take: 1 } } },
+      refunds: true,
+      credit_entries: true,
+    },
+  });
+  const v = { inv12: [], inv3: [], inv4: [], money: [], cap: [] };
+  for (const o of mine) {
+    const name = o.order_code ?? o.id;
+    const credit = o.credit_entries.reduce((s, e) => s + sen(e.amount), 0);
+    if (sen(o.credit_balance) < 0 || sen(o.credit_balance) !== credit) v.inv12.push(`${name} ${o.credit_balance}≠${credit / 100}`);
+    const refunds = o.refunds.reduce((s, r) => s + sen(r.amount), 0);
+    const legacy = o.is_refunded ? sen(o.refund_amount) : 0;
+    if (sen(o.refunded_total) !== refunds || refunds !== legacy) v.inv3.push(`${name} ${o.refunded_total}/${refunds / 100}/${legacy / 100}`);
+    const paidInv = o.invoices.filter((i) => i.status === 'PAID' || (i.status === 'CANCELLED' && i.paid_at));
+    const received = paidInv.reduce((s, i) => s + sen(i.receipts[0]?.amount ?? i.amount), 0);
+    if (received !== sen(o.paid_to_date)) v.inv4.push(`${name} paid_to_date ${o.paid_to_date}≠${received / 100}`);
+    for (const i of paidInv) if (i.receipts[0] && sen(i.amount_received) !== sen(i.receipts[0].amount)) v.inv4.push(`${i.invoice_number} amount_received ${i.amount_received}`);
+    const billed = o.invoices.filter((i) => !['REVISED', 'CANCELLED'].includes(i.status) || (i.status === 'CANCELLED' && i.paid_at)).reduce((s, i) => s + sen(i.amount), 0);
+    const open = o.invoices.filter((i) => ['DRAFT', 'ISSUED'].includes(i.status)).reduce((s, i) => s + sen(i.amount), 0);
+    const T = sen(o.final_price);
+    if (o.cancellation_fee == null && billed > T) v.cap.push(`${name} billed ${billed / 100} > total ${o.final_price}`);
+    const g = await order(o.id);
+    const m = g.money;
+    const net = sen(o.paid_to_date) - sen(o.refunded_total);
+    const want = {
+      total: T, received: sen(o.paid_to_date), refunded: sen(o.refunded_total), net_paid: net, credit_balance: sen(o.credit_balance),
+      covered: net - sen(o.credit_balance), open_billed: open, billable_remaining: Math.max(0, T - billed), outstanding: Math.max(0, T - net),
+    };
+    const diff = Object.entries(want).filter(([k, x]) => sen(m?.[k]) !== x).map(([k, x]) => `${k} ${m?.[k]}≠${x / 100}`);
+    if (m?.payment_status !== o.payment_status) diff.push(`payment_status ${m?.payment_status}`);
+    if (m?.start_ready !== g.start_payment?.ready) diff.push('start_ready ≠ start_payment.ready');
+    if (!Array.isArray(g.refunds) || !Array.isArray(g.credit_entries) || g.refunds.some((r) => 'proof_url' in r)) diff.push('refunds / credit_entries shape');
+    if (diff.length) v.money.push(`${name}: ${diff.join(', ')}`);
+  }
+  const head = (a) => `${a.length} of ${mine.length} orders ${a.slice(0, 3).join(' | ')}`;
+  check('R33a [INV-1, INV-2] credit_balance ≥ 0 and = Σ credit entries', v.inv12.length === 0, head(v.inv12));
+  check('R33b [INV-3] refunded_total = Σ refunds = the old refund columns', v.inv3.length === 0, head(v.inv3));
+  check('R33c [INV-4] paid_to_date = Σ receipts; amount_received = the receipt', v.inv4.length === 0, head(v.inv4));
+  check('R33d `money` on GET /orders/:id matches the stored money (and start_payment)', v.money.length === 0, head(v.money));
+  check('R33e [INV-6, today\'s form] no order not cancelled is billed past its total', v.cap.length === 0, head(v.cap));
 });
 
 const failed = summary();
