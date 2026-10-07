@@ -2195,9 +2195,16 @@ const samePlan = (a: CancelPlan, b: CancelPlan) =>
  */
 export async function cancelOrder(
   orderId: string,
-  input: { reason: string; actor?: string; expected_fee_total?: number; requested_at?: string },
+  input: {
+    reason: string;
+    actor?: string;
+    expected_fee_total?: number;
+    requested_at?: string;
+    client_ref?: string;
+  },
 ): Promise<CancelOrderResult> {
   const { reason, actor } = input;
+  const ref = input.client_ref ?? null;
   const now = new Date();
   const when = cancelDecisionTime(input.requested_at, now);
   if (when.error) throw new AppError(when.error, 400);
@@ -2208,6 +2215,11 @@ export async function cancelOrder(
     include: { customer: true },
   });
   if (!order) throw new AppError("Order not found", 404);
+  // Idempotency (client_ref): a resend of the cancel that went through gets
+  // its stored result; another ref on a cancelled order is refused below.
+  const replayed = cancelReplay(order, ref);
+  if (replayed) return replayed;
+  if (ref) await assertCancelRefFree(orderId, ref);
   const before = await loadCancelPlan(prisma, orderId, order.service_start_at, decidedAt);
   assertCancellable(order, before.days);
   if (
@@ -2274,8 +2286,11 @@ export async function cancelOrder(
       await lockOrder(tx, orderId);
       const fresh = await tx.order.findUniqueOrThrow({
         where: { id: orderId },
-        select: { order_status: true, cancellation_fee: true },
+        select: { order_status: true, cancellation_fee: true, cancel_client_ref: true, cancel_result: true },
       });
+      // The same ref committed meanwhile (a double click): its result.
+      const again = cancelReplay(fresh, ref);
+      if (again) return again;
       if (
         fresh.order_status === "DONE" ||
         fresh.order_status === "CANCELLED" ||
@@ -2451,7 +2466,7 @@ export async function cancelOrder(
 
       const after = await moneyState(tx, orderId);
       if (!after) throw new AppError("Order not found", 404);
-      return {
+      const out: CancelOrderResult = {
         tier: plan.tier,
         penalty: rp(plan.feeTotalSen),
         originalFinalPrice,
@@ -2470,7 +2485,14 @@ export async function cancelOrder(
         creditReleased: rp(plan.release),
         voidedInvoices: plan.voided,
         decidedAt: decidedAt.toISOString(),
-      } satisfies CancelOrderResult;
+      };
+      // Stored for a resend with the same client_ref (unique: a ref already
+      // used by another order fails here and rolls back).
+      await tx.order.update({
+        where: { id: orderId },
+        data: { cancel_client_ref: ref, cancel_result: out as unknown as Prisma.InputJsonValue },
+      });
+      return out;
     }, {
       // Cancel runs many sequential round-trips (status derive + driver/car sync
       // loops + invoice/order writes) against the Supabase pooler; the default 5s
@@ -2483,10 +2505,35 @@ export async function cancelOrder(
     // name, amounts) must not stay behind in the public bucket. Its reserved
     // number stays unused.
     if (prepared) void removeFile(env.SUPABASE_STORAGE_BUCKET, `invoices/${prepared.invoiceNumber}.pdf`);
+    if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002" && ref) {
+      throw new AppError("client_ref ini sudah dipakai untuk pembatalan order lain.", 409);
+    }
     throw err;
+  }
+  // A replay found under the lock: this request's PDF is not used.
+  if (prepared && result.cancellationInvoiceNumber !== prepared.invoiceNumber) {
+    void removeFile(env.SUPABASE_STORAGE_BUCKET, `invoices/${prepared.invoiceNumber}.pdf`);
   }
 
   return result;
+}
+
+/** The stored result when this cancel was already done with the same client_ref. */
+function cancelReplay(
+  order: { cancel_client_ref: string | null; cancel_result: Prisma.JsonValue | null },
+  ref: string | null,
+): CancelOrderResult | null {
+  if (!ref || order.cancel_client_ref !== ref || order.cancel_result == null) return null;
+  return order.cancel_result as unknown as CancelOrderResult;
+}
+
+/** A client_ref already used to cancel another order → 409. */
+async function assertCancelRefFree(orderId: string, ref: string) {
+  const other = await prisma.order.findFirst({
+    where: { cancel_client_ref: ref, id: { not: orderId } },
+    select: { id: true },
+  });
+  if (other) throw new AppError("client_ref ini sudah dipakai untuk pembatalan order lain.", 409);
 }
 
 /** One line for the invoice note and the change log: the fee of each day. */

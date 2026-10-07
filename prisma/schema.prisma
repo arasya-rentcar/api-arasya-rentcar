@@ -296,6 +296,9 @@ model Order {
   refunded_total         Decimal              @default(0) @db.Decimal(12, 2)
   cancellation_rule      String?
   cancel_client_ref      String?              @unique
+  // A3: the Batalkan Pesanan response, returned as is to a resend with the
+  // same cancel_client_ref (the numbers are frozen at the cancel).
+  cancel_result          Json?
   created_at             DateTime             @default(now())
   updated_at             DateTime             @updatedAt
   customers              OrderCustomer[]

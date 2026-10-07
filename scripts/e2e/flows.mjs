@@ -2713,6 +2713,24 @@ await section('R. Order money, saldo lebih, money received, refunds, locks, clie
     check('R27b [A3] the fee invoice PDF of Batalkan Pesanan lists one "(Dibatalkan — biaya pembatalan N%)" line per day (20%, 20% and today\'s 50% or 100%)',
       lines7.length === 3 && lines7.filter((x) => x.includes('20%')).length === 2 && lines7.some((x) => x.includes(`${tier7 === 2 ? 50 : 100}%`)),
       `${lines7.join(' | ')} (${fee7t.length} chars)`);
+    check('R27c [A3] the fee invoice has its own title and layout: "Invoice Biaya Pembatalan", "Sudah dibayar" for the 600.000 received, not the settlement "DP sudah dibayar"',
+      /Invoice Biaya Pembatalan/.test(fee7t) && /Sudah dibayar/.test(fee7t) && !/DP sudah dibayar/.test(fee7t) && /Total setelah pembatalan/.test(fee7t),
+      fee7t.slice(0, 300));
+
+    // R7d: Batalkan Pesanan is idempotent on client_ref.
+    const o7r = await makeOrder('RA7r', { startDay: 9 });
+    const ref7r = uuid();
+    const c7r1 = await call('POST', `/orders/${o7r.id}/cancel`, { token: admin, body: { reason: 'R7d', client_ref: ref7r } });
+    const inv7r1 = (await order(o7r.id)).invoices.length;
+    const c7r2 = await call('POST', `/orders/${o7r.id}/cancel`, { token: admin, body: { reason: 'R7d lagi', client_ref: ref7r } });
+    const c7r3 = await call('POST', `/orders/${o7r.id}/cancel`, { token: admin, body: { reason: 'R7d lain', client_ref: uuid() } });
+    const o7r2 = await order(o7r.id);
+    // Same values; key order is not part of the contract (the stored result is JSONB, which orders keys).
+    const canon7 = (v) => (Array.isArray(v) ? v.map(canon7) : v && typeof v === 'object' ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, canon7(v[k])])) : v);
+    check('R7d [A3] Batalkan Pesanan with client_ref: a resend with the same ref → 200 with the same result (no second fee invoice, no new number); another ref → 409',
+      c7r1.status === 200 && c7r1.data?.penalty === 200000 && c7r2.status === 200 && JSON.stringify(canon7(c7r2.data)) === JSON.stringify(canon7(c7r1.data)) &&
+      o7r2.invoices.length === inv7r1 && c7r3.status === 409 && o7r2.cancel_client_ref === ref7r && Number(o7r2.cancellation_fee) === 200000,
+      `${c7r1.status}/${c7r2.status}/${c7r3.status} invoices ${inv7r1}→${o7r2.invoices.length} ref ${o7r2.cancel_client_ref === ref7r} fee ${o7r2.cancellation_fee} same ${JSON.stringify(canon7(c7r2.data)) === JSON.stringify(canon7(c7r1.data))}`);
 
     // R9 (+ R8b): an earlier per-day fee is kept; an unpaid invoice is voided.
     const o9 = await makeOrder('RA9', { days: 3, startDay: 36 });

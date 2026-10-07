@@ -189,6 +189,8 @@ export const cancelOrderSchema = z.object({
   actor: z.string().optional(),
   expected_fee_total: z.number().nonnegative().optional(),
   requested_at: z.string().datetime({ offset: true }).optional(),
+  // Idempotency: a resend with the same ref gets the stored result (200).
+  client_ref: z.string().uuid().optional(),
 });
 
 export const orderCancelQuoteSchema = z.object({

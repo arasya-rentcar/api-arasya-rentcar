@@ -410,11 +410,12 @@ export async function buildCancellationFeePdf(args: {
     pickupLocation: args.order.pickup_location,
     dropoffLocation: args.order.dropoff_location,
     finalPrice: args.total,
-    // Nothing paid yet: the single-amount layout ("Total Tambahan / TOTAL").
-    // Some money in: the settlement layout (total − already paid = remaining).
-    // Both print "Dipotong dari saldo lebih" when credit is used.
+    // Its own layout (not the settlement one, whose "DP sudah dibayar" does
+    // not fit here): total after the cancellation, "Sudah dibayar", "Dipotong
+    // dari saldo lebih", TOTAL = the cash asked.
     invoiceType: "Cancellation Fee",
-    invoiceKind: alreadyPaid > 0 ? "SETTLEMENT" : "ADDITIONAL",
+    invoiceKind: "CANCELLATION_FEE",
+    title: "Invoice Biaya Pembatalan",
     paymentMethod: "Bank Transfer",
     amountPaid: gross,
     previouslyPaid: alreadyPaid,
@@ -1592,7 +1593,10 @@ export async function reviseInvoice(
     // without this invoice and its credit).
     previouslyPaid: rp(before.money.covered - oldCredit + before.money.open),
     creditApplied: rp(plannedCredit),
-    invoiceKind: isAdjustment ? "ADDITIONAL" : invoice.invoice_type,
+    // A revised fee invoice keeps the "what this invoice covers" layout
+    // (SUBTOTAL), under its own title.
+    invoiceKind: isAdjustment ? "ADDITIONAL" : invoice.invoice_type === "CANCELLATION_FEE" ? "FULL" : invoice.invoice_type,
+    ...(invoice.invoice_type === "CANCELLATION_FEE" ? { title: "Invoice Biaya Pembatalan" } : {}),
     // Same notes as the original; a cancellation fee keeps none (its own
     // notes, the reason and tier, are not stored).
     noteLines:

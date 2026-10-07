@@ -69,6 +69,9 @@ export interface InvoiceData {
   showPaidStamp?: boolean;
   // Free-form footer notes shown under the table (pickup/dropoff/inclusions).
   noteLines?: string[];
+  // Document title printed top-right instead of "INVOICE" (e.g. "Invoice
+  // Biaya Pembatalan"); a long title is printed smaller.
+  title?: string;
   // Optional extra "additional charges" section (combined invoice).
   additionalItems?: InvoiceLineItem[];
 }
@@ -256,8 +259,8 @@ export async function generateInvoicePDF(data: InvoiceData): Promise<Buffer> {
     ? "STATEMENT"
     : isReceipt
       ? "KUITANSI"
-      : "INVOICE";
-  drawRight(title, y - 24, 26, bold, rgb(0.1, 0.1, 0.1));
+      : sanitizeText(data.title || "INVOICE");
+  drawRight(title, y - 24, title.length > 12 ? 16 : 26, bold, rgb(0.1, 0.1, 0.1));
 
   // Tagline / address / phone (left, under logo)
   let infoY = y - 56;
@@ -627,6 +630,16 @@ export async function generateInvoicePDF(data: InvoiceData): Promise<Buffer> {
       // A settlement (or a revision of it) that bills less than the rest:
       // the TOTAL is what THIS invoice asks, so say what it covers.
       if (Math.round(dueNow) !== Math.round(sisa)) drawTotalRow("Ditagih di invoice ini", formatRp(dueNow));
+      creditRow();
+      divider();
+      drawTotalRow("TOTAL", formatRp(cash(dueNow)), { bold: true, size: 11 });
+    } else if (kind === "CANCELLATION_FEE") {
+      // Invoice Biaya Pembatalan (finance A3): the order total after the
+      // per-day fees, the money already received toward it, the saldo lebih
+      // used, and the cash asked.
+      const alreadyPaid = data.previouslyPaid;
+      drawTotalRow("Total setelah pembatalan", formatRp(total));
+      if (alreadyPaid > 0) drawTotalRow("Sudah dibayar", formatRp(-alreadyPaid));
       creditRow();
       divider();
       drawTotalRow("TOTAL", formatRp(cash(dueNow)), { bold: true, size: 11 });
