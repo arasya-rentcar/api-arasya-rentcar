@@ -30,6 +30,7 @@ import { assertUnitsFree, lockUnits } from "../schedule/availability";
 import { nextOrderCode } from "../../utils/codes";
 import { wibShortDay } from "../../utils/wib";
 import { buildCancellationFeePdf, cancellationLogValue } from "../invoices/invoices.service";
+import { computeOrderMoney, lockOrder, lockOrderDays, setLegacyRefundCredit } from "./order-money";
 import {
   deriveAndSetOrderStatus,
   refreshCarStatuses,
@@ -37,8 +38,10 @@ import {
   syncDriverStatus,
   syncCarStatus,
 } from "../schedule/order-derive.service";
+import { env } from "../../config/env";
 import {
   uploadFile,
+  removeFile,
   assertValidUpload,
   getSignedUrl,
   PAYMENT_PROOFS_BUCKET,
@@ -394,9 +397,10 @@ export async function searchOrders(params: SearchOrdersParams) {
     and.push({ order_status: params.order_status });
   switch (params.bucket) {
     case "ACTIVE":
+      // An order with a refund is still active (finance design §7): with
+      // several refunds per order it must not drop out of the list.
       and.push({ order_status: { not: "CANCELLED" } });
       and.push({ invoice_missing: false });
-      and.push({ is_refunded: false });
       break;
     case "MISSING_INVOICE":
       and.push({ invoice_missing: true });
@@ -409,7 +413,9 @@ export async function searchOrders(params: SearchOrdersParams) {
       and.push({ order_status: { not: "CANCELLED" } });
       break;
     case "REFUNDED":
-      and.push({ is_refunded: true });
+      // is_refunded alone: sheet imports (scripts/import-workbook.js) mark
+      // a refund without an amount.
+      and.push({ OR: [{ refunded_total: { gt: 0 } }, { is_refunded: true }] });
       break;
     case "AWAITING_FINAL":
       // All service days finished by the driver, waiting on admin finalization.
@@ -756,12 +762,39 @@ export async function getOrderById(id: string) {
       adjustments: { orderBy: { created_at: "desc" as const } },
       change_logs: { orderBy: { created_at: "desc" as const } },
       web_lead: { select: WEB_LEAD_SUMMARY },
+      refunds: {
+        orderBy: { refunded_at: "asc" as const },
+        select: { id: true, amount: true, refunded_at: true, note: true, proof_url: true },
+      },
+      credit_entries: {
+        orderBy: { created_at: "asc" as const },
+        select: {
+          kind: true,
+          amount: true,
+          created_at: true,
+          note: true,
+          invoice: { select: { invoice_number: true } },
+        },
+      },
     },
   });
 
   if (!order) throw new AppError("Order not found", 404);
-  // Paid in full = trips may start (driver app "Berangkat"); see startPayment.
-  return { ...order, start_payment: startPayment(order, order.service_items) };
+  const { refunds, credit_entries, ...rest } = order;
+  return {
+    ...rest,
+    // Paid in full = trips may start (driver app "Berangkat"); see startPayment.
+    // Kept for older clients; `money` carries the same numbers.
+    start_payment: startPayment(order, order.service_items),
+    // One money model for every screen (finance design §2, order-money.ts).
+    money: await computeOrderMoney(prisma, id),
+    // The proof is a private storage path: only whether there is one.
+    refunds: refunds.map(({ proof_url, ...r }) => ({ ...r, has_proof: !!proof_url })),
+    credit_entries: credit_entries.map(({ invoice, ...e }) => ({
+      ...e,
+      invoice_number: invoice?.invoice_number ?? null,
+    })),
+  };
 }
 
 // Terminal orders are READ-ONLY for structural data. DONE and CANCELLED orders
@@ -1019,8 +1052,10 @@ export async function updateOrder(id: string, input: UpdateOrderInput) {
       // B1.1: does this save remove a day still to run?
       let deletesOpenDay = false;
       // Days first, then the order row: the same lock order as the driver
-      // app and Edit Hari (day → order), so they cannot deadlock.
+      // app and Edit Hari (day → order), so they cannot deadlock. All days in
+      // id order, as cancelOrder (B9 lock order, order-money.ts).
       if (days) {
+        await lockOrderDays(tx, id);
         if (days.deletes.length > 0) {
           deletesOpenDay =
             (await tx.orderServiceItem.count({
@@ -1273,6 +1308,8 @@ export async function assignOrder(orderId: string, input: AssignOrderInput) {
   let got = newLines;
   const updated = await prisma.$transaction(
     async (tx) => {
+      // B9 lock order (order-money.ts): the days in id order, then the order.
+      await lockOrderDays(tx, orderId);
       // Conditional: a day another admin assigned meanwhile is left alone.
       await tx.orderServiceItem.updateMany({
         where: { ...openUnassigned, id: { in: newLines.map((l) => l.id) } },
@@ -1416,6 +1453,8 @@ export async function reassignOrder(
   );
 
   const updated = await prisma.$transaction(async (tx) => {
+    // B9 lock order (order-money.ts): the days in id order, then the order.
+    await lockOrderDays(tx, orderId);
     const mine = { id: { in: eligibleLines.map((l) => l.id) } };
     // Days the new driver already has keep their acceptance (car swap only).
     await tx.orderServiceItem.updateMany({
@@ -1466,59 +1505,92 @@ export async function reassignOrder(
   return updated;
 }
 
+/**
+ * Add a charge (or a non-billable note) to an order. `created` is false when
+ * the client_ref already made this charge: it is returned unchanged (B8).
+ */
 export async function createOrderAdjustment(
   orderId: string,
   input: CreateAdjustmentInput,
 ) {
+  const byRef = async (db: Prisma.TransactionClient | typeof prisma) => {
+    if (!input.client_ref) return null;
+    const seen = await db.orderAdjustment.findUnique({ where: { client_ref: input.client_ref } });
+    if (seen && seen.order_id !== orderId) throw new AppError("client_ref sudah dipakai untuk order lain.", 409);
+    return seen;
+  };
+  const replay = await byRef(prisma);
+  if (replay) return { adjustment: replay, created: false };
   const order = await prisma.order.findUnique({ where: { id: orderId } });
   if (!order) throw new AppError("Order not found", 404);
   assertOrderStructurallyEditable(order);
 
-  return prisma.$transaction(async (tx) => {
-    const adjustment = await tx.orderAdjustment.create({
-      data: {
-        order_id: orderId,
-        type: input.type,
-        description: input.description,
-        amount: input.amount,
-        quantity: input.quantity,
-        is_billable: input.is_billable,
-        created_by: input.created_by,
-      },
-    });
-
-    if (input.is_billable) {
-      const lineCount = await tx.orderServiceItem.count({
-        where: { order_id: orderId },
+  try {
+    return await prisma.$transaction(async (tx) => {
+      // B9 lock order (order-money.ts): the order row first, then the checks
+      // again on what is committed now (a cancel or finalize meanwhile wins).
+      await lockOrder(tx, orderId);
+      const seen = await byRef(tx);
+      if (seen) return { adjustment: seen, created: false };
+      const fresh = await tx.order.findUniqueOrThrow({
+        where: { id: orderId },
+        select: { order_status: true, cancellation_fee: true, final_price: true },
       });
-      if (lineCount > 0) {
-        // Keeps final_price, Total User and margin on the finance card in step.
-        await rollupOrderFinance(tx, orderId);
-      } else {
-        await tx.order.update({
-          where: { id: orderId },
-          data: {
-            final_price:
-              Number(order.final_price) + input.amount * input.quantity,
-          },
+      assertOrderStructurallyEditable(fresh);
+      const adjustment = await tx.orderAdjustment.create({
+        data: {
+          order_id: orderId,
+          type: input.type,
+          description: input.description,
+          amount: input.amount,
+          quantity: input.quantity,
+          is_billable: input.is_billable,
+          created_by: input.created_by,
+          client_ref: input.client_ref ?? null,
+        },
+      });
+
+      if (input.is_billable) {
+        const lineCount = await tx.orderServiceItem.count({
+          where: { order_id: orderId },
         });
+        if (lineCount > 0) {
+          // Keeps final_price, Total User and margin on the finance card in step.
+          await rollupOrderFinance(tx, orderId);
+        } else {
+          await tx.order.update({
+            where: { id: orderId },
+            data: {
+              final_price:
+                Number(fresh.final_price) + input.amount * input.quantity,
+            },
+          });
+        }
       }
+
+      await tx.orderChangeLog.create({
+        data: {
+          order_id: orderId,
+          field: "adjustment",
+          new_value: `${input.type}: ${input.description} (${input.amount} x ${input.quantity})`,
+          actor: input.created_by,
+          note: input.is_billable
+            ? "Billable adjustment added to order final_price"
+            : "Non-billable adjustment logged",
+        },
+      });
+
+      return { adjustment, created: true };
+    }, { maxWait: 15000, timeout: 20000 });
+  } catch (err) {
+    // The same client_ref committed at the same moment (unique key; on this
+    // order the lock above already serializes them): answer with that row.
+    if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
+      const seen = await byRef(prisma);
+      if (seen) return { adjustment: seen, created: false };
     }
-
-    await tx.orderChangeLog.create({
-      data: {
-        order_id: orderId,
-        field: "adjustment",
-        new_value: `${input.type}: ${input.description} (${input.amount} x ${input.quantity})`,
-        actor: input.created_by,
-        note: input.is_billable
-          ? "Billable adjustment added to order final_price"
-          : "Non-billable adjustment logged",
-      },
-    });
-
-    return adjustment;
-  });
+    throw err;
+  }
 }
 
 export async function createOrderChangeLog(
@@ -1654,16 +1726,38 @@ export async function markOrderRefunded(
     prefix: `refunds/${orderId}`,
   });
 
-  return prisma.order.update({
-    where: { id: orderId },
-    data: {
-      is_refunded: true,
-      refunded_at: new Date(),
-      refund_amount: amount,
-      refund_proof_url: proofUpload.path,
-      refund_note: input.note ?? null,
-    },
-  });
+  const refundedAt = new Date();
+  return prisma.$transaction(async (tx) => {
+    // B9 lock order (order-money.ts): the order row.
+    await lockOrder(tx, orderId);
+    await tx.order.update({
+      where: { id: orderId },
+      data: {
+        is_refunded: true,
+        refunded_at: refundedAt,
+        refund_amount: amount,
+        refund_proof_url: proofUpload.path,
+        refund_note: input.note ?? null,
+        // The ledger mirror of this single (overwritten) refund, like the A1
+        // migration: refunded_total = Σ order_refunds, one 'legacy-' row.
+        refunded_total: amount,
+      },
+    });
+    const legacy = {
+      amount,
+      refunded_at: refundedAt,
+      proof_url: proofUpload.path,
+      note: input.note ?? null,
+    };
+    const refund = await tx.orderRefund.upsert({
+      where: { client_ref: `legacy-${orderId}` },
+      create: { order_id: orderId, client_ref: `legacy-${orderId}`, created_by: "ADMIN", ...legacy },
+      update: legacy,
+    });
+    // Money given back comes out of the saldo lebih first (INV-2).
+    await setLegacyRefundCredit(tx, orderId, refund.id, amount);
+    return tx.order.findUniqueOrThrow({ where: { id: orderId } });
+  }, { maxWait: 15000, timeout: 20000 });
 }
 
 // Sprint 5: short-lived signed URL for the (private) refund proof.
@@ -1762,6 +1856,35 @@ function computeCancellationPenalty(args: {
   };
 }
 
+/** The tier and penalty of cancelling now, from the order and its days. */
+function cancellationQuote(
+  order: { final_price: unknown; service_start_at: Date | null },
+  days: { line_status: string; service_date: Date | null; trip_started_at: Date | null }[],
+  now: Date,
+) {
+  // ── Tier + penalty (base = final_price) ───────────────────────────────
+  const activeLines = days.filter((l) => l.line_status !== "CANCELLED");
+  const firstServiceDate =
+    activeLines
+      .map((l) => l.service_date)
+      .filter((d): d is Date => !!d)
+      .sort((a, b) => a.getTime() - b.getTime())[0] ??
+    order.service_start_at ??
+    null;
+  const anyLineStarted = activeLines.some((l) => l.trip_started_at != null);
+  return computeCancellationPenalty({
+    finalPrice: Number(order.final_price),
+    firstServiceDate,
+    anyLineStarted,
+    now,
+  });
+}
+
+const ALL_DAYS_DONE_MESSAGE =
+  "Semua hari order ini sudah selesai, jadi tidak ada yang bisa dibatalkan. Tutup order lewat Finalisasi.";
+const allDaysEnded = (days: { line_status: string }[]) =>
+  days.length > 0 && days.every((l) => l.line_status === "DONE" || l.line_status === "CANCELLED");
+
 export interface CancelOrderResult {
   tier: 1 | 2 | 3;
   penalty: number;
@@ -1823,37 +1946,11 @@ export async function cancelOrder(
     );
   }
   // Every day already done (awaiting finalize): nothing is left to cancel.
-  if (
-    order.service_items.length > 0 &&
-    order.service_items.every((l) => l.line_status === "DONE" || l.line_status === "CANCELLED")
-  ) {
-    throw new AppError(
-      "Semua hari order ini sudah selesai, jadi tidak ada yang bisa dibatalkan. Tutup order lewat Finalisasi.",
-      409,
-    );
-  }
+  if (allDaysEnded(order.service_items)) throw new AppError(ALL_DAYS_DONE_MESSAGE, 409);
 
   const now = new Date();
   const originalFinalPrice = Number(order.final_price);
-
-  // ── Tier + penalty (base = final_price) ─────────────────────────────────
-  const activeLines = order.service_items.filter(
-    (l) => l.line_status !== "CANCELLED",
-  );
-  const firstServiceDate =
-    activeLines
-      .map((l) => l.service_date)
-      .filter((d): d is Date => !!d)
-      .sort((a, b) => a.getTime() - b.getTime())[0] ??
-    order.service_start_at ??
-    null;
-  const anyLineStarted = activeLines.some((l) => l.trip_started_at != null);
-  const { tier, penalty, label } = computeCancellationPenalty({
-    finalPrice: originalFinalPrice,
-    firstServiceDate,
-    anyLineStarted,
-    now,
-  });
+  const { tier, penalty, label } = cancellationQuote(order, order.service_items, now);
 
   // What the customer still owes toward the penalty. Money already received
   // (a DP, or the full price) counts against it; the transaction re-reads it.
@@ -1889,201 +1986,230 @@ export async function cancelOrder(
   }
 
   // ── Mutations in one transaction ────────────────────────────────────────
-  const result = await prisma.$transaction(async (tx) => {
-    // 0) Lock the order and re-check under the lock: a second click (or a
-    //    finalize) that committed meanwhile wins and this cancel stops.
-    await tx.$queryRaw`SELECT id FROM "orders" WHERE id = ${orderId} FOR NO KEY UPDATE`;
-    const fresh = await tx.order.findUniqueOrThrow({
-      where: { id: orderId },
-      select: { order_status: true, cancellation_fee: true },
-    });
-    if (
-      fresh.order_status === "DONE" ||
-      fresh.order_status === "CANCELLED" ||
-      fresh.cancellation_fee != null
-    ) {
-      throw new AppError("Order ini sudah dibatalkan atau sudah selesai.", 409);
-    }
-
-    // 1) Void active invoices and decrement the customer's billed total.
-    const activeInvoices = await tx.invoice.findMany({
-      where: {
-        order_id: orderId,
-        status: { notIn: ["REVISED", "CANCELLED"] },
-      },
-      select: { id: true, amount: true },
-    });
-    const voidedSum = activeInvoices.reduce(
-      (s, inv) => s + Number(inv.amount),
-      0,
-    );
-    if (activeInvoices.length > 0) {
-      await tx.invoice.updateMany({
-        where: { id: { in: activeInvoices.map((i) => i.id) } },
-        data: { status: "CANCELLED" },
+  let result: CancelOrderResult;
+  try {
+    result = await prisma.$transaction(async (tx) => {
+      // 0) B9 lock order (order-money.ts): the days, then the order (as Edit
+      //    Hari, Edit Order and the driver app), then the invoices in step 1.
+      //    Re-check under the locks: a second click (or a finalize) that
+      //    committed meanwhile wins and this cancel stops.
+      await lockOrderDays(tx, orderId);
+      await lockOrder(tx, orderId);
+      const fresh = await tx.order.findUniqueOrThrow({
+        where: { id: orderId },
+        select: { order_status: true, cancellation_fee: true, final_price: true, service_start_at: true },
       });
-    }
+      if (
+        fresh.order_status === "DONE" ||
+        fresh.order_status === "CANCELLED" ||
+        fresh.cancellation_fee != null
+      ) {
+        throw new AppError("Order ini sudah dibatalkan atau sudah selesai.", 409);
+      }
+      // The days as they are now. A day started, finished, cancelled or
+      // repriced since the fee was worked out (and its PDF built) changes what
+      // is owed: stop and let the admin retry.
+      const days = await tx.orderServiceItem.findMany({ where: { order_id: orderId } });
+      if (allDaysEnded(days)) throw new AppError(ALL_DAYS_DONE_MESSAGE, 409);
+      const quote = cancellationQuote(fresh, days, now);
+      if (
+        quote.tier !== tier ||
+        quote.penalty !== penalty ||
+        Number(fresh.final_price) !== originalFinalPrice
+      ) {
+        throw new AppError(
+          "Ada perubahan pada hari atau total order saat pesanan dibatalkan. Coba batalkan lagi.",
+          409,
+        );
+      }
 
-    // Money received, read now: the invoices are locked by step 1, so a
-    // payment recorded while the fee PDF was being built is included. The PDF
-    // was made for owedBefore; if that changed, stop and let the admin retry.
-    const money = await tx.order.findUniqueOrThrow({
-      where: { id: orderId },
-      select: { paid_to_date: true, is_refunded: true, refund_amount: true },
-    });
-    const paidToDate = Number(money.paid_to_date ?? 0);
-    const owed = owedFor(netPaid(money));
-    if (owed !== owedBefore) {
-      throw new AppError(
-        "Ada pembayaran yang baru tercatat saat pesanan dibatalkan. Coba batalkan lagi.",
-        409,
-      );
-    }
-
-    // 2) Cancel all active lines; collect drivers/cars to release.
-    const driverIds = new Set<string>();
-    const carIds = new Set<string>();
-    const cancellableIds: string[] = [];
-    const startedIds: string[] = [];
-    for (const l of order.service_items) {
-      if (l.line_status === "DONE" || l.line_status === "CANCELLED") continue;
-      cancellableIds.push(l.id);
-      if (l.actual_start_at || l.trip_started_at) startedIds.push(l.id);
-      if (l.driver_id) driverIds.add(l.driver_id);
-      if (l.car_id) carIds.add(l.car_id);
-    }
-    // A day already paid out (driver fee / partner RTR) keeps who drove and
-    // its amounts, like a started day: the payment stays on record.
-    const paidOut = await tx.payable.findMany({
-      where: { service_item_id: { in: cancellableIds }, status: "PAID" },
-      select: { service_item_id: true },
-    });
-    for (const p of paidOut) {
-      if (!startedIds.includes(p.service_item_id)) startedIds.push(p.service_item_id);
-    }
-    const notStartedIds = cancellableIds.filter((id) => !startedIds.includes(id));
-    if (notStartedIds.length > 0) {
-      // Not started: release driver/car; nobody earned anything that day.
-      await tx.orderServiceItem.updateMany({
-        where: { id: { in: notStartedIds }, is_external: false },
-        data: {
-          line_status: "CANCELLED",
-          driver_id: null,
-          car_id: null,
-          driver_fee: 0,
-          driver_fee_note: "Dibatalkan sebelum berangkat",
-        },
-      });
-      await tx.orderServiceItem.updateMany({
-        where: { id: { in: notStartedIds }, is_external: true },
-        data: { line_status: "CANCELLED", rtr_amount: 0 },
-      });
-    }
-    if (startedIds.length > 0) {
-      // Already on the road (or already paid): keep who drove so their pay
-      // stays with them.
-      await tx.orderServiceItem.updateMany({
-        where: { id: { in: startedIds } },
-        data: { line_status: "CANCELLED" },
-      });
-    }
-    for (const id of cancellableIds) await recomputeLineMoney(tx, id);
-
-    // 3) Derive order status (all-cancelled → CANCELLED) + release resources.
-    await deriveAndSetOrderStatus(tx, orderId);
-    for (const dId of driverIds) await syncDriverStatus(tx, dId);
-    for (const cId of carIds) await syncCarStatus(tx, cId);
-
-    // 4) Issue the CANCELLATION_FEE invoice for what is still owed, with its
-    //    PDF (penalty − already paid = remaining). Nothing owed → no invoice:
-    //    a fee invoice over money already received would be paid twice.
-    let cancellationInvoiceNumber: string | null = null;
-    let invoiced = 0;
-    if (prepared && order.customer && owed > 0) {
-      await tx.invoice.create({
-        data: {
+      // 1) Void active invoices and decrement the customer's billed total.
+      const activeInvoices = await tx.invoice.findMany({
+        where: {
           order_id: orderId,
-          invoice_number: prepared.invoiceNumber,
-          customer_seq: prepared.invoiceSeq,
-          invoice_type: "CANCELLATION_FEE",
-          payment_method: "BANK_TRANSFER",
-          issue_date: now,
-          amount: owed,
-          note: `${reason}\n${label}`,
-          file_url: prepared.fileUrl,
-          status: "ISSUED",
+          status: { notIn: ["REVISED", "CANCELLED"] },
         },
+        select: { id: true, amount: true },
       });
-      cancellationInvoiceNumber = prepared.invoiceNumber;
-      invoiced = owed;
-    }
-
-    // 5) Keep total_billed = sum(active invoices): remove voided, add the new one.
-    if (order.customer) {
-      const billedDelta = invoiced - voidedSum;
-      if (billedDelta !== 0) {
-        await tx.customer.update({
-          where: { id: order.customer.id },
-          data: { total_billed: { increment: billedDelta } },
+      const voidedSum = activeInvoices.reduce(
+        (s, inv) => s + Number(inv.amount),
+        0,
+      );
+      if (activeInvoices.length > 0) {
+        await tx.invoice.updateMany({
+          where: { id: { in: activeInvoices.map((i) => i.id) } },
+          data: { status: "CANCELLED" },
         });
       }
-    }
 
-    // 6) The order is now worth the penalty. Set final_price = penalty so the
-    //    existing refund/payment flows compute correctly, and recompute
-    //    payment_status against the new total (money received is unchanged).
-    //    The cancellation fields mark the order as cancelled even when done
-    //    days keep it open, so later roll-ups keep the penalty as its price.
-    // The DP rule's base is the penalty too (dpBaseOf): it is what the
-    // customer owes now, so PAID once it is covered, DP_PAID from 20% of it.
-    const paymentStatus = paymentStatusFor(
-      netPaid(money),
-      penalty,
-      dpBaseOf({ cancellation_fee: penalty }, order.service_items),
-    );
+      // Money received, read now under the order lock (markInvoicePaid takes it
+      // first too), so a payment recorded while the fee PDF was being built is
+      // included. The PDF was made for owedBefore; if that changed, stop and
+      // let the admin retry.
+      const money = await tx.order.findUniqueOrThrow({
+        where: { id: orderId },
+        select: { paid_to_date: true, is_refunded: true, refund_amount: true },
+      });
+      const paidToDate = Number(money.paid_to_date ?? 0);
+      const owed = owedFor(netPaid(money));
+      if (owed !== owedBefore) {
+        throw new AppError(
+          "Ada pembayaran yang baru tercatat saat pesanan dibatalkan. Coba batalkan lagi.",
+          409,
+        );
+      }
 
-    await tx.order.update({
-      where: { id: orderId },
-      data: {
-        final_price: penalty,
-        payment_status: paymentStatus,
-        cancelled_at: now,
-        cancellation_fee: penalty,
-        cancellation_reason: reason,
-      },
+      // 2) Cancel all active lines; collect drivers/cars to release.
+      const driverIds = new Set<string>();
+      const carIds = new Set<string>();
+      const cancellableIds: string[] = [];
+      const startedIds: string[] = [];
+      for (const l of days) {
+        if (l.line_status === "DONE" || l.line_status === "CANCELLED") continue;
+        cancellableIds.push(l.id);
+        if (l.actual_start_at || l.trip_started_at) startedIds.push(l.id);
+        if (l.driver_id) driverIds.add(l.driver_id);
+        if (l.car_id) carIds.add(l.car_id);
+      }
+      // A day already paid out (driver fee / partner RTR) keeps who drove and
+      // its amounts, like a started day: the payment stays on record.
+      const paidOut = await tx.payable.findMany({
+        where: { service_item_id: { in: cancellableIds }, status: "PAID" },
+        select: { service_item_id: true },
+      });
+      for (const p of paidOut) {
+        if (!startedIds.includes(p.service_item_id)) startedIds.push(p.service_item_id);
+      }
+      const notStartedIds = cancellableIds.filter((id) => !startedIds.includes(id));
+      if (notStartedIds.length > 0) {
+        // Not started: release driver/car; nobody earned anything that day.
+        await tx.orderServiceItem.updateMany({
+          where: { id: { in: notStartedIds }, is_external: false },
+          data: {
+            line_status: "CANCELLED",
+            driver_id: null,
+            car_id: null,
+            driver_fee: 0,
+            driver_fee_note: "Dibatalkan sebelum berangkat",
+          },
+        });
+        await tx.orderServiceItem.updateMany({
+          where: { id: { in: notStartedIds }, is_external: true },
+          data: { line_status: "CANCELLED", rtr_amount: 0 },
+        });
+      }
+      if (startedIds.length > 0) {
+        // Already on the road (or already paid): keep who drove so their pay
+        // stays with them.
+        await tx.orderServiceItem.updateMany({
+          where: { id: { in: startedIds } },
+          data: { line_status: "CANCELLED" },
+        });
+      }
+      for (const id of cancellableIds) await recomputeLineMoney(tx, id);
+
+      // 3) Derive order status (all-cancelled → CANCELLED) + release resources.
+      await deriveAndSetOrderStatus(tx, orderId);
+      for (const dId of driverIds) await syncDriverStatus(tx, dId);
+      for (const cId of carIds) await syncCarStatus(tx, cId);
+
+      // 4) Issue the CANCELLATION_FEE invoice for what is still owed, with its
+      //    PDF (penalty − already paid = remaining). Nothing owed → no invoice:
+      //    a fee invoice over money already received would be paid twice.
+      let cancellationInvoiceNumber: string | null = null;
+      let invoiced = 0;
+      if (prepared && order.customer && owed > 0) {
+        await tx.invoice.create({
+          data: {
+            order_id: orderId,
+            invoice_number: prepared.invoiceNumber,
+            customer_seq: prepared.invoiceSeq,
+            invoice_type: "CANCELLATION_FEE",
+            payment_method: "BANK_TRANSFER",
+            issue_date: now,
+            amount: owed,
+            note: `${reason}\n${label}`,
+            file_url: prepared.fileUrl,
+            status: "ISSUED",
+          },
+        });
+        cancellationInvoiceNumber = prepared.invoiceNumber;
+        invoiced = owed;
+      }
+
+      // 5) Keep total_billed = sum(active invoices): remove voided, add the new one.
+      if (order.customer) {
+        const billedDelta = invoiced - voidedSum;
+        if (billedDelta !== 0) {
+          await tx.customer.update({
+            where: { id: order.customer.id },
+            data: { total_billed: { increment: billedDelta } },
+          });
+        }
+      }
+
+      // 6) The order is now worth the penalty. Set final_price = penalty so the
+      //    existing refund/payment flows compute correctly, and recompute
+      //    payment_status against the new total (money received is unchanged).
+      //    The cancellation fields mark the order as cancelled even when done
+      //    days keep it open, so later roll-ups keep the penalty as its price.
+      // The DP rule's base is the penalty too (dpBaseOf): it is what the
+      // customer owes now, so PAID once it is covered, DP_PAID from 20% of it.
+      const paymentStatus = paymentStatusFor(
+        netPaid(money),
+        penalty,
+        dpBaseOf({ cancellation_fee: penalty }, days),
+      );
+
+      await tx.order.update({
+        where: { id: orderId },
+        data: {
+          final_price: penalty,
+          payment_status: paymentStatus,
+          cancelled_at: now,
+          cancellation_fee: penalty,
+          cancellation_reason: reason,
+        },
+      });
+      await rollupOrderFinance(tx, orderId);
+
+      // 7) Audit log (preserve the original price).
+      await tx.orderChangeLog.create({
+        data: {
+          order_id: orderId,
+          field: "order_status",
+          old_value: `${order.order_status} (final_price ${originalFinalPrice})`,
+          new_value: cancellationLogValue(penalty, label),
+          note: reason,
+          actor: actor ?? "ADMIN",
+        },
+      });
+
+      // Net of any refund already made, like `owed` and payment_status.
+      const refundDue = Math.max(0, Math.round(netPaid(money) - penalty));
+      return {
+        tier,
+        penalty,
+        originalFinalPrice,
+        paidToDate,
+        refundDue,
+        stillOwed: owed,
+        cancellationInvoiceNumber,
+      } satisfies CancelOrderResult;
+    }, {
+      // Cancel runs many sequential round-trips (status derive + driver/car sync
+      // loops + invoice/order writes) against the Supabase pooler; the default 5s
+      // interactive-tx limit can be exceeded and yield P2028. Give it headroom.
+      maxWait: 15000,
+      timeout: 30000,
     });
-    await rollupOrderFinance(tx, orderId);
-
-    // 7) Audit log (preserve the original price).
-    await tx.orderChangeLog.create({
-      data: {
-        order_id: orderId,
-        field: "order_status",
-        old_value: `${order.order_status} (final_price ${originalFinalPrice})`,
-        new_value: cancellationLogValue(penalty, label),
-        note: reason,
-        actor: actor ?? "ADMIN",
-      },
-    });
-
-    // Net of any refund already made, like `owed` and payment_status.
-    const refundDue = Math.max(0, Math.round(netPaid(money) - penalty));
-    return {
-      tier,
-      penalty,
-      originalFinalPrice,
-      paidToDate,
-      refundDue,
-      stillOwed: owed,
-      cancellationInvoiceNumber,
-    } satisfies CancelOrderResult;
-  }, {
-    // Cancel runs many sequential round-trips (status derive + driver/car sync
-    // loops + invoice/order writes) against the Supabase pooler; the default 5s
-    // interactive-tx limit can be exceeded and yield P2028. Give it headroom.
-    maxWait: 15000,
-    timeout: 30000,
-  });
+  } catch (err) {
+    // Refused (or failed) after the fee PDF was uploaded: the PDF (customer
+    // name, amounts) must not stay behind in the public bucket. Its reserved
+    // number stays unused.
+    if (prepared) void removeFile(env.SUPABASE_STORAGE_BUCKET, `invoices/${prepared.invoiceNumber}.pdf`);
+    throw err;
+  }
 
   return result;
 }

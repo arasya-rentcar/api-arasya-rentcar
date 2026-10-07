@@ -146,6 +146,8 @@ export const createAdjustmentSchema = z.object({
   quantity: z.number().int().positive().default(1),
   is_billable: z.boolean().default(true),
   created_by: z.string().optional(),
+  // B8: a resend with the same client_ref returns the charge already made.
+  client_ref: z.string().uuid().optional(),
 });
 
 export const createChangeLogSchema = z.object({

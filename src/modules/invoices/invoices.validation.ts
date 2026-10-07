@@ -8,12 +8,18 @@ export const generateInvoiceSchema = z.object({
   // #10: optional issue date (defaults to now). Allows issuing/back-dating an
   // invoice for an order from a previous day.
   issue_date: z.string().datetime().optional(),
+  // B8: made by the client when the form opens and reused on a retry; a
+  // resend returns the invoice already made (200) instead of a second one.
+  // Optional until every dashboard sends it.
+  client_ref: z.string().uuid().optional(),
 });
 
 export const reviseInvoiceSchema = z.object({
   amount: z.number().positive("Amount must be a positive number"),
   note: z.string().optional(),
   payment_method: z.enum(["CASH", "BANK_TRANSFER", "QRIS", "OTHER"]).optional(),
+  // B8, as on generate: a resend returns the revision already made.
+  client_ref: z.string().uuid().optional(),
 });
 
 export const markInvoicePaidSchema = z.object({

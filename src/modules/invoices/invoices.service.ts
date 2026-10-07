@@ -7,9 +7,10 @@ import {
   rentalBaseOf,
   startPayment,
 } from "../orders/assignment-guard";
+import { addCreditEntry, billedSoFar, lockOrder } from "../orders/order-money";
 import { notifyOrderPaidInFull } from "../../services/driverNotify";
-import { reportLeadPurchase } from "../../services/ga4.service";
-import type { Prisma } from "@prisma/client";
+import { reportLeadPurchase, sendsNoPurchase } from "../../services/ga4.service";
+import { Prisma, type Invoice } from "@prisma/client";
 import prisma from "../../prisma/client";
 import { env } from "../../config/env";
 import { AppError } from "../../utils/AppError";
@@ -262,35 +263,6 @@ function buildNoteLines(order: {
 }
 
 /**
- * What is already billed on an order, for the "never bill more than the order
- * total" checks: the active invoices plus money received on invoices that a
- * cancellation voided. That money still counts toward the cancellation fee
- * (cancelOrder bills only the rest), so it must not be billed again. Only
- * cancelOrder voids invoices, so other orders are unaffected.
- */
-export async function billedSoFar(
-  orderId: string,
-  excludeInvoiceId?: string,
-  db: Prisma.TransactionClient | typeof prisma = prisma,
-): Promise<number> {
-  const [active, voidedPaid] = await Promise.all([
-    db.invoice.aggregate({
-      where: {
-        order_id: orderId,
-        ...(excludeInvoiceId ? { id: { not: excludeInvoiceId } } : {}),
-        status: { notIn: ["REVISED", "CANCELLED"] },
-      },
-      _sum: { amount: true },
-    }),
-    db.invoice.aggregate({
-      where: { order_id: orderId, status: "CANCELLED", paid_at: { not: null } },
-      _sum: { amount: true },
-    }),
-  ]);
-  return Number(active._sum.amount ?? 0) + Number(voidedPaid._sum.amount ?? 0);
-}
-
-/**
  * Prepare a CANCELLATION_FEE invoice for a cancelled order: reserve the invoice
  * number (atomic, short tx) and render the PDF. Returns everything the caller
  * needs to create the invoice row inside its own transaction. Network/PDF work
@@ -382,46 +354,39 @@ function assertDpAmount(amount: number, rentalBase: number): void {
   }
 }
 
-export async function generateInvoice(
-  orderId: string,
+/** What the invoice caps are checked against: read before the PDF, and again under the order lock. */
+async function invoiceCapState(db: Prisma.TransactionClient | typeof prisma, orderId: string) {
+  const [order, billed, activeCombined] = await Promise.all([
+    db.order.findUniqueOrThrow({
+      where: { id: orderId },
+      select: {
+        final_price: true,
+        service_items: { select: { total_price: true, line_status: true } },
+      },
+    }),
+    billedSoFar(orderId, undefined, db),
+    db.invoice.count({
+      where: {
+        order_id: orderId,
+        invoice_type: "COMBINED",
+        status: { notIn: ["REVISED", "CANCELLED"] },
+      },
+    }),
+  ]);
+  return {
+    finalPrice: Number(order.final_price),
+    rentalBase: rentalBaseOf(order.service_items),
+    alreadyInvoiced: billed,
+    hasActiveCombined: activeCombined > 0,
+  };
+}
+
+/** The rules a new invoice must pass (unchanged by B8, now also checked under the lock). */
+function assertNewInvoiceAllowed(
   input: GenerateInvoiceInput,
-) {
-  const order = await prisma.order.findUnique({
-    where: { id: orderId },
-    include: {
-      service_items: { orderBy: { sort_order: "asc" } },
-      adjustments: { orderBy: { created_at: "asc" } },
-      customer: true,
-    },
-  });
-  if (!order) throw new AppError("Order not found", 404);
-  // G6: an invoice cannot be numbered without a customer (the invoice number
-  // embeds the customer code + per-customer sequence).
-  if (!order.customer) {
-    throw new AppError(
-      "Order has no linked customer; cannot issue a numbered invoice",
-      409,
-    );
-  }
-
-  const isCombined = input.invoice_type === "COMBINED";
-
-  // Rental base = the days that are not cancelled (additionals/adjustments are
-  // billed separately, each as its own ADDITIONAL invoice). DP percentage is
-  // based on this rental base.
-  const rentalBase = rentalBaseOf(order.service_items);
-
-  // Billable additional charges (overtime/parking/etc.) — only used for COMBINED,
-  // which rolls rental + extras into a single invoice (and a single Kwitansi).
-  const billableAdjustments = order.adjustments.filter((a) => a.is_billable);
-  const additionalsTotal = billableAdjustments.reduce(
-    (sum, a) => sum + Number(a.amount) * (a.quantity ?? 1),
-    0,
-  );
-
-  // Calculate how much has already been invoiced
-  const alreadyInvoiced = await billedSoFar(orderId);
-  const finalPrice = Number(order.final_price);
+  state: Awaited<ReturnType<typeof invoiceCapState>>,
+): void {
+  const { finalPrice, rentalBase, alreadyInvoiced } = state;
   const remaining = finalPrice - alreadyInvoiced;
 
   // Validate: FULL invoice requires no previous payments
@@ -434,7 +399,7 @@ export async function generateInvoice(
 
   // COMBINED bills rental + all billable additionals as one invoice, so like FULL
   // it must be the only/first active invoice on the order.
-  if (isCombined && alreadyInvoiced > 0) {
+  if (input.invoice_type === "COMBINED" && alreadyInvoiced > 0) {
     throw new AppError(
       "Cannot generate a Combined invoice when other active invoices already exist",
       409,
@@ -443,20 +408,11 @@ export async function generateInvoice(
 
   // Prevent double-billing: a separate ADDITIONAL invoice can't coexist with an
   // active COMBINED invoice (which already includes the additionals), and vice-versa.
-  if (input.invoice_type === "ADDITIONAL") {
-    const hasActiveCombined = await prisma.invoice.count({
-      where: {
-        order_id: orderId,
-        invoice_type: "COMBINED",
-        status: { notIn: ["REVISED", "CANCELLED"] },
-      },
-    });
-    if (hasActiveCombined > 0) {
-      throw new AppError(
-        "An active Combined invoice already includes additional charges. Revise it instead of adding a separate Additional invoice.",
-        409,
-      );
-    }
+  if (input.invoice_type === "ADDITIONAL" && state.hasActiveCombined) {
+    throw new AppError(
+      "An active Combined invoice already includes additional charges. Revise it instead of adding a separate Additional invoice.",
+      409,
+    );
   }
 
   // Validate: SETTLEMENT requires a previous DP
@@ -477,6 +433,76 @@ export async function generateInvoice(
       409,
     );
   }
+}
+
+/**
+ * B8: the invoice a client_ref already made on this order (a resend), or
+ * null. A client_ref used on another order is refused.
+ */
+async function invoiceByClientRef(
+  db: Prisma.TransactionClient | typeof prisma,
+  clientRef: string | undefined,
+  orderId: string,
+): Promise<Invoice | null> {
+  if (!clientRef) return null;
+  const seen = await db.invoice.findUnique({ where: { client_ref: clientRef } });
+  if (seen && seen.order_id !== orderId) throw new AppError("client_ref sudah dipakai untuk order lain.", 409);
+  return seen;
+}
+
+/** A unique-key race on client_ref (the same resend committed first). */
+const isClientRefConflict = (err: unknown) =>
+  err instanceof Prisma.PrismaClientKnownRequestError &&
+  err.code === "P2002" &&
+  String((err.meta as { target?: unknown } | undefined)?.target ?? "").includes("client_ref");
+
+/**
+ * Issue an invoice. `created` is false when the client_ref was already used
+ * on this order: the first invoice is returned and nothing else happens (no
+ * second number, no PDF).
+ */
+export async function generateInvoice(
+  orderId: string,
+  input: GenerateInvoiceInput,
+): Promise<{ invoice: Invoice; created: boolean }> {
+  // B8: a resend is answered before a number is reserved or a PDF is built.
+  const replay = await invoiceByClientRef(prisma, input.client_ref, orderId);
+  if (replay) return { invoice: replay, created: false };
+
+  const order = await prisma.order.findUnique({
+    where: { id: orderId },
+    include: {
+      service_items: { orderBy: { sort_order: "asc" } },
+      adjustments: { orderBy: { created_at: "asc" } },
+      customer: true,
+    },
+  });
+  if (!order) throw new AppError("Order not found", 404);
+  // G6: an invoice cannot be numbered without a customer (the invoice number
+  // embeds the customer code + per-customer sequence).
+  if (!order.customer) {
+    throw new AppError(
+      "Order has no linked customer; cannot issue a numbered invoice",
+      409,
+    );
+  }
+
+  const isCombined = input.invoice_type === "COMBINED";
+
+  // Billable additional charges (overtime/parking/etc.) — only used for COMBINED,
+  // which rolls rental + extras into a single invoice (and a single Kwitansi).
+  const billableAdjustments = order.adjustments.filter((a) => a.is_billable);
+  const additionalsTotal = billableAdjustments.reduce(
+    (sum, a) => sum + Number(a.amount) * (a.quantity ?? 1),
+    0,
+  );
+
+  // The caps (the DP rule's rental base = the days that are not cancelled;
+  // additionals are billed separately), checked here so a refused invoice
+  // burns no number, and again under the order lock below (B8).
+  const capState = await invoiceCapState(prisma, orderId);
+  assertNewInvoiceAllowed(input, capState);
+  const { finalPrice, alreadyInvoiced } = capState;
 
   // Reserve the invoice number atomically (per-customer invoice_seq) in a short
   // transaction BEFORE building the PDF, so the pooler never times out and two
@@ -508,9 +534,6 @@ export async function generateInvoice(
       firstServiceDate || order.service_start_at || order.order_date || null;
   }
 
-  // Determine PDF description label
-
-
   // For COMBINED, render the billable adjustments as an "Additional Charges"
   // section in the same PDF as the rental service lines.
   const additionalItems = isCombined
@@ -526,8 +549,6 @@ export async function generateInvoice(
     input.invoice_type === "ADDITIONAL"
       ? additionalLineItems
       : await rentalDocumentItems(order, input.invoice_type, isCombined ? additionalsTotal : 0);
-
-
 
   const pdfBuffer = await generateInvoicePDF({
     invoiceNumber,
@@ -552,37 +573,61 @@ export async function generateInvoice(
 
   const fileName = `${invoiceNumber}.pdf`;
   const fileUrl = await uploadInvoicePDF(pdfBuffer, fileName);
+  // Not recorded (refused under the lock, or a resend got there first): the
+  // PDF (customer name, amounts) must not stay behind in the public bucket.
+  const dropPdf = () => void removeFile(env.SUPABASE_STORAGE_BUCKET, `invoices/${fileName}`);
 
-  // Create invoice + auto-update payment_status in one transaction
-  const [invoice] = await prisma.$transaction(async (tx) => {
-    const newInvoice = await tx.invoice.create({
-      data: {
-        order_id: orderId,
-        invoice_number: invoiceNumber,
-        customer_seq: invoiceSeq,
-        invoice_type: input.invoice_type,
-        payment_method: input.payment_method,
-        issue_date: issueDate,
-        amount: input.amount,
-        note: input.note,
-        file_url: fileUrl,
-        status: "ISSUED",
-        due_date: dueDate,
+  let result: { invoice: Invoice; created: boolean };
+  try {
+    result = await prisma.$transaction(
+      async (tx) => {
+        // B9 lock order (order-money.ts): the order row first, so two invoices
+        // of one order (or a resend) are decided one after the other.
+        await lockOrder(tx, orderId);
+        const seen = await invoiceByClientRef(tx, input.client_ref, orderId);
+        if (seen) return { invoice: seen, created: false };
+        // B8: the caps again, on what is committed now.
+        assertNewInvoiceAllowed(input, await invoiceCapState(tx, orderId));
+
+        const newInvoice = await tx.invoice.create({
+          data: {
+            order_id: orderId,
+            invoice_number: invoiceNumber,
+            customer_seq: invoiceSeq,
+            invoice_type: input.invoice_type,
+            payment_method: input.payment_method,
+            issue_date: issueDate,
+            amount: input.amount,
+            note: input.note,
+            file_url: fileUrl,
+            status: "ISSUED",
+            due_date: dueDate,
+            client_ref: input.client_ref ?? null,
+          },
+        });
+
+        // Keep the customer's billed total in sync (G9: total_billed = sum invoices).
+        await tx.customer.update({
+          where: { id: order.customer!.id },
+          data: { total_billed: { increment: input.amount } },
+        });
+
+        // NOTE: issuing an invoice does NOT change payment_status.
+        // payment_status only advances when an invoice is marked PAID (see markInvoicePaid).
+        return { invoice: newInvoice, created: true };
       },
-    });
-
-    // Keep the customer's billed total in sync (G9: total_billed = sum invoices).
-    await tx.customer.update({
-      where: { id: order.customer!.id },
-      data: { total_billed: { increment: input.amount } },
-    });
-
-    // NOTE: issuing an invoice does NOT change payment_status.
-    // payment_status only advances when an invoice is marked PAID (see markInvoicePaid).
-    return [newInvoice];
-  });
-
-  return invoice;
+      { maxWait: 15000, timeout: 20000 },
+    );
+  } catch (err) {
+    dropPdf();
+    if (isClientRefConflict(err)) {
+      const seen = await invoiceByClientRef(prisma, input.client_ref, orderId);
+      if (seen) return { invoice: seen, created: false };
+    }
+    throw err;
+  }
+  if (!result.created) dropPdf();
+  return result;
 }
 
 export async function getInvoicesByOrder(orderId: string) {
@@ -593,24 +638,6 @@ export async function getInvoicesByOrder(orderId: string) {
     where: { order_id: orderId },
     orderBy: { created_at: "desc" },
   });
-}
-
-export async function updateInvoiceStatus(
-  invoiceId: string,
-  status: "DRAFT" | "ISSUED" | "REVISED" | "PAID" | "CANCELLED",
-) {
-  const invoice = await prisma.invoice.findUnique({ where: { id: invoiceId } });
-  if (!invoice) throw new AppError("Invoice not found", 404);
-
-  const updated = await prisma.invoice.update({
-    where: { id: invoiceId },
-    data: { status },
-  });
-  if (status === "PAID")
-    reportLeadPurchase(invoice.order_id).catch((err) =>
-      console.error("GA4 purchase report failed:", err),
-    );
-  return updated;
 }
 
 // Sprint 3: return a short-lived signed URL for an invoice's payment proof.
@@ -683,24 +710,14 @@ export async function markInvoicePaid(
   // One payment per invoice, also on a double click or two admins at once:
   // the invoice turns PAID only if it is not already, and only that request
   // reserves the kwitansi number, writes the receipt and adds to the totals
-  // (the other one burns no number and records nothing). Lock order: invoice
-  // row, then order row (as cancelOrder and reviseInvoice), so they cannot
-  // deadlock; the order lock makes two invoices paid at once add up.
+  // (the other one burns no number and records nothing). B9 lock order
+  // (order-money.ts): the order row first, then the invoice, as cancelOrder,
+  // generateInvoice and reviseInvoice, so they cannot deadlock; the order lock
+  // also makes two invoices paid at once add up.
   let applied: { becameReady: boolean } | null;
   try {
     applied = await prisma.$transaction(
       async (tx) => {
-        const { count } = await tx.invoice.updateMany({
-          where: { id: invoiceId, status: { notIn: ["PAID", "REVISED", "CANCELLED"] } },
-          data: {
-            status: "PAID",
-            paid_at: paidAt,
-            ...(input.payment_method
-              ? { payment_method: input.payment_method as never }
-              : {}),
-          },
-        });
-        if (count === 0) return null;
         const [locked] = await tx.$queryRaw<
           {
             final_price: unknown;
@@ -711,6 +728,33 @@ export async function markInvoicePaid(
           }[]
         >`SELECT final_price, paid_to_date, is_refunded, refund_amount, cancellation_fee
           FROM "orders" WHERE id = ${invoice.order_id} FOR NO KEY UPDATE`;
+        const { count } = await tx.invoice.updateMany({
+          where: { id: invoiceId, status: { notIn: ["PAID", "REVISED", "CANCELLED"] } },
+          data: {
+            status: "PAID",
+            paid_at: paidAt,
+            // The money actually taken (also on the receipt below).
+            amount_received: amountReceived,
+            ...(input.payment_method
+              ? { payment_method: input.payment_method as never }
+              : {}),
+          },
+        });
+        if (count === 0) return null;
+        // More money than the invoice asked: the difference is saldo lebih
+        // (one OVERPAYMENT per invoice, unique index). Nothing reads it for a
+        // rule in A1; the numbers below are unchanged.
+        const over = Math.round(amountReceived * 100) - Math.round(Number(invoice.amount) * 100);
+        if (over > 0) {
+          await addCreditEntry(tx, {
+            orderId: invoice.order_id,
+            kind: "OVERPAYMENT",
+            amount: over / 100,
+            invoiceId: invoice.id,
+            note: `Lebih bayar ${invoice.invoice_number}`,
+            actor: "ADMIN",
+          });
+        }
 
         if (customer) {
           const { number: receiptNumber, seq: receiptSeq } = await nextReceiptNumber(
@@ -791,9 +835,11 @@ export async function markInvoicePaid(
   }
 
   // Website lead → GA4 "purchase" (first payment only; never blocks the admin).
-  reportLeadPurchase(invoice.order_id).catch((err) =>
-    console.error("GA4 purchase report failed:", err),
-  );
+  // Never from a cancellation fee or an adjustment (B12).
+  if (!sendsNoPurchase(invoice.invoice_type))
+    reportLeadPurchase(invoice.order_id).catch((err) =>
+      console.error("GA4 purchase report failed:", err),
+    );
   // Paid in full just now: the assigned drivers may begin the trip with the
   // customer (app unlocks "Mulai perjalanan") and get a notification.
   if (applied.becameReady) void notifyOrderPaidInFull(invoice.order_id);
@@ -988,10 +1034,20 @@ export async function generateOrderStatement(
   };
 }
 
+/** A revision of `invoice` (the same revision chain). */
+const isRevisionOf = (
+  rev: { parent_id: string | null },
+  invoice: { id: string; parent_id: string | null },
+) => rev.parent_id === (invoice.parent_id || invoice.id);
+
+/**
+ * Revise an unpaid invoice. `created` is false when the client_ref already
+ * made this revision: it is returned and nothing else happens (B8).
+ */
 export async function reviseInvoice(
   invoiceId: string,
   input: ReviseInvoiceInput,
-) {
+): Promise<{ invoice: Invoice; created: boolean }> {
   const invoice = await prisma.invoice.findUnique({
     where: { id: invoiceId },
     include: {
@@ -1004,6 +1060,14 @@ export async function reviseInvoice(
     },
   });
   if (!invoice) throw new AppError("Invoice not found", 404);
+  // B8: a resend (the invoice is REVISED by now) gets the revision it made.
+  const replayOf = async (db: Prisma.TransactionClient | typeof prisma) => {
+    const seen = await invoiceByClientRef(db, input.client_ref, invoice.order_id);
+    if (seen && !isRevisionOf(seen, invoice)) throw new AppError("client_ref sudah dipakai untuk invoice lain.", 409);
+    return seen;
+  };
+  const replay = await replayOf(prisma);
+  if (replay) return { invoice: replay, created: false };
   if (invoice.status === "PAID")
     throw new AppError(
       "Paid invoice cannot be revised. Update order price and create a revision before marking invoice paid.",
@@ -1087,9 +1151,13 @@ export async function reviseInvoice(
   const fileName = `${invoiceNumber}-${Date.now().toString(36)}.pdf`;
   const fileUrl = await uploadInvoicePDF(pdfBuffer, fileName);
 
-  let revised;
+  let result: { invoice: Invoice; created: boolean };
   try {
-    revised = await prisma.$transaction(async (tx) => {
+    result = await prisma.$transaction(async (tx) => {
+      // B9 lock order (order-money.ts): the order row, then the invoice.
+      await lockOrder(tx, invoice.order_id);
+      const seen = await replayOf(tx);
+      if (seen) return { invoice: seen, created: false };
       // Conditional: an invoice paid (or revised) by someone else since it was
       // read above is left alone (the revision would bill the customer twice).
       const { count } = await tx.invoice.updateMany({
@@ -1102,6 +1170,16 @@ export async function reviseInvoice(
           409,
         );
       }
+      // B8: the caps again, under the lock, on what is committed now.
+      const fresh = await invoiceCapState(tx, invoice.order_id);
+      const billedElsewhere = await billedSoFar(invoice.order_id, invoice.id, tx);
+      if (billedElsewhere + amount > fresh.finalPrice) {
+        throw new AppError(
+          `Revised invoice total (${billedElsewhere + amount}) exceeds order final price (${fresh.finalPrice}). Update order price first or reduce the invoice amount.`,
+          409,
+        );
+      }
+      if (invoice.invoice_type === "DP") assertDpAmount(amount, fresh.rentalBase);
       const revised = await tx.invoice.create({
         data: {
           order_id: invoice.order_id,
@@ -1115,6 +1193,7 @@ export async function reviseInvoice(
           status: "ISSUED",
           revision: invoice.revision + 1,
           parent_id: invoice.parent_id || invoice.id,
+          client_ref: input.client_ref ?? null,
         },
       });
       // payment_status is NOT recomputed here: it follows the money received
@@ -1142,15 +1221,20 @@ export async function reviseInvoice(
           });
         }
       }
-      return revised;
-    });
+      return { invoice: revised, created: true };
+    }, { maxWait: 15000, timeout: 20000 });
   } catch (err) {
     // Not recorded: the revision PDF (customer name, amounts) must not stay
     // behind in the public bucket.
     void removeFile(env.SUPABASE_STORAGE_BUCKET, `invoices/${fileName}`);
+    if (isClientRefConflict(err)) {
+      const seen = await replayOf(prisma);
+      if (seen) return { invoice: seen, created: false };
+    }
     throw err;
   }
-  return revised;
+  if (!result.created) void removeFile(env.SUPABASE_STORAGE_BUCKET, `invoices/${fileName}`);
+  return result;
 }
 
 function normalizePhone(phone = ""): string {

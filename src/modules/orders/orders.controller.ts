@@ -223,8 +223,9 @@ export async function createOrderAdjustmentController(
 ): Promise<void> {
   try {
     const input = createAdjustmentSchema.parse(req.body);
-    const adjustment = await createOrderAdjustment(req.params.id, input);
-    res.status(201).json({ status: "success", data: adjustment });
+    // A resend with the same client_ref answers 200 with the first charge.
+    const { adjustment, created } = await createOrderAdjustment(req.params.id, input);
+    res.status(created ? 201 : 200).json({ status: "success", data: adjustment });
   } catch (err) {
     next(err);
   }

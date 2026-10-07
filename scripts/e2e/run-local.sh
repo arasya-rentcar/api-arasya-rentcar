@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # End-to-end checks against the real API on a throwaway local Postgres, with
-# Supabase Storage and Expo Push replaced by mock-services.mjs. Nothing here
+# Supabase Storage, Expo Push and the GA4 collector replaced by mock-services.mjs. Nothing here
 # touches production. Usage (from the repo root):
 #   scripts/e2e/run-local.sh            # build, start everything, run, clean up
 #   E2E_SKIP_BUILD=1 scripts/e2e/run-local.sh   # reuse dist/
@@ -51,7 +51,7 @@ MOCK_PID=$!
 env PORT="$API_PORT" NODE_ENV=test JWT_SECRET=e2e-local-secret-0123456789 \
   SUPABASE_URL="http://localhost:$MOCK_PORT" SUPABASE_SERVICE_KEY=fake SUPABASE_STORAGE_BUCKET=invoices \
   EXPO_PUSH_URL="http://localhost:$MOCK_PORT/push" CONFIRMATION_SWEEP_ENABLED=false \
-  GA4_MEASUREMENT_ID= GA4_API_SECRET= WA_DELIVERY= WEB_DEPLOY_HOOK_URL="http://localhost:$MOCK_PORT/deploy-hook" \
+  GA4_MEASUREMENT_ID=G-E2E GA4_API_SECRET=e2e GA4_COLLECT_URL="http://localhost:$MOCK_PORT/ga4/collect" WA_DELIVERY= WEB_DEPLOY_HOOK_URL="http://localhost:$MOCK_PORT/deploy-hook" \
   DATABASE_URL="$DB" DIRECT_URL="$DB" node dist/src/server.js >"$WORK/api.log" 2>&1 &
 API_PID=$!
 for _ in $(seq 1 60); do

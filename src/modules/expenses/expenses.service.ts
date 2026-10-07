@@ -5,6 +5,7 @@ import { billedToCustomerByPackage } from '../../utils/driverFee';
 import { recomputeLineMoney } from '../schedule/line-money.service';
 import { notifyExpenseRejected } from '../../services/driverNotify';
 import { rollupOrderFinance } from '../schedule/schedule.service';
+import { lockOrder, lockOrderDays } from '../orders/order-money';
 import { CreateExpenseInput, UpdateExpenseInput } from './expenses.validation';
 
 // Merge: expenses belong to a service-day LINE (the line IS the trip).
@@ -65,6 +66,10 @@ export async function createExpense(
   try {
   return await prisma.$transaction(
     async (tx) => {
+      // B9 lock order (order-money.ts): the order's days, then the order,
+      // before this touches the payable and the day (recomputeLineMoney).
+      await lockOrderDays(tx, line.order_id);
+      await lockOrder(tx, line.order_id);
       const e = await tx.expense.create({
         data: {
           order_service_item_id: lineId,
@@ -163,6 +168,10 @@ export async function updateExpense(
   const reviewer = await reviewerName(userId);
   const updated = await prisma.$transaction(
     async (tx) => {
+      // B9 lock order (order-money.ts): the order's days, then the order,
+      // before this touches the payable and the day (recomputeLineMoney).
+      await lockOrderDays(tx, line.order_id);
+      await lockOrder(tx, line.order_id);
       await tx.expense.update({
         where: { id: expenseId },
         data: {
@@ -227,6 +236,10 @@ export async function deleteExpense(expenseId: string) {
   }
   await prisma.$transaction(
     async (tx) => {
+      // B9 lock order (order-money.ts): the order's days, then the order,
+      // before this touches the payable and the day (recomputeLineMoney).
+      await lockOrderDays(tx, line.order_id);
+      await lockOrder(tx, line.order_id);
       if (e.adjustment_id) {
         await tx.expense.update({ where: { id: e.id }, data: { adjustment_id: null } });
         await tx.orderAdjustment.deleteMany({ where: { id: e.adjustment_id } });

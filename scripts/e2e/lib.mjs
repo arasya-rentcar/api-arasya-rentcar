@@ -36,13 +36,25 @@ export function knownIssue(issue, name, cond, detail = '') {
     console.log(`KNOWN ${name}  — ${issue}${detail ? `; ${detail}` : ''}`);
   }
 }
-/** One group of checks; a crash is reported as a failure and the next group still runs. */
+/**
+ * One group of checks; a crash is reported as a failure and the next group
+ * still runs. E2E_ONLY=R (or "A,R") runs only the groups whose title starts
+ * with one of those letters.
+ */
+const only = (process.env.E2E_ONLY ?? '').split(',').map((x) => x.trim()).filter(Boolean);
+// Each group calls the API from its own address (X-Forwarded-For; the API
+// trusts one proxy hop), so the groups do not share the global rate limit of
+// 1000 requests per 15 minutes per address.
+let groupNo = 0;
 export async function section(title, fn) {
+  if (only.length && !only.some((g) => title.startsWith(`${g}.`))) return;
+  groupNo++;
   console.log(`\n# ${title}`);
   try {
     await fn();
   } catch (err) {
-    check(`${title}: stopped by an error`, false, String(err?.stack ?? err).split('\n').slice(0, 3).join(' | '));
+    const cause = err?.cause ? ` | cause: ${err.cause.code ?? ''} ${err.cause.message ?? err.cause}` : '';
+    check(`${title}: stopped by an error`, false, String(err?.stack ?? err).split('\n').slice(0, 3).join(' | ') + cause);
   }
 }
 export function summary() {
@@ -51,7 +63,7 @@ export function summary() {
 }
 
 export async function call(method, path, { token, body, form, headers = {} } = {}) {
-  const h = { ...headers };
+  const h = { 'X-Forwarded-For': `10.99.0.${groupNo}`, ...headers };
   if (token) h.Authorization = `Bearer ${token}`;
   let b;
   if (form) b = form;
@@ -59,7 +71,13 @@ export async function call(method, path, { token, body, form, headers = {} } = {
     h['Content-Type'] = 'application/json';
     b = JSON.stringify(body);
   }
-  const res = await fetch(BASE + path, { method, headers: h, body: b });
+  let res;
+  try {
+    res = await fetch(BASE + path, { method, headers: h, body: b });
+  } catch (err) {
+    err.message = `${err.message} (${method} ${path})`;
+    throw err;
+  }
   let json = null;
   try {
     json = await res.json();
