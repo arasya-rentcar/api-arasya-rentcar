@@ -11,6 +11,13 @@ const flag = (fallback: boolean) =>
     z.boolean(),
   );
 
+/** The same flag, but undefined when the client did not send it at all. */
+const optionalFlag = () =>
+  z.preprocess(
+    (v) => (v === undefined || v === null || v === "" ? undefined : v === true || v === "true" || v === "1" || v === 1),
+    z.boolean().optional(),
+  );
+
 export const generateInvoiceSchema = z
   .object({
   invoice_type: z.enum(["DP", "SETTLEMENT", "FULL", "ADDITIONAL", "COMBINED", "ADJUSTMENT"]),
@@ -42,13 +49,17 @@ export const generateInvoiceSchema = z
   });
 
 export const reviseInvoiceSchema = z.object({
-  // Gross, as on generate.
+  // Gross, as on generate (the part of the total the revision covers, before
+  // saldo lebih), not the cash asked.
   amount: z.number().positive("Amount must be a positive number"),
   note: z.string().optional(),
   payment_method: z.enum(["CASH", "BANK_TRANSFER", "QRIS", "OTHER"]).optional(),
   // B8, as on generate: a resend returns the revision already made.
   client_ref: z.string().uuid().optional(),
-  apply_credit: flag(true),
+  // Absent = true, except on an invoice that used saldo lebih: there the
+  // client must say it (reviseInvoice answers 409 otherwise), because an
+  // older dashboard sends the cash it shows as `amount`, not the gross.
+  apply_credit: optionalFlag(),
 });
 
 export const markInvoicePaidSchema = z.object({
@@ -57,7 +68,8 @@ export const markInvoicePaidSchema = z.object({
   // Sprint 2: actual money received, which may differ from the invoice amount
   // (overpayment). Defaults to the invoice amount when omitted. Coerced because
   // multipart form fields arrive as strings.
-  amount_received: z.coerce.number().positive().optional(),
+  // Whole rupiah, like every amount billed (B12).
+  amount_received: z.coerce.number().int("amount_received harus rupiah bulat (tanpa sen)").positive().optional(),
   // Required when amount_received differs from the invoice amount (finance
   // design §3.4): without it the API answers 409 with both numbers and the
   // effect, so a typo ("750.000,00" pasted as 75.000.000) is not recorded.

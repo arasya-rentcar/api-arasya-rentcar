@@ -2141,7 +2141,8 @@ await section('R. Order money, saldo lebih, money received, refunds, locks, clie
     await markPaid(full16.id, paid16c.id);
     const notShort16 = await bill(full16, { invoice_type: 'ADJUSTMENT', amount: 10_000, adjusts_invoice_id: paid16c.id });
     check('R16c an adjustment above the shortfall (409), without the invoice it adjusts (400), or for an invoice paid in full (409) is refused',
-      tooBig16.status === 409 && noRef16.status === 400 && notShort16.status === 409,
+      tooBig16.status === 409 && tooBig16.json?.code === 'ADJUSTMENT_EXCEEDS_SHORTFALL' && tooBig16.json?.shortfall_remaining === 50000 &&
+      noRef16.status === 400 && notShort16.status === 409 && notShort16.json?.code === 'NOT_UNDERPAID',
       `${tooBig16.status} ${tooBig16.json?.message ?? ''} | ${noRef16.status} | ${notShort16.status} ${notShort16.json?.message ?? ''}`);
     const adj16 = await bill(o16, { invoice_type: 'ADJUSTMENT', amount: 50_000, adjusts_invoice_id: dp16.id });
     const adj16pdf = adj16.data?.file_url ? await pdfText(adj16.data.file_url) : '';
@@ -2201,7 +2202,7 @@ await section('R. Order money, saldo lebih, money received, refunds, locks, clie
       `${r18c.status} refunds ${o18c.refunds.length} ${o18c.refunded_total} ${o18c.refund_amount} ${o18c.payment_status}`);
     const r18d = await refundA2(o18, 200_000);
     check('R18d more than the saldo lebih (200.000 > 150.000) → 409 "Saldo lebih tinggal Rp 150.000"',
-      r18d.status === 409 && /Saldo lebih tinggal Rp 150\.000/.test(r18d.json?.message ?? ''), `${r18d.status} ${r18d.json?.message ?? ''}`);
+      r18d.status === 409 && r18d.json?.code === 'REFUND_EXCEEDS_CREDIT' && /Saldo lebih tinggal Rp 150\.000/.test(r18d.json?.message ?? ''), `${r18d.status} ${r18d.json?.message ?? ''}`);
     const r18e = await refundA2(o18, 100_000, ref18);
     check('R18e the same client_ref again → 200 with the first refund, nothing deducted twice',
       r18e.status === 200 && r18e.data.refund.id === r18a.data.refund.id && Number((await order(o18.id)).refunded_total) === 150000, `${r18e.status}`);
@@ -2267,10 +2268,164 @@ await section('R. Order money, saldo lebih, money received, refunds, locks, clie
     const m32 = (await order(o32.id)).money;
     const over32 = await bill(o32, { invoice_type: 'SETTLEMENT', amount: m32.billable_remaining + 1 });
     const ok32 = await bill(o32, { invoice_type: 'SETTLEMENT', amount: m32.billable_remaining });
-    check('R32 [B6] billable_remaining 700.000: +1 → 409 (with billable_remaining), exactly 700.000 → 201 asking 650.000 (50.000 saldo lebih)',
-      m32.billable_remaining === 700000 && over32.status === 409 && over32.json?.billable_remaining === 700000 &&
+    check('R32 [B6] billable_remaining 700.000: +1 → 409 BILLABLE_EXCEEDED (with billable_remaining), exactly 700.000 → 201 asking 650.000 (50.000 saldo lebih)',
+      m32.billable_remaining === 700000 && over32.status === 409 && over32.json?.code === 'BILLABLE_EXCEEDED' && over32.json?.billable_remaining === 700000 &&
       ok32.status === 201 && Number(ok32.data.amount) === 650000 && (await order(o32.id)).money.billable_remaining === 0,
       `${m32.billable_remaining} ${over32.status} ${ok32.status} ${ok32.data?.amount}`);
+
+    // ── Review of PR #8 (S1, S2, nits): reviewer probes P3, P5, P16, P17, P19 ──
+    // S1 (P16): revising an invoice that used saldo lebih. `amount` is the
+    // gross; an older dashboard sends the cash it shows, so without an
+    // explicit apply_credit the API refuses instead of taking the credit twice.
+    const o34 = await makeOrder('R34', { startDay: 7 });
+    const f34 = (await bill(o34, { invoice_type: 'FULL', amount: 1_000_000 })).data;
+    await payAck(o34, f34, 1_100_000);
+    await charge(o34, 300_000);
+    const a34 = (await bill(o34, { invoice_type: 'ADDITIONAL', amount: 300_000 })).data;
+    const old34 = await reviseA2(o34, a34, { amount: Number(a34.amount), note: 'ganti catatan' });
+    const a34st = (await prisma.invoice.findUnique({ where: { id: a34.id } })).status;
+    check('R34a [S1] revising an invoice that used saldo lebih without apply_credit (older dashboard: amount = the cash shown) → 409, nothing changed',
+      Number(a34.amount) === 200000 && Number(a34.credit_applied) === 100000 && old34.status === 409 && old34.json?.code === 'REVISE_NEEDS_APPLY_CREDIT' &&
+      old34.json.gross === 300000 && old34.json.credit_applied === 100000 && old34.json.amount === 200000 && a34st === 'ISSUED' &&
+      (await order(o34.id)).money.credit_balance === 0,
+      `${old34.status} ${JSON.stringify(old34.json).slice(0, 240)} ${a34st}`);
+    const keep34 = await reviseA2(o34, a34, { amount: 300_000, apply_credit: true });
+    const m34a = (await order(o34.id)).money;
+    check('R34b with apply_credit=true and the gross (300.000): the credit comes back and is used again → cash 200.000, saldo lebih 0',
+      keep34.status === 201 && Number(keep34.data.amount) === 200000 && Number(keep34.data.credit_applied) === 100000 && keep34.data.gross === 300000 && m34a.credit_balance === 0,
+      `${keep34.status} ${keep34.json?.message ?? ''} ${keep34.data?.amount}/${keep34.data?.credit_applied} credit ${m34a.credit_balance}`);
+    const drop34 = await reviseA2(o34, keep34.data, { amount: 300_000, apply_credit: false });
+    const m34b = (await order(o34.id)).money;
+    check('R34c with apply_credit=false: cash 300.000, the 100.000 stays saldo lebih',
+      drop34.status === 201 && Number(drop34.data.amount) === 300000 && Number(drop34.data.credit_applied) === 0 && m34b.credit_balance === 100000,
+      `${drop34.status} ${drop34.data?.amount}/${drop34.data?.credit_applied} credit ${m34b.credit_balance}`);
+    const def34 = await reviseA2(o34, drop34.data, { amount: 300_000 });
+    check('R34d an invoice that used no credit is revised as before: without apply_credit the saldo lebih is applied by default (cash 200.000)',
+      def34.status === 201 && Number(def34.data.amount) === 200000 && Number(def34.data.credit_applied) === 100000 && (await order(o34.id)).money.credit_balance === 0,
+      `${def34.status} ${def34.json?.message ?? ''} ${def34.data?.amount}/${def34.data?.credit_applied}`);
+
+    // Nit 3: a revised fee invoice PDF prints what THIS invoice covers and asks.
+    const fee34 = (await order(o12g.id)).invoices.find((i) => i.invoice_type === 'CANCELLATION_FEE' && i.status === 'ISSUED');
+    const rfee34 = fee34 ? await reviseA2(o12g, fee34, { amount: 800_000, apply_credit: true }) : { status: 0 };
+    const rfee34t = rfee34.data?.file_url ? await pdfText(rfee34.data.file_url) : '';
+    check('R34e a revised cancellation-fee invoice (gross 800.000, 100.000 saldo lebih) prints SUBTOTAL Rp 800.000, "Dipotong dari saldo lebih" and TOTAL Rp 700.000',
+      rfee34.status === 201 && Number(rfee34.data.amount) === 700000 && /Rp 800\.000/.test(rfee34t) && /Dipotong dari saldo lebih/.test(rfee34t) && /Rp 700\.000/.test(rfee34t),
+      `${rfee34.status} ${rfee34.json?.message ?? ''} ${rfee34.data?.amount} 800 ${/Rp 800\.000/.test(rfee34t)} credit ${/Dipotong dari saldo lebih/.test(rfee34t)} 700 ${/Rp 700\.000/.test(rfee34t)}`);
+
+    // S2 (P17): the settlement caption quotes the DP actually received.
+    const o35 = await makeOrder('R35', { startDay: 7 });
+    const dp35 = (await bill(o35, { invoice_type: 'DP', amount: 200_000 })).data;
+    await payAck(o35, dp35, 150_000);
+    // The settlement bills the rental rest (800.000); the 50.000 short stays billable.
+    const st35 = (await bill(o35, { invoice_type: 'SETTLEMENT', amount: 800_000 })).data;
+    const wa35 = await call('POST', `/orders/${o35.id}/invoice/${st35.id}/send-whatsapp`, { token: admin, body: { target_phone: '081234567890' } });
+    const cap35 = wa35.data?.message_text ?? '';
+    const adj35 = (await bill(o35, { invoice_type: 'ADJUSTMENT', amount: 50_000, adjusts_invoice_id: dp35.id })).data;
+    await markPaid(o35.id, adj35.id);
+    const wa35b = await call('POST', `/orders/${o35.id}/invoice/${st35.id}/send-whatsapp`, { token: admin, body: { target_phone: '081234567890' } });
+    const cap35b = wa35b.data?.message_text ?? '';
+    check('R35 [S2] settlement caption: "DP senilai Rp 150.000" after a DP paid short; Rp 200.000 once its Invoice Penyesuaian is paid',
+      /DP senilai \*Rp 150\.000\*/.test(cap35) && /DP senilai \*Rp 200\.000\*/.test(cap35b),
+      `${(/DP senilai[^\n]*/.exec(cap35) ?? [''])[0]} | ${(/DP senilai[^\n]*/.exec(cap35b) ?? [''])[0]}`);
+
+    // Nit 1 (P5): an invoice saldo lebih pays, issued with a back-dated date,
+    // is paid now: its kwitansi counts the payments made before it.
+    const o36 = await makeOrder('R36', { startDay: 7 });
+    const f36 = (await bill(o36, { invoice_type: 'FULL', amount: 1_000_000 })).data;
+    await payAck(o36, f36, 1_200_000);
+    await charge(o36, 150_000);
+    const add36 = await bill(o36, { invoice_type: 'ADDITIONAL', amount: 150_000, issue_date: new Date(Date.now() - 2 * 86400000).toISOString() });
+    const inv36 = await prisma.invoice.findUnique({ where: { id: add36.data?.id ?? '' }, include: { receipts: true } });
+    const t36 = inv36?.receipt_url ? await pdfText(inv36.receipt_url) : '';
+    check('R36 [nit 1] back-dated invoice paid from saldo lebih: paid_at = now (not the issue date), kwitansi counts the 1.200.000 received (no "DP DITERIMA" stamp)',
+      add36.status === 201 && inv36?.status === 'PAID' && Math.abs(inv36.paid_at.getTime() - Date.now()) < 120e3 &&
+      Math.abs(inv36.receipts[0].payment_date.getTime() - Date.now()) < 120e3 && /1\.200\.000/.test(t36) && !/DP DITERIMA/.test(t36),
+      `${add36.status} paid_at ${inv36?.paid_at?.toISOString()} 1.200.000 ${/1\.200\.000/.test(t36)} stamp ${/DP DITERIMA/.test(t36)}`);
+
+    // Nit 4 (P19): SALDO LEBIH on a kwitansi only once nothing is owed.
+    const o37 = await makeOrder('R37', { startDay: 7 });
+    const dp37 = (await bill(o37, { invoice_type: 'DP', amount: 200_000 })).data;
+    await payAck(o37, dp37, 250_000);
+    const t37 = await pdfText((await prisma.invoice.findUnique({ where: { id: dp37.id } })).receipt_url);
+    check('R37 [nit 4] DP 200.000 paid with 250.000 (750.000 still owed): the kwitansi says "Masuk saldo lebih" but shows no SALDO LEBIH row next to SISA TAGIHAN',
+      /SISA TAGIHAN/.test(t37) && /750\.000/.test(t37) && /Masuk saldo lebih/.test(t37) && !/SALDO LEBIH/.test(t37),
+      `sisa ${/SISA TAGIHAN/.test(t37)} 750 ${/750\.000/.test(t37)} masuk ${/Masuk saldo lebih/.test(t37)} row ${/SALDO LEBIH/.test(t37)}`);
+
+    // Nit 5: whole rupiah only.
+    const o38 = await makeOrder('R38', { startDay: 7 });
+    const f38 = (await bill(o38, { invoice_type: 'FULL', amount: 1_000_000 })).data;
+    const frac38 = await markPaid(o38.id, f38.id, { amount_received: '1000000.50', amount_mismatch_ack: true });
+    await payAck(o38, f38, 1_100_000);
+    const frac38r = await refundA2(o38, '50000.5');
+    const noRef38 = (() => {
+      const f = new FormData();
+      f.append('proof', jpeg(), 'r.jpg');
+      f.append('amount', '50000');
+      return call('POST', `/orders/${o38.id}/refunds`, { token: admin, form: f });
+    })();
+    const noRef38r = await noRef38;
+    check('R38 [nit 5, nit 6] amount_received or a refund with sen (1.000.000,50 / 50.000,5) → 400; /refunds without client_ref → 400; nothing recorded',
+      frac38.status === 400 && frac38r.status === 400 && noRef38r.status === 400 && (await order(o38.id)).refunds.length === 0 &&
+      (await prisma.receipt.count({ where: { invoice_id: f38.id } })) === 1,
+      `${frac38.status} ${frac38r.status} ${noRef38r.status}`);
+
+    // Nit 2: the same refund sent twice at once leaves one refund and one proof file.
+    const sameRef39 = uuid();
+    const [r39a, r39b] = await Promise.all([refundA2(o38, 40_000, sameRef39), refundA2(o38, 40_000, sameRef39)]);
+    await sleep(500);
+    const proofs39 = (await (await fetch(`${MOCK}/__objects`)).json()).filter((k) => k.includes(`refunds/${o38.id}/`));
+    check('R39 [nit 2] the same refund client_ref twice at once: one refund (201 + 200), one proof file left in storage',
+      [r39a.status, r39b.status].sort().join() === '200,201' && (await order(o38.id)).refunds.length === 1 && proofs39.length === 1,
+      `${r39a.status}/${r39b.status} proofs ${proofs39.length}`);
+
+    // Nit 6 (P3): cancel where the money kept covers the fee but part of it
+    // is saldo lebih: the credit is used for the fee without an invoice.
+    const o40 = await makeOrder('R40', { startDay: 7 });
+    await charge(o40, 500_000);
+    const dp40 = (await bill(o40, { invoice_type: 'DP', amount: 200_000 })).data;
+    await payAck(o40, dp40, 350_000);
+    const c40 = await cancel(o40);
+    const o40a = await order(o40.id);
+    const e40 = await entries(o40);
+    check('R40 [P3] total 1.500.000, fee 300.000, 350.000 kept of which 150.000 saldo lebih: APPLIED 100.000 without an invoice, refund due = saldo lebih 50.000, covered = fee, PAID',
+      c40.status === 200 && c40.data.penalty === 300000 && c40.data.refundDue === 50000 && c40.data.cancellationInvoiceNumber === null &&
+      o40a.money.credit_balance === 50000 && o40a.money.covered === 300000 && o40a.payment_status === 'PAID' &&
+      e40.some((e) => e.kind === 'APPLIED' && Number(e.amount) === -100000 && e.invoice_id === null),
+      `${c40.status} ${JSON.stringify(c40.data)} ${o40a.money.credit_balance}/${o40a.money.covered} ${e40.map((e) => `${e.kind} ${e.amount}`).join(', ')}`);
+
+    // Nit 6: the B1.3 baseline on an underpaid order and on one with open credit.
+    const o41 = await makeOrder('R41', { days: 3, startDay: 12 });
+    const f41 = (await bill(o41, { invoice_type: 'FULL', amount: 3_000_000 })).data;
+    await payAck(o41, f41, 1_800_000);
+    const days41 = [...o41.service_items].sort((a, b) => a.service_date.localeCompare(b.service_date));
+    const eh41 = await putLine(days41[2].id, { is_external: false, line_status: 'CANCELLED' });
+    const o41a = await order(o41.id);
+    check('R41a [B1.3 v3] FULL 3.000.000 paid with 1.800.000: Edit Hari cancels a day (total 2.000.000 ≥ 1.800.000 covered; the old rule counted the 3.000.000 invoice)',
+      eh41.status === 200 && o41a.money.total === 2000000, `${eh41.status} ${eh41.json?.message ?? ''} ${o41a.money.total}`);
+    const lower41 = await call('PUT', `/orders/${o41.id}`, { token: admin, body: editBody(o41a, { reason: 'diskon', days: o41a.service_items.map((l) => ({ id: l.id, ...(l.id === days41[1].id ? { unit_price: 500_000 } : {}) })) }) });
+    const ok41 = await call('PUT', `/orders/${o41.id}`, { token: admin, body: editBody(o41a, { reason: 'diskon', days: o41a.service_items.map((l) => ({ id: l.id, ...(l.id === days41[1].id ? { unit_price: 900_000 } : {}) })) }) });
+    check('R41b Edit Order: a price that takes the total to 1.500.000 (< 1.800.000 paid) → 409; to 1.900.000 → 200',
+      lower41.status === 409 && ok41.status === 200 && (await order(o41.id)).money.total === 1900000,
+      `${lower41.status} ${lower41.json?.message ?? ''} | ${ok41.status} ${ok41.json?.message ?? ''}`);
+    const o42 = await makeOrder('R42', { days: 3, startDay: 16 });
+    const dp42 = (await bill(o42, { invoice_type: 'DP', amount: 600_000 })).data;
+    await payAck(o42, dp42, 1_000_000);
+    const st42 = (await bill(o42, { invoice_type: 'SETTLEMENT', amount: 2_400_000 })).data;
+    const days42 = [...o42.service_items].sort((a, b) => a.service_date.localeCompare(b.service_date));
+    const eh42 = await putLine(days42[2].id, { is_external: false, line_status: 'CANCELLED' });
+    check('R42 [B1.3 v3] DP 600.000 paid with 1.000.000 and the settlement (gross 2.400.000, cash 2.000.000) open: cancelling a day (total 2.000.000 < covered 1.000.000 + open 2.000.000; the 400.000 credit is now used) → 409 with both amounts',
+      Number(st42.amount) === 2000000 && Number(st42.credit_applied) === 400000 && eh42.status === 409 &&
+      /Rp 2\.000\.000/.test(eh42.json?.message ?? '') && /Rp 3\.000\.000/.test(eh42.json?.message ?? ''),
+      `${st42.amount}/${st42.credit_applied} ${eh42.status} ${eh42.json?.message ?? ''}`);
+
+    // The orders list carries the order-level money, so the dashboard shows
+    // Diterima / Sisa without summing invoice amounts.
+    const code18 = (await order(o18.id)).order_code;
+    const list18 = await call('GET', `/orders/search?search=${encodeURIComponent(code18)}&bucket=ALL&page_size=10`, { token: admin });
+    const item18 = (list18.json?.data ?? []).find((x) => x.id === o18.id);
+    check('R43 /orders/search items carry paid_to_date, refunded_total and credit_balance (R18: 1.300.000 / 250.000 / 50.000)',
+      list18.status === 200 && Number(item18?.paid_to_date) === 1300000 && Number(item18?.refunded_total) === 250000 && Number(item18?.credit_balance) === 50000,
+      `${list18.status} ${item18 ? `${item18.paid_to_date}/${item18.refunded_total}/${item18.credit_balance}` : 'not found'}`);
   }
 
   // Ledger flows: overpayment → saldo lebih, the old refund endpoint (now a

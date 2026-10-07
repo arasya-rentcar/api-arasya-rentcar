@@ -562,9 +562,11 @@ export async function generateInvoicePDF(data: InvoiceData): Promise<Buffer> {
       color: rgb(0.7, 0.7, 0.7),
     });
     drawTotalRow("SISA TAGIHAN", formatRp(remaining), { bold: true });
-    if (credit > 0) {
+    if (credit > 0 && remaining <= 0) {
       // Saldo lebih held for the customer: reduces the next bill or is
-      // refunded (flagged red).
+      // refunded (flagged red). Shown only once nothing is owed (Net ≥ total),
+      // so it cannot be read as a deduction from SISA TAGIHAN; while money is
+      // still owed the credit is part of it and is used on the next bill.
       const rowSize = 9;
       page.drawText(sanitizeText("SALDO LEBIH"), {
         x: totalsLabelX,
@@ -624,9 +626,12 @@ export async function generateInvoicePDF(data: InvoiceData): Promise<Buffer> {
       drawTotalRow("Total Tagihan", formatRp(total));
       drawTotalRow("DP sudah dibayar", formatRp(alreadyPaid));
       drawTotalRow("Sisa harus dibayar", formatRp(sisa));
+      // A settlement (or a revision of it) that bills less than the rest:
+      // the TOTAL is what THIS invoice asks, so say what it covers.
+      if (Math.round(dueNow) !== Math.round(sisa)) drawTotalRow("Ditagih di invoice ini", formatRp(dueNow));
       creditRow();
       divider();
-      drawTotalRow("TOTAL", formatRp(cash(sisa)), { bold: true, size: 11 });
+      drawTotalRow("TOTAL", formatRp(cash(dueNow)), { bold: true, size: 11 });
     } else if (kind === "ADDITIONAL") {
       // Additional invoice bills only the extra charge, not the whole trip.
       drawTotalRow("Total Tambahan", formatRp(dueNow));
@@ -634,12 +639,14 @@ export async function generateInvoicePDF(data: InvoiceData): Promise<Buffer> {
       divider();
       drawTotalRow("TOTAL", formatRp(cash(dueNow)), { bold: true, size: 11 });
     } else {
-      // FULL / COMBINED: bill the whole amount.
-      drawTotalRow("SUBTOTAL", formatRp(total));
+      // FULL / COMBINED (and a revised cancellation-fee invoice): what THIS
+      // invoice covers, which a revision may have changed from the order
+      // total; the TOTAL is the cash it asks.
+      drawTotalRow("SUBTOTAL", formatRp(dueNow));
       drawTotalRow("LAIN-LAIN", "Rp -");
       creditRow();
       divider();
-      drawTotalRow("TOTAL", formatRp(cash(total)), { bold: true, size: 11 });
+      drawTotalRow("TOTAL", formatRp(cash(dueNow)), { bold: true, size: 11 });
     }
     if (data.dueDate) {
       drawTotalRow("Jatuh tempo", formatDateId(data.dueDate), { size: 8 });

@@ -448,6 +448,7 @@ function adjustmentRoom(orderId: string, adjusted: CapState["adjusted"]): number
     throw new AppError(
       `Invoice ${adjusted.invoice_number} tidak kurang bayar, jadi tidak ada yang ditagih lewat invoice penyesuaian.`,
       409,
+      { code: "NOT_UNDERPAID" },
     );
   const billed = adjusted.adjusted_by.reduce((s, a) => s + sen(a.amount) + sen(a.credit_applied), 0);
   return short - billed;
@@ -512,6 +513,7 @@ function assertNewInvoiceAllowed(
       throw new AppError(
         `Invoice penyesuaian (${rupiah(rp(gross))}) melebihi kekurangan ${state.adjusted!.invoice_number} yang belum ditagih (${rupiah(rp(Math.max(0, room)))}).`,
         409,
+        { code: "ADJUSTMENT_EXCEEDS_SHORTFALL", shortfall_remaining: rp(Math.max(0, room)) },
       );
     }
   }
@@ -522,7 +524,7 @@ function assertNewInvoiceAllowed(
     throw new AppError(
       `Amount (${input.amount}) exceeds remaining balance (${rp(Math.max(0, m.billable))}). Order total: ${rp(m.total)}, already paid or invoiced: ${rp(alreadyBilled)}`,
       409,
-      { billable_remaining: rp(Math.max(0, m.billable)) },
+      { code: "BILLABLE_EXCEEDED", billable_remaining: rp(Math.max(0, m.billable)) },
     );
   }
 }
@@ -724,6 +726,9 @@ export async function generateInvoice(
   // PDF (customer name, amounts) must not stay behind in the public bucket.
   const dropPdf = () => void removeFile(env.SUPABASE_STORAGE_BUCKET, `invoices/${fileName}`);
 
+  // An invoice saldo lebih pays in full is paid now, also when its issue_date
+  // is back-dated: its kwitansi then counts every payment made so far.
+  const paidFromCreditAt = new Date();
   let result: { invoice: Invoice; created: boolean; fromCredit: boolean };
   try {
     result = await prisma.$transaction(
@@ -737,7 +742,7 @@ export async function generateInvoice(
         const fresh = await invoiceCapState(tx, orderId, capOpts);
         assertNewInvoiceAllowed(orderId, input, fresh);
         const credit = creditToApply(input.apply_credit, fresh.money, gross);
-        if (credit !== plannedCredit) throw new AppError(CREDIT_CHANGED, 409);
+        if (credit !== plannedCredit) throw new AppError(CREDIT_CHANGED, 409, { code: "CREDIT_CHANGED" });
         const cash = gross - credit;
 
         const newInvoice = await tx.invoice.create({
@@ -778,7 +783,7 @@ export async function generateInvoice(
         // payment_status only advances when an invoice is marked PAID (see
         // markInvoicePaid); an invoice paid from saldo lebih moves no money.
         if (cash === 0) {
-          const paid = await settleFromCredit(tx, newInvoice, customer, issueDate);
+          const paid = await settleFromCredit(tx, newInvoice, customer, paidFromCreditAt);
           return { invoice: paid, created: true, fromCredit: true };
         }
         return { invoice: newInvoice, created: true, fromCredit: false };
@@ -798,7 +803,7 @@ export async function generateInvoice(
     // The kwitansi "Dibayar dari saldo lebih". No GA4: no money came in.
     try {
       await attachReceiptPdf(result.invoice.id, {
-        paidAt: issueDate,
+        paidAt: paidFromCreditAt,
         paymentMethod: input.payment_method,
         amountReceived: 0,
       });
@@ -1419,6 +1424,23 @@ export async function reviseInvoice(
   const amount = input.amount;
   const gross = sen(amount);
   const oldCredit = sen(invoice.credit_applied);
+  // `amount` is the gross. An older dashboard sends the cash it shows (the
+  // stored amount), which on an invoice that used saldo lebih is the gross
+  // minus that credit: the revision would ask the credit off twice. Such an
+  // invoice is revised only by a client that says apply_credit explicitly.
+  if (oldCredit > 0 && input.apply_credit === undefined) {
+    throw new AppError(
+      `Invoice ${invoice.invoice_number} sebagian dibayar dari saldo lebih: nilai invoice ${rupiah(grossOf(invoice))}, dipotong saldo lebih ${rupiah(rp(oldCredit))}, yang ditagih ${rupiah(Number(invoice.amount))}. Versi dashboard ini belum bisa merevisinya dengan benar. Muat ulang dashboard ke versi terbaru, lalu revisi lagi.`,
+      409,
+      {
+        code: "REVISE_NEEDS_APPLY_CREDIT",
+        gross: grossOf(invoice),
+        credit_applied: rp(oldCredit),
+        amount: Number(invoice.amount),
+      },
+    );
+  }
+  const applyCredit = input.apply_credit ?? true;
   const isAdjustment = invoice.invoice_type === "ADJUSTMENT";
   const adjustedNumber = invoice.adjusts_invoice?.invoice_number ?? "";
 
@@ -1443,7 +1465,7 @@ export async function reviseInvoice(
       throw new AppError(
         `Revised invoice total (${rp(covered + m.open + gross)}) exceeds order final price (${rp(m.total)}). Update order price first or reduce the invoice amount.`,
         409,
-        { billable_remaining: rp(Math.max(0, billable)) },
+        { code: "BILLABLE_EXCEEDED", billable_remaining: rp(Math.max(0, billable)) },
       );
     }
     // B2: a revised DP keeps the 20% minimum, like a new one.
@@ -1454,9 +1476,10 @@ export async function reviseInvoice(
         throw new AppError(
           `Invoice penyesuaian (${rupiah(amount)}) melebihi kekurangan ${adjustedNumber} yang belum ditagih (${rupiah(rp(Math.max(0, room)))}).`,
           409,
+          { code: "ADJUSTMENT_EXCEEDS_SHORTFALL", shortfall_remaining: rp(Math.max(0, room)) },
         );
     }
-    return input.apply_credit ? Math.max(0, Math.min(credit, gross)) : 0;
+    return applyCredit ? Math.max(0, Math.min(credit, gross)) : 0;
   };
   const capOpts = { excludeInvoiceId: invoice.id, adjustsInvoiceId: invoice.adjusts_invoice_id };
   const before = await invoiceCapState(prisma, invoice.order_id, capOpts);
@@ -1547,7 +1570,7 @@ export async function reviseInvoice(
       // invoice is REVISED and its credit back, so nothing more to set aside).
       const fresh = await invoiceCapState(tx, invoice.order_id, capOpts);
       const credit = checkRevision(fresh, 0);
-      if (credit !== plannedCredit) throw new AppError(CREDIT_CHANGED, 409);
+      if (credit !== plannedCredit) throw new AppError(CREDIT_CHANGED, 409, { code: "CREDIT_CHANGED" });
       const cash = gross - credit;
       const revised = await tx.invoice.create({
         data: {
@@ -1729,9 +1752,22 @@ export async function sendInvoiceWhatsapp(
         status: "PAID",
       },
       orderBy: { paid_at: "asc" },
+      include: {
+        adjusted_by: {
+          where: { status: "PAID" },
+          select: { amount: true, amount_received: true, credit_applied: true },
+        },
+      },
     });
     dpPaidAt = dpInvoice?.paid_at ?? dpInvoice?.issue_date ?? null;
-    dpAmount = dpInvoice ? Number(dpInvoice.amount) : Math.max(rentalTotal - amount, 0);
+    // The DP as actually settled, not as invoiced: the money received on it
+    // (an underpaid DP received less), the saldo lebih it used, and any paid
+    // Invoice Penyesuaian that billed its shortfall.
+    const settled = (i: { amount: unknown; amount_received?: unknown; credit_applied?: unknown }) =>
+      sen(i.amount_received ?? i.amount) + sen(i.credit_applied);
+    dpAmount = dpInvoice
+      ? rp(settled(dpInvoice) + dpInvoice.adjusted_by.reduce((s, a) => s + settled(a), 0))
+      : Math.max(rentalTotal - amount, 0);
   }
 
   const captionCtx = {

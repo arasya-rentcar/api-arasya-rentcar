@@ -1748,7 +1748,7 @@ async function recordRefund(
     new AppError(
       `Pengembalian ${rupiah(rp(amount))} melebihi saldo lebih. Saldo lebih tinggal ${rupiah(rp(credit))}.`,
       409,
-      { credit_balance: rp(credit) },
+      { code: "REFUND_EXCEEDS_CREDIT", credit_balance: rp(credit) },
     );
   if (amount > before.credit) throw tooMuch(before.credit);
 
@@ -1757,8 +1757,9 @@ async function recordRefund(
     prefix: `refunds/${orderId}`,
   });
   const refundedAt = new Date();
+  let result: { refund: Awaited<ReturnType<typeof prisma.orderRefund.create>>; created: boolean };
   try {
-    return await prisma.$transaction(async (tx) => {
+    result = await prisma.$transaction(async (tx) => {
       // B9 lock order (order-money.ts): the order row; the refund and its
       // credit entry are inserts.
       await lockOrder(tx, orderId);
@@ -1813,6 +1814,10 @@ async function recordRefund(
     }
     throw err;
   }
+  // A resend that the lock found already recorded: our copy of the proof is
+  // not on any refund.
+  if (!result.created) void removeFile(PAYMENT_PROOFS_BUCKET, proofUpload.path);
+  return result;
 }
 
 /** The refund as the API returns it: no storage path, only whether there is a proof. */

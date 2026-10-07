@@ -163,13 +163,16 @@ export const createChangeLogSchema = z.object({
 // file is required and validated in the service.
 export const markOrderRefundedSchema = z.object({
   note: z.string().optional(),
-  amount: z.coerce.number().positive().optional(),
+  amount: z.coerce.number().int("Nominal pengembalian harus rupiah bulat (tanpa sen)").positive().optional(),
 });
 
 // POST /orders/:id/refunds (multipart; proof file required, field "proof").
 // The amount is at most the saldo lebih; client_ref makes a resend a no-op.
 export const createRefundSchema = z.object({
-  amount: z.coerce.number().positive("Nominal pengembalian harus lebih dari 0"),
+  amount: z.coerce
+    .number()
+    .int("Nominal pengembalian harus rupiah bulat (tanpa sen)")
+    .positive("Nominal pengembalian harus lebih dari 0"),
   note: z.string().trim().max(500).optional(),
   client_ref: z.string().uuid(),
 });
