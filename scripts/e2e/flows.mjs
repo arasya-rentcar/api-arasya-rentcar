@@ -1774,9 +1774,18 @@ await section('R. Order money, one lock order, client_ref, GA4 (finance A1: B8, 
     }, { timeout: 15000 });
     return both;
   }
-  const races = { pay: {}, start: {}, edit: {} };
+  const races = { pay: {}, start: {}, edit: {}, payable: {} };
+  // Invoice PDFs in the mock storage that belong to no invoice row (a fee PDF
+  // left behind by a refused cancel).
+  async function orphanPdfs(o) {
+    const code = (await prisma.customer.findUnique({ where: { id: o.customer_id } })).code;
+    const rows = new Set((await prisma.invoice.findMany({ where: { order: { customer_id: o.customer_id } }, select: { invoice_number: true } })).map((r) => r.invoice_number));
+    return (await (await fetch(`${MOCK}/__objects`)).json())
+      .map((k) => new RegExp(`/(INV-\\d+-${code}-\\d+)\\.pdf$`).exec(k)?.[1])
+      .filter((n) => n && !rows.has(n));
+  }
   const tally = (k, a, b) => (races[k][`${a.status}/${b.status}`] = (races[k][`${a.status}/${b.status}`] ?? 0) + 1);
-  const bad22 = { pay: [], start: [], edit: [] };
+  const bad22 = { pay: [], start: [], edit: [], payable: [] };
   for (let i = 0; i < 10; i++) {
     const oa = await makeOrder(`R22a${i}`, { startDay: 60 + i });
     const dpa = await invoice(oa.id, 'DP', 300_000);
@@ -1784,6 +1793,8 @@ await section('R. Order money, one lock order, client_ref, GA4 (finance A1: B8, 
     tally('pay', ca, pa);
     for (const r of [ca, pa]) if (!fine(r)) bad22.pay.push(`#${i} ${r.status} ${r.json?.message ?? ''}`);
     bad22.pay.push(...(await moneyProblems(oa.id)).map((m) => `#${i} ${m}`));
+    // A refused cancel had already built its fee PDF: it must be deleted.
+    bad22.pay.push(...(await orphanPdfs(oa)).map((n) => `#${i} fee PDF ${n} left without an invoice (cancel ${ca.status})`));
 
     const ob = await makeOrder(`R22b${i}`, { startDay: 80 + i });
     await payDp(ob, 300_000);
@@ -1804,11 +1815,26 @@ await section('R. Order money, one lock order, client_ref, GA4 (finance A1: B8, 
     tally('edit', cc, ec);
     for (const r of [cc, ec]) if (!fine(r)) bad22.edit.push(`#${i} ${r.status} ${r.json?.message ?? ''}`);
     bad22.edit.push(...(await moneyProblems(oc.id)).map((m) => `#${i} ${m}`));
+
+    // Payable edits (Utang) locked payable → day → order before; cancel locks
+    // day → order → payable.
+    const od = await makeOrder(`R22d${i}`, { startDay: 140 + i });
+    await payDp(od, 300_000);
+    await putLine(od.service_items[0].id, { is_external: false, driver_id: dR.id, car_id: carR.id, line_status: 'ASSIGNED' });
+    const pay = await prisma.payable.findFirst({ where: { service_item_id: od.service_items[0].id } });
+    const [cd, ed] = await race(od.id, i, () => cancel(od), () =>
+      call('PUT', `/payables/${pay?.id}`, { token: admin, body: { extras: [{ label: 'Bonus', amount: 25_000 }], keterangan: 'R22d' } }));
+    tally('payable', cd, ed);
+    if (!pay) bad22.payable.push(`#${i} no payable after assigning`);
+    for (const r of [cd, ed]) if (!fine(r)) bad22.payable.push(`#${i} ${r.status} ${r.json?.message ?? ''}`);
+    bad22.payable.push(...(await moneyProblems(od.id)).map((m) => `#${i} ${m}`));
   }
   const show = (k) => `${JSON.stringify(races[k])} ${bad22[k].slice(0, 3).join(' | ')}`;
   check('R22a [B9] cancel + "Tandai terbayar" at once, 10×: no 500, money consistent', bad22.pay.length === 0, show('pay'));
   check('R22b [B9] cancel + driver "Berangkat" at once, 10×: no 500, money and days consistent', bad22.start.length === 0, show('start'));
   check('R22c [B9] cancel + Edit Hari cancelling a day at once, 10×: no 500, money consistent', bad22.edit.length === 0, show('edit'));
+  check('R22d [B9] cancel + editing the day\'s payable (Utang) at once, 10×: no 500, money consistent', bad22.payable.length === 0, show('payable'));
+  check('R22e a cancel refused after its fee PDF was built leaves no PDF behind', bad22.pay.every((m) => !/fee PDF/.test(m)), bad22.pay.filter((m) => /fee PDF/.test(m)).slice(0, 3).join(' | '));
 
   // R23 (B8): client_ref on invoices.
   const gen = (o, body) => call('POST', `/orders/${o.id}/generate-invoice`, { token: admin, body: { payment_method: 'BANK_TRANSFER', ...body } });
@@ -1835,7 +1861,10 @@ await section('R. Order money, one lock order, client_ref, GA4 (finance A1: B8, 
   const rows23b = await prisma.invoice.findMany({ where: { order_id: o23b.id } });
   check('R23d two different refs that together pass the total, at once → one 201, one 409 (cap checked under the lock)',
     [x1.status, x2.status].sort().join() === '201,409' && rows23b.length === 1, `${x1.status}/${x2.status} rows ${rows23b.length}`);
-  check('R23e a client_ref of another order → 409', (await gen(o23b, body23)).status === 409);
+  const other23 = await gen(o23b, body23);
+  check('R23e a client_ref of another order → 409 (that reason), no invoice made',
+    other23.status === 409 && /client_ref sudah dipakai untuk order lain/.test(other23.json?.message ?? '') && (await prisma.invoice.count({ where: { order_id: o23b.id } })) === rows23b.length,
+    `${other23.status} ${other23.json?.message ?? ''}`);
   const rev = (o, inv, amount, client_ref) => call('POST', `/orders/${o.id}/invoice/${inv.id}/revise`, { token: admin, body: { amount, client_ref } });
   const rref = uuid();
   const [rv1, rv2] = await Promise.all([rev(o23, rows23[0], 350_000, rref), rev(o23, rows23[0], 350_000, rref)]);
@@ -1910,9 +1939,38 @@ await section('R. Order money, one lock order, client_ref, GA4 (finance A1: B8, 
     link.status === 200 && (await order(o25c.id)).payment_status !== 'UNPAID' && (await sentTo(l3)).length === 0,
     `link ${link.status} ${link.json?.message ?? ''}, sends ${(await sentTo(l3)).length}`);
 
+  // Ledger flows A1 writes (no rule reads them yet): overpayment → saldo
+  // lebih, the old refund endpoint takes it back, a re-mark moves its entry.
+  const o33 = await makeOrder('R33f');
+  const before33 = await order(o33.id);
+  const f33 = await invoice(o33.id, 'FULL', 1_000_000);
+  await markPaid(o33.id, f33.data.id, { amount_received: 1_150_000 });
+  const paid33 = await order(o33.id);
+  const refund33 = (amount) => {
+    const f = new FormData();
+    f.append('proof', jpeg(), 'r.jpg');
+    if (amount) f.append('amount', String(amount));
+    return call('POST', `/orders/${o33.id}/mark-refunded`, { token: admin, form: f });
+  };
+  const r33a = await refund33();
+  const after33a = await order(o33.id);
+  const r33b = await refund33(100_000);
+  const after33b = await order(o33.id);
+  const entries33 = await prisma.orderCreditEntry.findMany({ where: { order_id: o33.id }, orderBy: { created_at: 'asc' } });
+  const kinds33 = entries33.map((e) => `${e.kind} ${Number(e.amount)}`).join(', ');
+  check('R33f overpaid 150.000 → OVERPAYMENT entry, saldo lebih 150.000; refunding it → 0; re-marking 100.000 → 50.000 with still one REFUND entry',
+    paid33.money.credit_balance === 150000 && r33a.status === 200 && after33a.money.credit_balance === 0 && r33b.status === 200 && after33b.money.credit_balance === 50000 &&
+    entries33.length === 2 && entries33[0].kind === 'OVERPAYMENT' && Number(entries33[0].amount) === 150000 && entries33[1].kind === 'REFUND' && Number(entries33[1].amount) === -100000,
+    `${paid33.money.credit_balance} → ${after33a.money.credit_balance} → ${after33b.money.credit_balance}; ${kinds33}`);
+  const rules33 = (m) => [m.payment_status, m.billable_remaining, m.start_ready].join('/');
+  check('R33g the ledger changes no rule: payment_status, billable_remaining and start_ready as the old rules give',
+    rules33(before33.money) === 'UNPAID/1000000/false' && rules33(paid33.money) === 'PAID/0/true' && rules33(after33b.money) === 'PAID/0/true',
+    `${rules33(before33.money)} | ${rules33(paid33.money)} | ${rules33(after33b.money)}`);
+
   // R33: invariants over every order this run made (finance design §6). In A1
-  // the ledger is only opened (no OVERPAYMENT/RELEASE yet), so INV-5/INV-6
-  // are checked in today's form: invoices never bill past the total.
+  // the ledger only records (no RELEASE/APPLIED yet), so INV-6 is checked in
+  // today's form (invoices never bill past the total) and INV-5 (covered ≤
+  // total) on the orders whose ledger moved.
   const mine = await prisma.order.findMany({
     where: { customer_name: { contains: tag } },
     include: {
@@ -1921,7 +1979,7 @@ await section('R. Order money, one lock order, client_ref, GA4 (finance A1: B8, 
       credit_entries: true,
     },
   });
-  const v = { inv12: [], inv3: [], inv4: [], money: [], cap: [] };
+  const v = { inv12: [], inv3: [], inv4: [], money: [], cap: [], ledger: [] };
   for (const o of mine) {
     const name = o.order_code ?? o.id;
     const credit = o.credit_entries.reduce((s, e) => s + sen(e.amount), 0);
@@ -1937,6 +1995,13 @@ await section('R. Order money, one lock order, client_ref, GA4 (finance A1: B8, 
     const open = o.invoices.filter((i) => ['DRAFT', 'ISSUED'].includes(i.status)).reduce((s, i) => s + sen(i.amount), 0);
     const T = sen(o.final_price);
     if (o.cancellation_fee == null && billed > T) v.cap.push(`${name} billed ${billed / 100} > total ${o.final_price}`);
+    for (const i of paidInv) {
+      const over = sen(i.amount_received) - sen(i.amount);
+      const entries = o.credit_entries.filter((e) => e.kind === 'OVERPAYMENT' && e.invoice_id === i.id);
+      if (over > 0 ? entries.length !== 1 || sen(entries[0].amount) !== over : entries.length !== 0) v.ledger.push(`${i.invoice_number} over ${over / 100}, entries ${entries.length}`);
+    }
+    const covered = sen(o.paid_to_date) - sen(o.refunded_total) - sen(o.credit_balance);
+    if (o.credit_entries.length && covered > T) v.ledger.push(`${name} covered ${covered / 100} > total ${o.final_price}`);
     const g = await order(o.id);
     const m = g.money;
     const net = sen(o.paid_to_date) - sen(o.refunded_total);
@@ -1956,6 +2021,7 @@ await section('R. Order money, one lock order, client_ref, GA4 (finance A1: B8, 
   check('R33c [INV-4] paid_to_date = Σ receipts; amount_received = the receipt', v.inv4.length === 0, head(v.inv4));
   check('R33d `money` on GET /orders/:id matches the stored money (and start_payment)', v.money.length === 0, head(v.money));
   check('R33e [INV-6, today\'s form] no order not cancelled is billed past its total', v.cap.length === 0, head(v.cap));
+  check('R33h [INV-8, INV-5] one OVERPAYMENT entry per overpaid invoice (= the difference); covered ≤ total where the ledger moved', v.ledger.length === 0, head(v.ledger));
 });
 
 const failed = summary();

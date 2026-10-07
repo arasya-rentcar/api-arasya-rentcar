@@ -30,7 +30,7 @@ import { assertUnitsFree, lockUnits } from "../schedule/availability";
 import { nextOrderCode } from "../../utils/codes";
 import { wibShortDay } from "../../utils/wib";
 import { buildCancellationFeePdf, cancellationLogValue } from "../invoices/invoices.service";
-import { computeOrderMoney, lockOrder, lockOrderDays } from "./order-money";
+import { computeOrderMoney, lockOrder, lockOrderDays, setLegacyRefundCredit } from "./order-money";
 import {
   deriveAndSetOrderStatus,
   refreshCarStatuses,
@@ -38,8 +38,10 @@ import {
   syncDriverStatus,
   syncCarStatus,
 } from "../schedule/order-derive.service";
+import { env } from "../../config/env";
 import {
   uploadFile,
+  removeFile,
   assertValidUpload,
   getSignedUrl,
   PAYMENT_PROOFS_BUCKET,
@@ -411,7 +413,9 @@ export async function searchOrders(params: SearchOrdersParams) {
       and.push({ order_status: { not: "CANCELLED" } });
       break;
     case "REFUNDED":
-      and.push({ refunded_total: { gt: 0 } });
+      // is_refunded alone: sheet imports (scripts/import-workbook.js) mark
+      // a refund without an amount.
+      and.push({ OR: [{ refunded_total: { gt: 0 } }, { is_refunded: true }] });
       break;
     case "AWAITING_FINAL":
       // All service days finished by the driver, waiting on admin finalization.
@@ -1577,7 +1581,7 @@ export async function createOrderAdjustment(
       });
 
       return { adjustment, created: true };
-    });
+    }, { maxWait: 15000, timeout: 20000 });
   } catch (err) {
     // The same client_ref committed at the same moment (unique key; on this
     // order the lock above already serializes them): answer with that row.
@@ -1726,7 +1730,7 @@ export async function markOrderRefunded(
   return prisma.$transaction(async (tx) => {
     // B9 lock order (order-money.ts): the order row.
     await lockOrder(tx, orderId);
-    const updated = await tx.order.update({
+    await tx.order.update({
       where: { id: orderId },
       data: {
         is_refunded: true,
@@ -1745,13 +1749,15 @@ export async function markOrderRefunded(
       proof_url: proofUpload.path,
       note: input.note ?? null,
     };
-    await tx.orderRefund.upsert({
+    const refund = await tx.orderRefund.upsert({
       where: { client_ref: `legacy-${orderId}` },
       create: { order_id: orderId, client_ref: `legacy-${orderId}`, created_by: "ADMIN", ...legacy },
       update: legacy,
     });
-    return updated;
-  });
+    // Money given back comes out of the saldo lebih first (INV-2).
+    await setLegacyRefundCredit(tx, orderId, refund.id, amount);
+    return tx.order.findUniqueOrThrow({ where: { id: orderId } });
+  }, { maxWait: 15000, timeout: 20000 });
 }
 
 // Sprint 5: short-lived signed URL for the (private) refund proof.
@@ -1980,221 +1986,230 @@ export async function cancelOrder(
   }
 
   // ── Mutations in one transaction ────────────────────────────────────────
-  const result = await prisma.$transaction(async (tx) => {
-    // 0) B9 lock order (order-money.ts): the days, then the order (as Edit
-    //    Hari, Edit Order and the driver app), then the invoices in step 1.
-    //    Re-check under the locks: a second click (or a finalize) that
-    //    committed meanwhile wins and this cancel stops.
-    await lockOrderDays(tx, orderId);
-    await lockOrder(tx, orderId);
-    const fresh = await tx.order.findUniqueOrThrow({
-      where: { id: orderId },
-      select: { order_status: true, cancellation_fee: true, final_price: true, service_start_at: true },
-    });
-    if (
-      fresh.order_status === "DONE" ||
-      fresh.order_status === "CANCELLED" ||
-      fresh.cancellation_fee != null
-    ) {
-      throw new AppError("Order ini sudah dibatalkan atau sudah selesai.", 409);
-    }
-    // The days as they are now. A day started, finished, cancelled or
-    // repriced since the fee was worked out (and its PDF built) changes what
-    // is owed: stop and let the admin retry.
-    const days = await tx.orderServiceItem.findMany({ where: { order_id: orderId } });
-    if (allDaysEnded(days)) throw new AppError(ALL_DAYS_DONE_MESSAGE, 409);
-    const quote = cancellationQuote(fresh, days, now);
-    if (
-      quote.tier !== tier ||
-      quote.penalty !== penalty ||
-      Number(fresh.final_price) !== originalFinalPrice
-    ) {
-      throw new AppError(
-        "Ada perubahan pada hari atau total order saat pesanan dibatalkan. Coba batalkan lagi.",
-        409,
-      );
-    }
-
-    // 1) Void active invoices and decrement the customer's billed total.
-    const activeInvoices = await tx.invoice.findMany({
-      where: {
-        order_id: orderId,
-        status: { notIn: ["REVISED", "CANCELLED"] },
-      },
-      select: { id: true, amount: true },
-    });
-    const voidedSum = activeInvoices.reduce(
-      (s, inv) => s + Number(inv.amount),
-      0,
-    );
-    if (activeInvoices.length > 0) {
-      await tx.invoice.updateMany({
-        where: { id: { in: activeInvoices.map((i) => i.id) } },
-        data: { status: "CANCELLED" },
+  let result: CancelOrderResult;
+  try {
+    result = await prisma.$transaction(async (tx) => {
+      // 0) B9 lock order (order-money.ts): the days, then the order (as Edit
+      //    Hari, Edit Order and the driver app), then the invoices in step 1.
+      //    Re-check under the locks: a second click (or a finalize) that
+      //    committed meanwhile wins and this cancel stops.
+      await lockOrderDays(tx, orderId);
+      await lockOrder(tx, orderId);
+      const fresh = await tx.order.findUniqueOrThrow({
+        where: { id: orderId },
+        select: { order_status: true, cancellation_fee: true, final_price: true, service_start_at: true },
       });
-    }
+      if (
+        fresh.order_status === "DONE" ||
+        fresh.order_status === "CANCELLED" ||
+        fresh.cancellation_fee != null
+      ) {
+        throw new AppError("Order ini sudah dibatalkan atau sudah selesai.", 409);
+      }
+      // The days as they are now. A day started, finished, cancelled or
+      // repriced since the fee was worked out (and its PDF built) changes what
+      // is owed: stop and let the admin retry.
+      const days = await tx.orderServiceItem.findMany({ where: { order_id: orderId } });
+      if (allDaysEnded(days)) throw new AppError(ALL_DAYS_DONE_MESSAGE, 409);
+      const quote = cancellationQuote(fresh, days, now);
+      if (
+        quote.tier !== tier ||
+        quote.penalty !== penalty ||
+        Number(fresh.final_price) !== originalFinalPrice
+      ) {
+        throw new AppError(
+          "Ada perubahan pada hari atau total order saat pesanan dibatalkan. Coba batalkan lagi.",
+          409,
+        );
+      }
 
-    // Money received, read now under the order lock (markInvoicePaid takes it
-    // first too), so a payment recorded while the fee PDF was being built is
-    // included. The PDF was made for owedBefore; if that changed, stop and
-    // let the admin retry.
-    const money = await tx.order.findUniqueOrThrow({
-      where: { id: orderId },
-      select: { paid_to_date: true, is_refunded: true, refund_amount: true },
-    });
-    const paidToDate = Number(money.paid_to_date ?? 0);
-    const owed = owedFor(netPaid(money));
-    if (owed !== owedBefore) {
-      throw new AppError(
-        "Ada pembayaran yang baru tercatat saat pesanan dibatalkan. Coba batalkan lagi.",
-        409,
-      );
-    }
-
-    // 2) Cancel all active lines; collect drivers/cars to release.
-    const driverIds = new Set<string>();
-    const carIds = new Set<string>();
-    const cancellableIds: string[] = [];
-    const startedIds: string[] = [];
-    for (const l of days) {
-      if (l.line_status === "DONE" || l.line_status === "CANCELLED") continue;
-      cancellableIds.push(l.id);
-      if (l.actual_start_at || l.trip_started_at) startedIds.push(l.id);
-      if (l.driver_id) driverIds.add(l.driver_id);
-      if (l.car_id) carIds.add(l.car_id);
-    }
-    // A day already paid out (driver fee / partner RTR) keeps who drove and
-    // its amounts, like a started day: the payment stays on record.
-    const paidOut = await tx.payable.findMany({
-      where: { service_item_id: { in: cancellableIds }, status: "PAID" },
-      select: { service_item_id: true },
-    });
-    for (const p of paidOut) {
-      if (!startedIds.includes(p.service_item_id)) startedIds.push(p.service_item_id);
-    }
-    const notStartedIds = cancellableIds.filter((id) => !startedIds.includes(id));
-    if (notStartedIds.length > 0) {
-      // Not started: release driver/car; nobody earned anything that day.
-      await tx.orderServiceItem.updateMany({
-        where: { id: { in: notStartedIds }, is_external: false },
-        data: {
-          line_status: "CANCELLED",
-          driver_id: null,
-          car_id: null,
-          driver_fee: 0,
-          driver_fee_note: "Dibatalkan sebelum berangkat",
-        },
-      });
-      await tx.orderServiceItem.updateMany({
-        where: { id: { in: notStartedIds }, is_external: true },
-        data: { line_status: "CANCELLED", rtr_amount: 0 },
-      });
-    }
-    if (startedIds.length > 0) {
-      // Already on the road (or already paid): keep who drove so their pay
-      // stays with them.
-      await tx.orderServiceItem.updateMany({
-        where: { id: { in: startedIds } },
-        data: { line_status: "CANCELLED" },
-      });
-    }
-    for (const id of cancellableIds) await recomputeLineMoney(tx, id);
-
-    // 3) Derive order status (all-cancelled → CANCELLED) + release resources.
-    await deriveAndSetOrderStatus(tx, orderId);
-    for (const dId of driverIds) await syncDriverStatus(tx, dId);
-    for (const cId of carIds) await syncCarStatus(tx, cId);
-
-    // 4) Issue the CANCELLATION_FEE invoice for what is still owed, with its
-    //    PDF (penalty − already paid = remaining). Nothing owed → no invoice:
-    //    a fee invoice over money already received would be paid twice.
-    let cancellationInvoiceNumber: string | null = null;
-    let invoiced = 0;
-    if (prepared && order.customer && owed > 0) {
-      await tx.invoice.create({
-        data: {
+      // 1) Void active invoices and decrement the customer's billed total.
+      const activeInvoices = await tx.invoice.findMany({
+        where: {
           order_id: orderId,
-          invoice_number: prepared.invoiceNumber,
-          customer_seq: prepared.invoiceSeq,
-          invoice_type: "CANCELLATION_FEE",
-          payment_method: "BANK_TRANSFER",
-          issue_date: now,
-          amount: owed,
-          note: `${reason}\n${label}`,
-          file_url: prepared.fileUrl,
-          status: "ISSUED",
+          status: { notIn: ["REVISED", "CANCELLED"] },
         },
+        select: { id: true, amount: true },
       });
-      cancellationInvoiceNumber = prepared.invoiceNumber;
-      invoiced = owed;
-    }
-
-    // 5) Keep total_billed = sum(active invoices): remove voided, add the new one.
-    if (order.customer) {
-      const billedDelta = invoiced - voidedSum;
-      if (billedDelta !== 0) {
-        await tx.customer.update({
-          where: { id: order.customer.id },
-          data: { total_billed: { increment: billedDelta } },
+      const voidedSum = activeInvoices.reduce(
+        (s, inv) => s + Number(inv.amount),
+        0,
+      );
+      if (activeInvoices.length > 0) {
+        await tx.invoice.updateMany({
+          where: { id: { in: activeInvoices.map((i) => i.id) } },
+          data: { status: "CANCELLED" },
         });
       }
-    }
 
-    // 6) The order is now worth the penalty. Set final_price = penalty so the
-    //    existing refund/payment flows compute correctly, and recompute
-    //    payment_status against the new total (money received is unchanged).
-    //    The cancellation fields mark the order as cancelled even when done
-    //    days keep it open, so later roll-ups keep the penalty as its price.
-    // The DP rule's base is the penalty too (dpBaseOf): it is what the
-    // customer owes now, so PAID once it is covered, DP_PAID from 20% of it.
-    const paymentStatus = paymentStatusFor(
-      netPaid(money),
-      penalty,
-      dpBaseOf({ cancellation_fee: penalty }, days),
-    );
+      // Money received, read now under the order lock (markInvoicePaid takes it
+      // first too), so a payment recorded while the fee PDF was being built is
+      // included. The PDF was made for owedBefore; if that changed, stop and
+      // let the admin retry.
+      const money = await tx.order.findUniqueOrThrow({
+        where: { id: orderId },
+        select: { paid_to_date: true, is_refunded: true, refund_amount: true },
+      });
+      const paidToDate = Number(money.paid_to_date ?? 0);
+      const owed = owedFor(netPaid(money));
+      if (owed !== owedBefore) {
+        throw new AppError(
+          "Ada pembayaran yang baru tercatat saat pesanan dibatalkan. Coba batalkan lagi.",
+          409,
+        );
+      }
 
-    await tx.order.update({
-      where: { id: orderId },
-      data: {
-        final_price: penalty,
-        payment_status: paymentStatus,
-        cancelled_at: now,
-        cancellation_fee: penalty,
-        cancellation_reason: reason,
-      },
+      // 2) Cancel all active lines; collect drivers/cars to release.
+      const driverIds = new Set<string>();
+      const carIds = new Set<string>();
+      const cancellableIds: string[] = [];
+      const startedIds: string[] = [];
+      for (const l of days) {
+        if (l.line_status === "DONE" || l.line_status === "CANCELLED") continue;
+        cancellableIds.push(l.id);
+        if (l.actual_start_at || l.trip_started_at) startedIds.push(l.id);
+        if (l.driver_id) driverIds.add(l.driver_id);
+        if (l.car_id) carIds.add(l.car_id);
+      }
+      // A day already paid out (driver fee / partner RTR) keeps who drove and
+      // its amounts, like a started day: the payment stays on record.
+      const paidOut = await tx.payable.findMany({
+        where: { service_item_id: { in: cancellableIds }, status: "PAID" },
+        select: { service_item_id: true },
+      });
+      for (const p of paidOut) {
+        if (!startedIds.includes(p.service_item_id)) startedIds.push(p.service_item_id);
+      }
+      const notStartedIds = cancellableIds.filter((id) => !startedIds.includes(id));
+      if (notStartedIds.length > 0) {
+        // Not started: release driver/car; nobody earned anything that day.
+        await tx.orderServiceItem.updateMany({
+          where: { id: { in: notStartedIds }, is_external: false },
+          data: {
+            line_status: "CANCELLED",
+            driver_id: null,
+            car_id: null,
+            driver_fee: 0,
+            driver_fee_note: "Dibatalkan sebelum berangkat",
+          },
+        });
+        await tx.orderServiceItem.updateMany({
+          where: { id: { in: notStartedIds }, is_external: true },
+          data: { line_status: "CANCELLED", rtr_amount: 0 },
+        });
+      }
+      if (startedIds.length > 0) {
+        // Already on the road (or already paid): keep who drove so their pay
+        // stays with them.
+        await tx.orderServiceItem.updateMany({
+          where: { id: { in: startedIds } },
+          data: { line_status: "CANCELLED" },
+        });
+      }
+      for (const id of cancellableIds) await recomputeLineMoney(tx, id);
+
+      // 3) Derive order status (all-cancelled → CANCELLED) + release resources.
+      await deriveAndSetOrderStatus(tx, orderId);
+      for (const dId of driverIds) await syncDriverStatus(tx, dId);
+      for (const cId of carIds) await syncCarStatus(tx, cId);
+
+      // 4) Issue the CANCELLATION_FEE invoice for what is still owed, with its
+      //    PDF (penalty − already paid = remaining). Nothing owed → no invoice:
+      //    a fee invoice over money already received would be paid twice.
+      let cancellationInvoiceNumber: string | null = null;
+      let invoiced = 0;
+      if (prepared && order.customer && owed > 0) {
+        await tx.invoice.create({
+          data: {
+            order_id: orderId,
+            invoice_number: prepared.invoiceNumber,
+            customer_seq: prepared.invoiceSeq,
+            invoice_type: "CANCELLATION_FEE",
+            payment_method: "BANK_TRANSFER",
+            issue_date: now,
+            amount: owed,
+            note: `${reason}\n${label}`,
+            file_url: prepared.fileUrl,
+            status: "ISSUED",
+          },
+        });
+        cancellationInvoiceNumber = prepared.invoiceNumber;
+        invoiced = owed;
+      }
+
+      // 5) Keep total_billed = sum(active invoices): remove voided, add the new one.
+      if (order.customer) {
+        const billedDelta = invoiced - voidedSum;
+        if (billedDelta !== 0) {
+          await tx.customer.update({
+            where: { id: order.customer.id },
+            data: { total_billed: { increment: billedDelta } },
+          });
+        }
+      }
+
+      // 6) The order is now worth the penalty. Set final_price = penalty so the
+      //    existing refund/payment flows compute correctly, and recompute
+      //    payment_status against the new total (money received is unchanged).
+      //    The cancellation fields mark the order as cancelled even when done
+      //    days keep it open, so later roll-ups keep the penalty as its price.
+      // The DP rule's base is the penalty too (dpBaseOf): it is what the
+      // customer owes now, so PAID once it is covered, DP_PAID from 20% of it.
+      const paymentStatus = paymentStatusFor(
+        netPaid(money),
+        penalty,
+        dpBaseOf({ cancellation_fee: penalty }, days),
+      );
+
+      await tx.order.update({
+        where: { id: orderId },
+        data: {
+          final_price: penalty,
+          payment_status: paymentStatus,
+          cancelled_at: now,
+          cancellation_fee: penalty,
+          cancellation_reason: reason,
+        },
+      });
+      await rollupOrderFinance(tx, orderId);
+
+      // 7) Audit log (preserve the original price).
+      await tx.orderChangeLog.create({
+        data: {
+          order_id: orderId,
+          field: "order_status",
+          old_value: `${order.order_status} (final_price ${originalFinalPrice})`,
+          new_value: cancellationLogValue(penalty, label),
+          note: reason,
+          actor: actor ?? "ADMIN",
+        },
+      });
+
+      // Net of any refund already made, like `owed` and payment_status.
+      const refundDue = Math.max(0, Math.round(netPaid(money) - penalty));
+      return {
+        tier,
+        penalty,
+        originalFinalPrice,
+        paidToDate,
+        refundDue,
+        stillOwed: owed,
+        cancellationInvoiceNumber,
+      } satisfies CancelOrderResult;
+    }, {
+      // Cancel runs many sequential round-trips (status derive + driver/car sync
+      // loops + invoice/order writes) against the Supabase pooler; the default 5s
+      // interactive-tx limit can be exceeded and yield P2028. Give it headroom.
+      maxWait: 15000,
+      timeout: 30000,
     });
-    await rollupOrderFinance(tx, orderId);
-
-    // 7) Audit log (preserve the original price).
-    await tx.orderChangeLog.create({
-      data: {
-        order_id: orderId,
-        field: "order_status",
-        old_value: `${order.order_status} (final_price ${originalFinalPrice})`,
-        new_value: cancellationLogValue(penalty, label),
-        note: reason,
-        actor: actor ?? "ADMIN",
-      },
-    });
-
-    // Net of any refund already made, like `owed` and payment_status.
-    const refundDue = Math.max(0, Math.round(netPaid(money) - penalty));
-    return {
-      tier,
-      penalty,
-      originalFinalPrice,
-      paidToDate,
-      refundDue,
-      stillOwed: owed,
-      cancellationInvoiceNumber,
-    } satisfies CancelOrderResult;
-  }, {
-    // Cancel runs many sequential round-trips (status derive + driver/car sync
-    // loops + invoice/order writes) against the Supabase pooler; the default 5s
-    // interactive-tx limit can be exceeded and yield P2028. Give it headroom.
-    maxWait: 15000,
-    timeout: 30000,
-  });
+  } catch (err) {
+    // Refused (or failed) after the fee PDF was uploaded: the PDF (customer
+    // name, amounts) must not stay behind in the public bucket. Its reserved
+    // number stays unused.
+    if (prepared) void removeFile(env.SUPABASE_STORAGE_BUCKET, `invoices/${prepared.invoiceNumber}.pdf`);
+    throw err;
+  }
 
   return result;
 }

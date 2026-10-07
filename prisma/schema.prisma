@@ -655,6 +655,7 @@ model Invoice {
   @@index([order_id])
   @@index([parent_id])
   @@index([status])
+  @@index([adjusts_invoice_id])
   @@map("invoices")
 }
 
@@ -1399,5 +1400,7 @@ model OrderCreditEntry {
   created_at      DateTime        @default(now())
 
   @@index([order_id])
+  @@index([invoice_id])
+  @@index([refund_id])
   @@map("order_credit_entries")
 }

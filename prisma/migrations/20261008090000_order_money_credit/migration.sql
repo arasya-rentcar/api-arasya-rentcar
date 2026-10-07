@@ -96,6 +96,11 @@ ALTER TABLE "invoices" ADD CONSTRAINT "invoices_credit_applied_nonneg" CHECK ("c
 ALTER TABLE "order_refunds" ADD CONSTRAINT "order_refunds_amount_positive" CHECK ("amount" > 0);
 ALTER TABLE "order_credit_entries" ADD CONSTRAINT "order_credit_entries_amount_nonzero" CHECK ("amount" <> 0);
 
+-- Foreign keys used in lookups (Postgres does not index them by itself).
+CREATE INDEX "invoices_adjusts_invoice_id_idx" ON "invoices"("adjusts_invoice_id");
+CREATE INDEX "order_credit_entries_invoice_id_idx" ON "order_credit_entries"("invoice_id");
+CREATE INDEX "order_credit_entries_refund_id_idx" ON "order_credit_entries"("refund_id");
+
 -- INV-8: at most one OVERPAYMENT entry per invoice and one REFUND entry per refund.
 CREATE UNIQUE INDEX "credit_one_overpayment_per_invoice" ON "order_credit_entries"("invoice_id") WHERE "kind" = 'OVERPAYMENT';
 CREATE UNIQUE INDEX "credit_one_entry_per_refund" ON "order_credit_entries"("refund_id") WHERE "kind" = 'REFUND';
@@ -108,7 +113,8 @@ ALTER TABLE "order_refunds" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "order_credit_entries" ENABLE ROW LEVEL SECURITY;
 
 
--- Backfill (finance design §10). Only reads columns that existed before.
+-- Backfill (finance design §10). Only reads columns that existed before, and
+-- safe to run again by hand: nothing is inserted twice or overwritten.
 
 -- 1. Refunds: refunded_total, and one order_refunds row per refunded order
 --    (the old endpoint kept one refund per order, overwritten on re-marking).
@@ -120,7 +126,8 @@ INSERT INTO "order_refunds" ("id", "order_id", "amount", "refunded_at", "proof_u
 SELECT gen_random_uuid()::text, o."id", o."refund_amount", COALESCE(o."refunded_at", o."updated_at"),
        o."refund_proof_url", o."refund_note", 'legacy-' || o."id", 'migration', COALESCE(o."refunded_at", o."updated_at")
 FROM "orders" o
-WHERE o."is_refunded" AND COALESCE(o."refund_amount", 0) > 0;
+WHERE o."is_refunded" AND COALESCE(o."refund_amount", 0) > 0
+ON CONFLICT ("client_ref") DO NOTHING;
 
 -- 2. The money actually taken on each payment: the first receipt (the one
 --    paid_to_date counts), or the invoice amount for old rows without one.
@@ -128,7 +135,8 @@ UPDATE "invoices" i
 SET "amount_received" = COALESCE(
   (SELECT r."amount" FROM "receipts" r WHERE r."invoice_id" = i."id" ORDER BY r."created_at" ASC, r."id" ASC LIMIT 1),
   i."amount")
-WHERE i."status" = 'PAID' OR (i."status" = 'CANCELLED' AND i."paid_at" IS NOT NULL);
+WHERE (i."status" = 'PAID' OR (i."status" = 'CANCELLED' AND i."paid_at" IS NOT NULL))
+  AND i."amount_received" IS NULL;
 
 -- 3. Saldo lebih already held: money received beyond the order total, net of
 --    refunds (so legacy refunds need no REFUND entry). Sheet imports
@@ -137,12 +145,14 @@ INSERT INTO "order_credit_entries" ("id", "order_id", "kind", "amount", "note", 
 SELECT gen_random_uuid()::text, o."id", 'OPENING', o."paid_to_date" - o."refunded_total" - o."final_price",
        'Saldo lebih awal (migrasi): uang diterima dikurangi pengembalian dan total order', 'migration', CURRENT_TIMESTAMP
 FROM "orders" o
-WHERE o."paid_to_date" > 0 AND o."paid_to_date" - o."refunded_total" - o."final_price" > 0;
+WHERE o."paid_to_date" > 0 AND o."paid_to_date" - o."refunded_total" - o."final_price" > 0
+  AND NOT EXISTS (SELECT 1 FROM "order_credit_entries" e WHERE e."order_id" = o."id" AND e."kind" = 'OPENING');
 
+-- credit_balance = Σ entries (INV-2).
 UPDATE "orders" o
-SET "credit_balance" = e."amount"
-FROM "order_credit_entries" e
-WHERE e."order_id" = o."id" AND e."kind" = 'OPENING';
+SET "credit_balance" = e."total"
+FROM (SELECT "order_id", SUM("amount") AS "total" FROM "order_credit_entries" GROUP BY "order_id") e
+WHERE e."order_id" = o."id";
 
 -- 4. Orders cancelled before this release used the whole-order fee and keep
 --    their frozen final_price.

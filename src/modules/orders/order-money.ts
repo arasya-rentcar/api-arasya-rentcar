@@ -42,6 +42,89 @@ export async function lockOrder(tx: Prisma.TransactionClient, orderId: string): 
 const sen = (v: unknown) => Math.round(Number(v ?? 0) * 100);
 const rp = (s: number) => s / 100;
 
+/*
+ * ── Saldo lebih ledger (INV-1, INV-2) ──────────────────────────────────────
+ * orders.credit_balance = Σ order_credit_entries.amount, always ≥ 0. Only
+ * these helpers write entries, each in the caller's transaction and under the
+ * order lock (lockOrder), together with the cached balance. The migration's
+ * OPENING entries follow the same rule.
+ * In A1 nothing reads the balance for a rule: billable_remaining, start_ready
+ * and payment_status do not use it (see computeOrderMoney).
+ */
+type CreditKind = "OPENING" | "OVERPAYMENT" | "RELEASE" | "APPLIED" | "UNAPPLIED" | "REFUND";
+
+/** One ledger movement (positive adds credit, negative uses it). Zero writes nothing. */
+export async function addCreditEntry(
+  tx: Prisma.TransactionClient,
+  entry: {
+    orderId: string;
+    kind: CreditKind;
+    /** Rupiah; sign as stored. */
+    amount: number;
+    invoiceId?: string;
+    refundId?: string;
+    note?: string;
+    actor?: string;
+  },
+): Promise<void> {
+  const amount = rp(sen(entry.amount));
+  if (amount === 0) return;
+  await tx.orderCreditEntry.create({
+    data: {
+      order_id: entry.orderId,
+      kind: entry.kind,
+      amount,
+      invoice_id: entry.invoiceId ?? null,
+      refund_id: entry.refundId ?? null,
+      note: entry.note ?? null,
+      actor: entry.actor ?? null,
+    },
+  });
+  await tx.order.update({
+    where: { id: entry.orderId },
+    data: { credit_balance: { increment: amount } },
+  });
+}
+
+/**
+ * The old "refund settled" endpoint keeps one refund per order and overwrites
+ * it when re-marked. Its REFUND entry (one per refund, INV-8) follows: the
+ * refund uses saldo lebih up to min(amount, credit available before it), and
+ * a re-mark moves the same entry instead of adding a second one.
+ */
+export async function setLegacyRefundCredit(
+  tx: Prisma.TransactionClient,
+  orderId: string,
+  refundId: string,
+  amount: number,
+): Promise<void> {
+  const [order, existing] = await Promise.all([
+    tx.order.findUniqueOrThrow({ where: { id: orderId }, select: { credit_balance: true } }),
+    tx.orderCreditEntry.findFirst({ where: { refund_id: refundId, kind: "REFUND" } }),
+  ]);
+  const before = existing ? -sen(existing.amount) : 0;
+  const available = sen(order.credit_balance) + before;
+  const use = Math.max(0, Math.min(sen(amount), available));
+  if (use === before) return;
+  if (!existing) {
+    await addCreditEntry(tx, {
+      orderId,
+      kind: "REFUND",
+      amount: -rp(use),
+      refundId,
+      note: "Pengembalian dana (tandai sudah direfund)",
+      actor: "ADMIN",
+    });
+    return;
+  }
+  if (use === 0) await tx.orderCreditEntry.delete({ where: { id: existing.id } });
+  else await tx.orderCreditEntry.update({ where: { id: existing.id }, data: { amount: -rp(use) } });
+  await tx.order.update({
+    where: { id: orderId },
+    data: { credit_balance: { increment: rp(before - use) } },
+  });
+}
+
 /**
  * What is already billed on an order, for the "never bill more than the order
  * total" checks: the active invoices plus money received on invoices that a

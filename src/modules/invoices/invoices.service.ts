@@ -7,7 +7,7 @@ import {
   rentalBaseOf,
   startPayment,
 } from "../orders/assignment-guard";
-import { billedSoFar, lockOrder } from "../orders/order-money";
+import { addCreditEntry, billedSoFar, lockOrder } from "../orders/order-money";
 import { notifyOrderPaidInFull } from "../../services/driverNotify";
 import { reportLeadPurchase, sendsNoPurchase } from "../../services/ga4.service";
 import { Prisma, type Invoice } from "@prisma/client";
@@ -741,6 +741,20 @@ export async function markInvoicePaid(
           },
         });
         if (count === 0) return null;
+        // More money than the invoice asked: the difference is saldo lebih
+        // (one OVERPAYMENT per invoice, unique index). Nothing reads it for a
+        // rule in A1; the numbers below are unchanged.
+        const over = Math.round(amountReceived * 100) - Math.round(Number(invoice.amount) * 100);
+        if (over > 0) {
+          await addCreditEntry(tx, {
+            orderId: invoice.order_id,
+            kind: "OVERPAYMENT",
+            amount: over / 100,
+            invoiceId: invoice.id,
+            note: `Lebih bayar ${invoice.invoice_number}`,
+            actor: "ADMIN",
+          });
+        }
 
         if (customer) {
           const { number: receiptNumber, seq: receiptSeq } = await nextReceiptNumber(
