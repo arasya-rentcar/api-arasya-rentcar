@@ -7,6 +7,7 @@ import {
   createChangeLogSchema,
   upsertOrderFinanceSchema,
   markOrderRefundedSchema,
+  createRefundSchema,
   cancelOrderSchema,
 } from "./orders.validation";
 import {
@@ -23,6 +24,8 @@ import {
   upsertOrderFinance,
   markOrderRefunded,
   getRefundProofUrl,
+  createOrderRefund,
+  getOrderRefundProofUrl,
   cancelOrder,
 } from "./orders.service";
 import {
@@ -71,6 +74,44 @@ export async function markOrderRefundedController(
         : undefined,
     });
     res.json({ status: "success", data: order });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/** The uploaded proof in the shape the services take. */
+const proofOf = (req: Request) => {
+  const file = (req as Request & { file?: Express.Multer.File }).file;
+  return file
+    ? { buffer: file.buffer, mimetype: file.mimetype, size: file.size, originalname: file.originalname }
+    : undefined;
+};
+
+// A refund (several per order, each at most the saldo lebih). 201 when made,
+// 200 for a resend of the same client_ref.
+export async function createOrderRefundController(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const input = createRefundSchema.parse(req.body ?? {});
+    const { created, data } = await createOrderRefund(req.params.id, { ...input, proof: proofOf(req) });
+    res.status(created ? 201 : 200).json({ status: "success", data });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// Signed URL (5 minutes) for one refund's proof.
+export async function getOrderRefundProofController(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const data = await getOrderRefundProofUrl(req.params.id, req.params.refundId);
+    res.json({ status: "success", data });
   } catch (err) {
     next(err);
   }

@@ -31,6 +31,8 @@ import {
   getPaymentProofController,
   markOrderRefundedController,
   getRefundProofController,
+  createOrderRefundController,
+  getOrderRefundProofController,
   cancelOrderController,
   finalizeOrderController,
 } from "./orders.controller";
@@ -76,7 +78,12 @@ router.post(
   "/:id/invoice/:invoiceId/send-receipt-whatsapp",
   sendReceiptWhatsappController,
 );
-// Sprint 5: mark a refund settled. Refund proof file REQUIRED (field "proof").
+// Refunds: several per order, each at most the saldo lebih. Proof file
+// REQUIRED (field "proof").
+router.post("/:id/refunds", upload.single("proof"), createOrderRefundController);
+router.get("/:id/refunds/:refundId/proof", getOrderRefundProofController);
+// The old "refund settled" endpoint: an alias of /refunds for one release
+// (amount defaults to the whole saldo lebih and is bounded by it).
 router.post(
   "/:id/mark-refunded",
   upload.single("proof"),
