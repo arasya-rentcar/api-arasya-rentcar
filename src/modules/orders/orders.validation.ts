@@ -228,7 +228,8 @@ export const cancelOrderSchema = z.object({
   expected_fee_total: z.number().nonnegative().optional(),
   requested_at: z.string().datetime({ offset: true }).optional(),
   // Idempotency: a resend with the same ref gets the stored result (200).
-  client_ref: z.string().uuid().optional(),
+  // Required since the dashboard always sends it (D2, 8 Oct 2026).
+  client_ref: z.string().uuid(),
   // Fees set by hand (owner, 8 Oct 2026), whole rupiah: only days this cancel
   // cancels, once each, ≤ that day's price (checked in cancelOrder, 400
   // INVALID_CANCEL_FEE); days not listed get the automatic fee.

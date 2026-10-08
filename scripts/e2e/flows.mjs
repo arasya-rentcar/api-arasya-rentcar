@@ -242,7 +242,7 @@ await section('B. Assignment paths (T4: one way to assign)', async () => {
   const started = await act(d4, b5day, 'start');
   check('B28 a trip under way keeps driver ON_DUTY and car IN_USE whatever its date', started.status === 200 && (await st(d4)) === 'ON_DUTY' && (await cs(car6)) === 'IN_USE');
   // The only day cannot be cancelled in Edit Hari any more (B1.1): the order is cancelled.
-  const closed = await call('POST', `/orders/${oB5.id}/cancel`, { token: admin, body: { reason: 'tes B29' } });
+  const closed = await call('POST', `/orders/${oB5.id}/cancel`, { token: admin, body: { client_ref: uuid(), reason: 'tes B29' } });
   check('B29 trip closed (order cancelled): driver and car AVAILABLE', closed.status === 200 && (await st(d4)) === 'AVAILABLE' && (await cs(car6)) === 'AVAILABLE', `${closed.status} ${closed.json?.message ?? ''}`);
 
   // Two units on the same date and hours: one driver / car cannot take both
@@ -498,7 +498,7 @@ await section('D. Driver flow', async () => {
   check('D18 another driver cannot report on this trip (404)', (await call('POST', `/driver/trips/${lineId}/reports`, { token: d1.token, form: f })).status === 404);
   const fin = await act(d2, lineId, 'finish', { notes: 'selesai' });
   check('D19 finish → DONE; order awaits finalization', fin.data.status === 'DONE' && (await order(o.id)).awaiting_finalization === true);
-  const cDone = await call('POST', `/orders/${o.id}/cancel`, { token: admin, body: { reason: 'x' } });
+  const cDone = await call('POST', `/orders/${o.id}/cancel`, { token: admin, body: { client_ref: uuid(), reason: 'x' } });
   check('D19b cancel refused once every day is done (409), invoices untouched', cDone.status === 409 && (await order(o.id)).invoices.every((i) => i.status !== 'CANCELLED'), cDone.json?.message);
   check('D20 late receipt after DONE accepted', (await report(d2, lineId, { report_type: 'TOLL', amount: 30000 })).status === 200);
   check('D21 finalize refused while costs are PENDING (409)', (await call('POST', `/orders/${o.id}/finalize`, { token: admin })).status === 409);
@@ -537,7 +537,7 @@ await section('E. Cancellation', async () => {
   const dp = await payDp(o, 300_000);
   const ea = await call('POST', `/orders/${o.id}/assign`, { token: admin, body: { driver_id: d3.id, car_id: car4.id } });
   check('E0 assign for E', ea.status === 201, ea.json?.message);
-  const c = await call('POST', `/orders/${o.id}/cancel`, { token: admin, body: { reason: 'Pelanggan batal' } });
+  const c = await call('POST', `/orders/${o.id}/cancel`, { token: admin, body: { client_ref: uuid(), reason: 'Pelanggan batal' } });
   check('E1 tier 1 before day H: penalty 20% = 200.000, refund 100.000', c.data?.tier === 1 && c.data.penalty === 200000 && c.data.refundDue === 100000, JSON.stringify(c.data));
   const after = await order(o.id);
   check('E2 order CANCELLED, days CANCELLED, driver released, fee 0', after.order_status === 'CANCELLED' && after.service_items.every((l) => l.line_status === 'CANCELLED' && !l.driver_id && Number(l.driver_fee) === 0));
@@ -550,7 +550,7 @@ await section('E. Cancellation', async () => {
     after.money?.credit_balance === 100000 && c.data?.refundDue === 100000,
     `DP ${after.invoices.find((i) => i.id === dp.id)?.status}, credit ${after.money?.credit_balance}, refundDue ${c.data?.refundDue}`);
   check('E4 driver action on the cancelled day → 404', (await act(d3, o.service_items[0].id, 'start')).status === 404);
-  check('E5 cancelling twice refused (409)', (await call('POST', `/orders/${o.id}/cancel`, { token: admin, body: { reason: 'lagi' } })).status === 409);
+  check('E5 cancelling twice refused (409)', (await call('POST', `/orders/${o.id}/cancel`, { token: admin, body: { client_ref: uuid(), reason: 'lagi' } })).status === 409);
   check('E6 driver AVAILABLE again', (await prisma.driver.findUnique({ where: { id: d3.id } })).status === 'AVAILABLE');
   const reopen = await putLine(o.service_items[0].id, { is_external: false, line_status: 'SCHEDULED' });
   check('E7 [T5] a day of a cancelled order cannot be reopened (409, clear message)', reopen.status === 409 && /sudah dibatalkan/.test(reopen.json?.message ?? ''), reopen.json?.message);
@@ -633,7 +633,7 @@ await section('G. Payments (T3)', async () => {
   // yesterday (tier 3, fee 100%), so the DP does not cover the fee.
   const o5 = await makeOrder('G15', { startDay: -1 });
   await payDp(o5, 200_000);
-  const c5 = await call('POST', `/orders/${o5.id}/cancel`, { token: admin, body: { reason: 'batal' } });
+  const c5 = await call('POST', `/orders/${o5.id}/cancel`, { token: admin, body: { client_ref: uuid(), reason: 'batal' } });
   const fee = (await order(o5.id)).invoices.find((i) => i.invoice_type === 'CANCELLATION_FEE');
   check('G15a [A6] fee invoice asks only for the rest (fee 1.000.000 − DP 200.000)', c5.status === 200 && c5.data.tier === 3 && Number(fee?.amount) === 800000, `${JSON.stringify(c5.data ?? c5.json)} ${fee?.amount}`);
   await markPaid(o5.id, fee.id, { amount_received: 50_000, amount_mismatch_ack: true });
@@ -814,7 +814,7 @@ await section('J. Phone clock, stale trips, packages, cancel on day H', async ()
   check('J5b Edit Order with charges: no reason needed, total stays 1.300.000', edit.status === 200 && Number((await order(o.id)).final_price) === 1300000, `${edit.status} ${edit.json?.message ?? ''}`);
   check('J6 deleting a driver receipt refused (409)', (await call('DELETE', `/lines/expenses/${e.id}`, { token: admin })).status === 409);
   const wibHour = new Date(Date.now() + 7 * 3600e3).getUTCHours();
-  const c = await call('POST', `/orders/${o.id}/cancel`, { token: admin, body: { reason: 'tes hari H' } });
+  const c = await call('POST', `/orders/${o.id}/cancel`, { token: admin, body: { client_ref: uuid(), reason: 'tes hari H' } });
   check('J7 cancel on day H after the driver arrived at the pickup → tier 3 (100%)', c.data?.tier === 3, `WIB hour ${wibHour}, ${JSON.stringify(c.data)}`);
   const jFee = (await order(o.id)).invoices.find((i) => i.invoice_type === 'CANCELLATION_FEE');
   check('J7b [A6] fee 1.300.000 − 1.000.000 already paid: invoice for 300.000', c.data?.stillOwed === 300000 && Number(jFee?.amount) === 300000, `${c.data?.stillOwed} / ${jFee?.amount}`);
@@ -1305,7 +1305,7 @@ await section('O. Finance formulas (extra charges, cancellations, cancelled days
   const o2 = await makeOrder('O4', { startDay: 6 });
   await payDp(o2, 200_000);
   before = await dash();
-  const c2 = await call('POST', `/orders/${o2.id}/cancel`, { token: admin, body: { reason: 'Pelanggan batal O4' } });
+  const c2 = await call('POST', `/orders/${o2.id}/cancel`, { token: admin, body: { client_ref: uuid(), reason: 'Pelanggan batal O4' } });
   after = await dash();
   const o2a = await order(o2.id);
   check('O4 [A6] DP covers the 20% fee: no cancellation invoice, nothing owed, no refund',
@@ -1325,7 +1325,7 @@ await section('O. Finance formulas (extra charges, cancellations, cancelled days
   const o3 = await makeOrder('O8', { startDay: -1 });
   await payDp(o3, 300_000);
   before = await dash();
-  const c3 = await call('POST', `/orders/${o3.id}/cancel`, { token: admin, body: { reason: 'Pelanggan batal O8' } });
+  const c3 = await call('POST', `/orders/${o3.id}/cancel`, { token: admin, body: { client_ref: uuid(), reason: 'Pelanggan batal O8' } });
   after = await dash();
   const fee3 = (await order(o3.id)).invoices.find((i) => i.invoice_type === 'CANCELLATION_FEE');
   check('O8 [A6] DP 300.000 < fee 1.000.000: one cancellation invoice for the remaining 700.000',
@@ -1355,7 +1355,7 @@ await section('O. Finance formulas (extra charges, cancellations, cancelled days
   await act(dO, l4, 'arrive', { latitude: -6.56, longitude: 106.8, location_accuracy_m: 12, location_mocked: false });
   before = await dash();
   rb = await rev();
-  const c4 = await call('POST', `/orders/${o4.id}/cancel`, { token: admin, body: { reason: 'Batal di jalan' } });
+  const c4 = await call('POST', `/orders/${o4.id}/cancel`, { token: admin, body: { client_ref: uuid(), reason: 'Batal di jalan' } });
   after = await dash();
   ra = await rev();
   check('O11 cancel after the driver arrived at the pickup: tier 3, paid in full, no invoice',
@@ -1380,7 +1380,7 @@ await section('O. Finance formulas (extra charges, cancellations, cancelled days
   const fin = await act(dP, day1, 'finish', { notes: 'selesai' });
   check('O13 day 1 finished by the driver', fin.data?.status === 'DONE', JSON.stringify(fin.json).slice(0, 160));
   before = await dash();
-  const c5 = await call('POST', `/orders/${o5.id}/cancel`, { token: admin, body: { reason: 'Pelanggan pulang lebih awal' } });
+  const c5 = await call('POST', `/orders/${o5.id}/cancel`, { token: admin, body: { client_ref: uuid(), reason: 'Pelanggan pulang lebih awal' } });
   after = await dash();
   const o5a = await order(o5.id);
   // A3: Batalkan Pesanan is per day. Day 1 is done and keeps its 500.000;
@@ -1407,7 +1407,7 @@ await section('O. Finance formulas (extra charges, cancellations, cancelled days
     resave.status === 200 && Number(o5b.final_price) === 600000 && o5b.payment_status === 'PAID' && o5b.money?.credit_balance === 400000,
     `${resave.status} ${o5b.final_price} ${o5b.payment_status} credit ${o5b.money?.credit_balance}`);
   check('O18 the cancelled day stays closed (409)', (await putLine(day2, { is_external: false, line_status: 'SCHEDULED' })).status === 409);
-  const again = await call('POST', `/orders/${o5.id}/cancel`, { token: admin, body: { reason: 'lagi' } });
+  const again = await call('POST', `/orders/${o5.id}/cancel`, { token: admin, body: { client_ref: uuid(), reason: 'lagi' } });
   const edit = await call('PUT', `/orders/${o5.id}`, { token: admin, body: editBody(o5b, { notes: 'x' }) });
   const charge = await call('POST', `/orders/${o5.id}/adjustments`, { token: admin, body: { type: 'OVERTIME', description: 'OT', amount: 50000 } });
   check('O19 second cancel, Edit Order and new charges refused (409)', again.status === 409 && edit.status === 409 && charge.status === 409, `${again.status} ${edit.status} ${charge.status}`);
@@ -1793,7 +1793,7 @@ await section('Q. Cancelled days, billed totals, DP minimum (B1, B2, B7, B12)', 
 
   // B12: cancellation fees in whole rupiah.
   const o10 = await makeOrder('Q16', { price: 1_000_003, startDay: 30 });
-  const c10 = await call('POST', `/orders/${o10.id}/cancel`, { token: admin, body: { reason: 'tes pembulatan' } });
+  const c10 = await call('POST', `/orders/${o10.id}/cancel`, { token: admin, body: { client_ref: uuid(), reason: 'tes pembulatan' } });
   const fee10 = (await order(o10.id)).invoices.find((i) => i.invoice_type === 'CANCELLATION_FEE');
   check('Q16 [B12] 20% of 1.000.003 billed as 200.001 (whole rupiah), fee invoice the same',
     c10.status === 200 && c10.data.penalty === 200001 && c10.data.stillOwed === 200001 && Number(fee10?.amount) === 200001 && Number((await order(o10.id)).cancellation_fee) === 200001,
@@ -1803,7 +1803,7 @@ await section('Q. Cancelled days, billed totals, DP minimum (B1, B2, B7, B12)', 
   const o11 = await makeOrder('Q17', { price: 5_000_000, startDay: 32 });
   const dp11 = (await invoice(o11.id, 'DP', 1_000_000)).data;
   await markPaid(o11.id, dp11.id, { amount_received: 50_000, amount_mismatch_ack: true });
-  const c11 = await call('POST', `/orders/${o11.id}/cancel`, { token: admin, body: { reason: 'tes DP setelah batal' } });
+  const c11 = await call('POST', `/orders/${o11.id}/cancel`, { token: admin, body: { client_ref: uuid(), reason: 'tes DP setelah batal' } });
   const o11a = await order(o11.id);
   check('Q17 [B2] 50.000 received on 5.000.000, cancelled before day H (fee 1.000.000): stays UNPAID (below 20% of the fee)',
     c11.status === 200 && c11.data.penalty === 1000000 && o11a.payment_status === 'UNPAID', `${c11.status} ${c11.data?.penalty} ${o11a.payment_status}`);
@@ -1910,7 +1910,7 @@ await section('R. Order money, saldo lebih, money received, refunds, locks, clie
   const dR = await makeDriver(50);
   const carR = await makeCar('Rush');
   const sen = (v) => Math.round(Number(v ?? 0) * 100);
-  const cancel = (o, reason = 'R batal') => call('POST', `/orders/${o.id}/cancel`, { token: admin, body: { reason } });
+  const cancel = (o, reason = 'R batal') => call('POST', `/orders/${o.id}/cancel`, { token: admin, body: { reason, client_ref: uuid() } });
   // Answers a race may give: done, refused (409) or gone (404). Never a 500.
   const fine = (r) => [200, 201, 404, 409].includes(r.status);
 
@@ -2627,7 +2627,7 @@ await section('R. Order money, saldo lebih, money received, refunds, locks, clie
     const qs = (requestedAt) => (requestedAt ? `?requested_at=${encodeURIComponent(requestedAt)}` : '');
     const lineQuote = (id, requestedAt) => call('GET', `/schedule/lines/${id}/cancel-quote${qs(requestedAt)}`, { token: admin });
     const orderQuote = (o, requestedAt) => call('GET', `/orders/${o.id}/cancel-quote${qs(requestedAt)}`, { token: admin });
-    const cancelOrder = (o, body = {}) => call('POST', `/orders/${o.id}/cancel`, { token: admin, body: { reason: 'R A3 batal', ...body } });
+    const cancelOrder = (o, body = {}) => call('POST', `/orders/${o.id}/cancel`, { token: admin, body: { client_ref: uuid(), reason: 'R A3 batal', ...body } });
     const day = (id) => prisma.orderServiceItem.findUnique({ where: { id } });
     const entriesOf = (o) => prisma.orderCreditEntry.findMany({ where: { order_id: o.id }, orderBy: { created_at: 'asc' } });
     const logsSince = (o, t) => prisma.orderChangeLog.findMany({ where: { order_id: o.id, created_at: { gte: new Date(t) } } });
@@ -2802,6 +2802,16 @@ await section('R. Order money, saldo lebih, money received, refunds, locks, clie
       c7r1.status === 200 && c7r1.data?.penalty === 200000 && c7r2.status === 200 && JSON.stringify(canon7(c7r2.data)) === JSON.stringify(canon7(c7r1.data)) &&
       o7r2.invoices.length === inv7r1 && c7r3.status === 409 && o7r2.cancel_client_ref === ref7r && Number(o7r2.cancellation_fee) === 200000,
       `${c7r1.status}/${c7r2.status}/${c7r3.status} invoices ${inv7r1}→${o7r2.invoices.length} ref ${o7r2.cancel_client_ref === ref7r} fee ${o7r2.cancellation_fee} same ${JSON.stringify(canon7(c7r2.data)) === JSON.stringify(canon7(c7r1.data))}`);
+
+    // R7e: client_ref is required (the dashboard always sends it, 8 Oct 2026).
+    const o7n = await makeOrder('RA7n', { days: 1, startDay: 33 });
+    const c7n = await call('POST', `/orders/${o7n.id}/cancel`, { token: admin, body: { reason: 'R7e tanpa ref' } });
+    const o7n2 = (await call('GET', `/orders/${o7n.id}`, { token: admin })).data;
+    check('R7e Batalkan Pesanan without client_ref → 400, the order not cancelled', c7n.status === 400 && o7n2.order_status !== 'CANCELLED', `${c7n.status} ${o7n2.order_status}`);
+    const oldDash = await call('GET', '/analytics/dashboard', { token: admin });
+    check('R7f the old /analytics/dashboard still answers, marked Deprecation with the v2 successor link',
+      oldDash.status === 200 && oldDash.headers.get('deprecation') === 'true' && /dashboard-v2/.test(oldDash.headers.get('link') ?? ''),
+      `${oldDash.status} ${oldDash.headers.get('deprecation')} ${oldDash.headers.get('link')}`);
 
     // R9 (+ R8b): an earlier per-day fee is kept; an unpaid invoice is voided.
     const o9 = await makeOrder('RA9', { days: 3, startDay: 36 });
