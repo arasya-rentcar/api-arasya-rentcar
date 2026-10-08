@@ -10,7 +10,7 @@ E2E_KEEP=1 scripts/e2e/run-local.sh         # keep the database and logs (path i
 E2E_ONLY=R scripts/e2e/run-local.sh         # only the groups starting with these letters ("A,R")
 ```
 
-Needs the Postgres 16 binaries (`PG_BIN`, default `/usr/lib/postgresql/16/bin`). When run as root it starts Postgres as the `postgres` user. Ports: `E2E_PG_PORT` (5544), `E2E_API_PORT` (3999), `E2E_MOCK_PORT` (4600).
+Needs the Postgres 16 binaries (`PG_BIN`, default `/usr/lib/postgresql/16/bin`), or an empty database that is already running in `E2E_EXTERNAL_DB` (CI: `.github/workflows/ci.yml` runs the whole suite on every PR against Postgres 15). When run as root it starts Postgres as the `postgres` user. Ports: `E2E_PG_PORT` (5544), `E2E_API_PORT` (3999), `E2E_MOCK_PORT` (4600).
 
 Output: one line per check. `PASS`/`FAIL` count towards the exit code. `KNOWN` is a documented issue that does not fail the run; it turns into `FIXED` once the behaviour is corrected, and should then become a normal `check`. The run exits 1 when any check fails.
 
