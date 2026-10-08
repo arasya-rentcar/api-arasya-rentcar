@@ -7,7 +7,9 @@ import {
   createChangeLogSchema,
   upsertOrderFinanceSchema,
   markOrderRefundedSchema,
+  createRefundSchema,
   cancelOrderSchema,
+  orderCancelQuoteSchema,
 } from "./orders.validation";
 import {
   createOrder,
@@ -23,7 +25,10 @@ import {
   upsertOrderFinance,
   markOrderRefunded,
   getRefundProofUrl,
+  createOrderRefund,
+  getOrderRefundProofUrl,
   cancelOrder,
+  orderCancelQuote,
 } from "./orders.service";
 import {
   generateInvoiceController,
@@ -76,6 +81,44 @@ export async function markOrderRefundedController(
   }
 }
 
+/** The uploaded proof in the shape the services take. */
+const proofOf = (req: Request) => {
+  const file = (req as Request & { file?: Express.Multer.File }).file;
+  return file
+    ? { buffer: file.buffer, mimetype: file.mimetype, size: file.size, originalname: file.originalname }
+    : undefined;
+};
+
+// A refund (several per order, each at most the saldo lebih). 201 when made,
+// 200 for a resend of the same client_ref.
+export async function createOrderRefundController(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const input = createRefundSchema.parse(req.body ?? {});
+    const { created, data } = await createOrderRefund(req.params.id, { ...input, proof: proofOf(req) });
+    res.status(created ? 201 : 200).json({ status: "success", data });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// Signed URL (5 minutes) for one refund's proof.
+export async function getOrderRefundProofController(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const data = await getOrderRefundProofUrl(req.params.id, req.params.refundId);
+    res.json({ status: "success", data });
+  } catch (err) {
+    next(err);
+  }
+}
+
 // Full-order cancellation (applies Arasya cancellation-fee policy server-side).
 export async function cancelOrderController(
   req: Request,
@@ -84,7 +127,7 @@ export async function cancelOrderController(
 ): Promise<void> {
   try {
     const input = cancelOrderSchema.parse(req.body ?? {});
-    const result = await cancelOrder(req.params.id, input.reason, input.actor);
+    const result = await cancelOrder(req.params.id, input);
     res.json({ status: "success", data: result });
   } catch (err) {
     next(err);
@@ -223,8 +266,9 @@ export async function createOrderAdjustmentController(
 ): Promise<void> {
   try {
     const input = createAdjustmentSchema.parse(req.body);
-    const adjustment = await createOrderAdjustment(req.params.id, input);
-    res.status(201).json({ status: "success", data: adjustment });
+    // A resend with the same client_ref answers 200 with the first charge.
+    const { adjustment, created } = await createOrderAdjustment(req.params.id, input);
+    res.status(created ? 201 : 200).json({ status: "success", data: adjustment });
   } catch (err) {
     next(err);
   }
@@ -271,3 +315,18 @@ export {
   getOrderStatementController,
   getPaymentProofController,
 };
+
+// A3: what Batalkan Pesanan would charge per day (finance design §5.5).
+export async function orderCancelQuoteController(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const query = orderCancelQuoteSchema.parse(req.query);
+    const data = await orderCancelQuote(req.params.id, query.requested_at);
+    res.json({ status: "success", data });
+  } catch (err) {
+    next(err);
+  }
+}

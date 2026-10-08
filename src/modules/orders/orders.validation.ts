@@ -184,6 +184,8 @@ export const createAdjustmentSchema = z.object({
   quantity: z.number().int().positive().default(1),
   is_billable: z.boolean().default(true),
   created_by: z.string().optional(),
+  // B8: a resend with the same client_ref returns the charge already made.
+  client_ref: z.string().uuid().optional(),
 });
 
 export const createChangeLogSchema = z.object({
@@ -194,19 +196,56 @@ export const createChangeLogSchema = z.object({
   actor: z.string().optional(),
 });
 
-// Sprint 5: mark refund settled. Amount optional (defaults to derived refund
-// due); proof file is required and validated in the controller/service.
+// The old "refund settled" endpoint, kept as an alias for one release:
+// amount optional (defaults to the whole saldo lebih, bounded by it); proof
+// file is required and validated in the service.
 export const markOrderRefundedSchema = z.object({
   note: z.string().optional(),
-  amount: z.coerce.number().positive().optional(),
+  amount: z.coerce.number().int("Nominal pengembalian harus rupiah bulat (tanpa sen)").positive().optional(),
+});
+
+// POST /orders/:id/refunds (multipart; proof file required, field "proof").
+// The amount is at most the saldo lebih; client_ref makes a resend a no-op.
+export const createRefundSchema = z.object({
+  amount: z.coerce
+    .number()
+    .int("Nominal pengembalian harus rupiah bulat (tanpa sen)")
+    .positive("Nominal pengembalian harus lebih dari 0"),
+  note: z.string().trim().max(500).optional(),
+  client_ref: z.string().uuid(),
 });
 
 // Full-order cancellation. A reason is required (kept in the audit log + on the
 // cancellation-fee invoice). The penalty tier is computed server-side from the
 // service date + current time; the client never sends an amount.
+// A3 (per day): `expected_fee_total` is the fee total the admin saw in
+// GET /orders/:id/cancel-quote (a different server total → 409
+// CANCEL_FEE_CHANGED); `requested_at` is when the customer asked to cancel
+// (≤ now, ≥ now − 3 days; the tiers follow it, it is logged).
 export const cancelOrderSchema = z.object({
-  reason: z.string().trim().min(1, "Cancellation reason is required"),
+  reason: z.string().trim().min(1, "Cancellation reason is required").max(500),
   actor: z.string().optional(),
+  expected_fee_total: z.number().nonnegative().optional(),
+  requested_at: z.string().datetime({ offset: true }).optional(),
+  // Idempotency: a resend with the same ref gets the stored result (200).
+  client_ref: z.string().uuid().optional(),
+  // Fees set by hand (owner, 8 Oct 2026), whole rupiah: only days this cancel
+  // cancels, once each, ≤ that day's price (checked in cancelOrder, 400
+  // INVALID_CANCEL_FEE); days not listed get the automatic fee.
+  // `expected_fee_total` stays the AUTOMATIC total.
+  day_fees: z
+    .array(
+      z.object({
+        line_id: z.string().min(1),
+        fee: z.number().int("Biaya pembatalan harus rupiah bulat").nonnegative(),
+      }).strict(),
+    )
+    .max(400)
+    .optional(),
+});
+
+export const orderCancelQuoteSchema = z.object({
+  requested_at: z.string().datetime({ offset: true }).optional(),
 });
 
 export type UpsertOrderFinanceInput = z.infer<typeof upsertOrderFinanceSchema>;
@@ -216,4 +255,5 @@ export type AssignOrderInput = z.infer<typeof assignOrderSchema>;
 export type CreateAdjustmentInput = z.infer<typeof createAdjustmentSchema>;
 export type CreateChangeLogInput = z.infer<typeof createChangeLogSchema>;
 export type MarkOrderRefundedInput = z.infer<typeof markOrderRefundedSchema>;
+export type CreateRefundInput = z.infer<typeof createRefundSchema>;
 export type CancelOrderInput = z.infer<typeof cancelOrderSchema>;

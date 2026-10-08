@@ -11,6 +11,7 @@ import {
   tripHistoryController,
   scheduleWeekController,
   driverFeePresetsController,
+  lineCancelQuoteController,
 } from './schedule.controller';
 import {
   sendLineConfirmationController,
@@ -27,6 +28,7 @@ router.get('/stock', scheduleStockController);
 router.get('/week', scheduleWeekController);
 router.get('/history', tripHistoryController);
 router.get('/driver-fee-presets', driverFeePresetsController);
+router.get('/lines/:id/cancel-quote', lineCancelQuoteController);
 router.put('/lines/:id', assignScheduleLineController);
 // #A1/#A2 trip-team confirmation messaging.
 router.post('/lines/:id/send-confirmation', sendLineConfirmationController);

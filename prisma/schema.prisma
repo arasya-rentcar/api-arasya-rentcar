@@ -84,6 +84,20 @@ enum InvoiceType {
   ADDITIONAL
   COMBINED
   CANCELLATION_FEE
+  // A shortfall billed again (finance design §3.4); used from PR A2 on.
+  ADJUSTMENT
+}
+
+// Saldo lebih (customer credit held on one order), finance design §2/§3.3.
+// Each movement is one order_credit_entries row; orders.credit_balance is
+// their sum.
+enum CreditEntryKind {
+  OPENING
+  OVERPAYMENT
+  RELEASE
+  APPLIED
+  UNAPPLIED
+  REFUND
 }
 
 enum PaymentMethod {
@@ -272,6 +286,19 @@ model Order {
   cancelled_at           DateTime?
   cancellation_fee       Decimal?             @db.Decimal(12, 2)
   cancellation_reason    String?
+  // Money model (finance design §2). credit_balance = Σ credit_entries.amount
+  // (saldo lebih, CHECK >= 0); refunded_total = Σ refunds.amount. Both are
+  // written only together with their rows, under the order lock (see
+  // order-money.ts). cancellation_rule: 'ORDER_V1' (whole-order fee, frozen
+  // final_price) | 'DAY_V2' (per-day fees, PR A3). cancel_client_ref: the
+  // client_ref of the Batalkan Pesanan request (PR A3).
+  credit_balance         Decimal              @default(0) @db.Decimal(12, 2)
+  refunded_total         Decimal              @default(0) @db.Decimal(12, 2)
+  cancellation_rule      String?
+  cancel_client_ref      String?              @unique
+  // A3: the Batalkan Pesanan response, returned as is to a resend with the
+  // same cancel_client_ref (the numbers are frozen at the cancel).
+  cancel_result          Json?
   created_at             DateTime             @default(now())
   updated_at             DateTime             @updatedAt
   customers              OrderCustomer[]
@@ -286,6 +313,8 @@ model Order {
   change_logs            OrderChangeLog[]
   payables               Payable[]
   web_lead               WebLead?
+  refunds                OrderRefund[]
+  credit_entries         OrderCreditEntry[]
 
   @@index([order_code])
   @@index([source])
@@ -442,6 +471,22 @@ model OrderServiceItem {
   // --- Schedule / per-day assignment ---
   is_external        Boolean         @default(false)
   line_status        ScheduleStatus  @default(SCHEDULED)
+  // Per-day cancellation (finance A3, design §3.1): set when this day is
+  // cancelled on its own (Edit Hari) or by Batalkan Pesanan under the DAY_V2
+  // rule. cancel_fee = the fee charged; cancel_fee_auto = the automatic fee,
+  // pctRupiah(total_price, 20|50|100) by cancel_tier 1|2|3 (owner, 8 Oct
+  // 2026: the admin may set the fee by hand, manual = cancel_fee ≠
+  // cancel_fee_auto; days cancelled before that have no cancel_fee_auto);
+  // cancelled_at = when it was saved (reports book the fee on its WIB date);
+  // cancel_requested_at = when the customer asked, when the admin gave it (the
+  // tier follows it). Cleared when the day is reopened. Legacy (ORDER_V1)
+  // cancelled days have none of these.
+  cancel_fee          Decimal?        @db.Decimal(12, 2)
+  cancel_tier         Int?
+  cancel_fee_auto     Decimal?        @db.Decimal(12, 2)
+  cancelled_at        DateTime?
+  cancel_reason       String?
+  cancel_requested_at DateTime?
   driver_id          String?
   driver             Driver?         @relation(fields: [driver_id], references: [id], onDelete: SetNull)
   car_id             String?
@@ -598,34 +643,46 @@ model PayableExtra {
 }
 
 model Invoice {
-  id                String               @id @default(uuid())
-  order_id          String
-  order             Order                @relation(fields: [order_id], references: [id])
-  invoice_number    String               @unique
-  invoice_type      InvoiceType          @default(FULL)
-  payment_method    PaymentMethod        @default(CASH)
-  issue_date        DateTime             @default(now())
-  due_date          DateTime?
-  paid_at           DateTime?
-  amount            Decimal              @db.Decimal(12, 2)
-  note              String?
-  file_url          String?
-  receipt_url       String?
-  payment_proof_url String?
-  customer_seq      Int?
-  status            InvoiceStatus        @default(ISSUED)
-  revision          Int                  @default(0)
-  parent_id         String?
-  parent            Invoice?             @relation("InvoiceRevisions", fields: [parent_id], references: [id])
-  revisions         Invoice[]            @relation("InvoiceRevisions")
-  delivery_logs     InvoiceDeliveryLog[]
-  receipts          Receipt[]
-  created_at        DateTime             @default(now())
-  updated_at        DateTime             @updatedAt
+  id                 String               @id @default(uuid())
+  order_id           String
+  order              Order                @relation(fields: [order_id], references: [id])
+  invoice_number     String               @unique
+  invoice_type       InvoiceType          @default(FULL)
+  payment_method     PaymentMethod        @default(CASH)
+  issue_date         DateTime             @default(now())
+  due_date           DateTime?
+  paid_at            DateTime?
+  amount             Decimal              @db.Decimal(12, 2)
+  note               String?
+  file_url           String?
+  receipt_url        String?
+  payment_proof_url  String?
+  customer_seq       Int?
+  status             InvoiceStatus        @default(ISSUED)
+  revision           Int                  @default(0)
+  parent_id          String?
+  parent             Invoice?             @relation("InvoiceRevisions", fields: [parent_id], references: [id])
+  revisions          Invoice[]            @relation("InvoiceRevisions")
+  delivery_logs      InvoiceDeliveryLog[]
+  receipts           Receipt[]
+  // B8: a resend with the same client_ref returns this invoice.
+  client_ref         String?              @unique
+  // Saldo lebih used for this invoice; amount is the cash asked (PR A2).
+  credit_applied     Decimal              @default(0) @db.Decimal(12, 2)
+  // Money actually taken when it was marked paid (the first receipt).
+  amount_received    Decimal?             @db.Decimal(12, 2)
+  // An ADJUSTMENT invoice: the paid invoice whose shortfall it bills.
+  adjusts_invoice_id String?
+  adjusts_invoice    Invoice?             @relation("InvoiceAdjustments", fields: [adjusts_invoice_id], references: [id], onDelete: SetNull)
+  adjusted_by        Invoice[]            @relation("InvoiceAdjustments")
+  credit_entries     OrderCreditEntry[]
+  created_at         DateTime             @default(now())
+  updated_at         DateTime             @updatedAt
 
   @@index([order_id])
   @@index([parent_id])
   @@index([status])
+  @@index([adjusts_invoice_id])
   @@map("invoices")
 }
 
@@ -694,6 +751,8 @@ model OrderAdjustment {
   created_by  String?
   created_at  DateTime            @default(now())
   expense     Expense?
+  // B8: a resend with the same client_ref returns this row.
+  client_ref  String?             @unique
 
   @@index([order_id])
   @@index([type])
@@ -1336,4 +1395,49 @@ model PricePublication {
 
   @@index([created_at])
   @@map("price_publications")
+}
+
+// One refund paid back to the customer (finance design §3.5). Several per
+// order; orders.refunded_total is their sum. Rows from before PR A2 carry
+// client_ref 'legacy-<order id>' (the single refund of the old endpoint).
+model OrderRefund {
+  id             String             @id @default(uuid())
+  order_id       String
+  order          Order              @relation(fields: [order_id], references: [id], onDelete: Cascade)
+  amount         Decimal            @db.Decimal(12, 2)
+  refunded_at    DateTime
+  proof_url      String?
+  note           String?
+  client_ref     String?            @unique
+  created_by     String?
+  created_at     DateTime           @default(now())
+  credit_entries OrderCreditEntry[]
+
+  @@index([order_id])
+  @@map("order_refunds")
+}
+
+// One movement of an order's saldo lebih (finance design §2): positive adds
+// credit (OPENING, OVERPAYMENT, RELEASE, UNAPPLIED), negative uses it
+// (APPLIED, REFUND). Partial unique indexes (migration only): one OVERPAYMENT
+// per invoice, one REFUND entry per refund.
+model OrderCreditEntry {
+  id              String          @id @default(uuid())
+  order_id        String
+  order           Order           @relation(fields: [order_id], references: [id], onDelete: Cascade)
+  kind            CreditEntryKind
+  amount          Decimal         @db.Decimal(12, 2)
+  invoice_id      String?
+  invoice         Invoice?        @relation(fields: [invoice_id], references: [id], onDelete: SetNull)
+  refund_id       String?
+  refund          OrderRefund?    @relation(fields: [refund_id], references: [id], onDelete: SetNull)
+  service_item_id String?
+  note            String?
+  actor           String?
+  created_at      DateTime        @default(now())
+
+  @@index([order_id])
+  @@index([invoice_id])
+  @@index([refund_id])
+  @@map("order_credit_entries")
 }

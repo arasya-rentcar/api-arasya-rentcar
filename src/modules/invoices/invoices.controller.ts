@@ -10,6 +10,7 @@ import {
   generateInvoice,
   getInvoicesByOrder,
   reviseInvoice,
+  invoiceView,
   sendInvoiceWhatsapp,
   sendReceiptWhatsapp,
   markInvoicePaid,
@@ -47,8 +48,9 @@ export async function generateInvoiceController(
 ): Promise<void> {
   try {
     const input = generateInvoiceSchema.parse(req.body);
-    const invoice = await generateInvoice(req.params.id, input);
-    res.status(201).json({ status: "success", data: invoice });
+    // A resend with the same client_ref answers 200 with the first invoice.
+    const { invoice, created } = await generateInvoice(req.params.id, input);
+    res.status(created ? 201 : 200).json({ status: "success", data: invoiceView(invoice) });
   } catch (err) {
     next(err);
   }
@@ -74,8 +76,8 @@ export async function reviseInvoiceController(
 ): Promise<void> {
   try {
     const input = reviseInvoiceSchema.parse(req.body);
-    const invoice = await reviseInvoice(req.params.invoiceId, input);
-    res.status(201).json({ status: "success", data: invoice });
+    const { invoice, created } = await reviseInvoice(req.params.invoiceId, input);
+    res.status(created ? 201 : 200).json({ status: "success", data: invoiceView(invoice) });
   } catch (err) {
     next(err);
   }

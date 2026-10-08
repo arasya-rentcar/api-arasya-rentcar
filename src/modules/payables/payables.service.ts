@@ -8,6 +8,7 @@ import {
 } from './payables.validation';
 import { recomputeLineMoney } from '../schedule/line-money.service';
 import { rollupOrderFinance } from '../schedule/schedule.service';
+import { lockOrder, lockOrderDays } from '../orders/order-money';
 import { notifyPayablesPaid } from '../../services/driverNotify';
 
 const payableInclude = {
@@ -300,8 +301,21 @@ export async function updatePayable(id: string, input: UpdatePayableInput) {
     );
 
   return prisma.$transaction(async (tx) => {
+    // B9 lock order (order-money.ts): the order's days, then the order,
+    // before the payable and the day (recomputeLineMoney).
+    await lockOrderDays(tx, existing.order_id);
+    await lockOrder(tx, existing.order_id);
+    // Again under the locks: a cancel that released the day (its payable is
+    // gone) or a payment that committed meanwhile wins.
+    const current = await tx.payable.findUnique({ where: { id }, include: { extras: true } });
+    if (!current) throw new AppError('Payable not found', 404);
+    if (current.status === 'PAID')
+      throw new AppError(
+        'Tagihan ini sudah terbayar. Tandai belum terbayar dulu bila ingin mengubahnya.',
+        409,
+      );
     // Replace extras list if provided.
-    let extrasSum = existing.extras.reduce((s, e) => s + Number(e.amount), 0);
+    let extrasSum = current.extras.reduce((s, e) => s + Number(e.amount), 0);
     if (input.extras) {
       await tx.payableExtra.deleteMany({ where: { payable_id: id } });
       if (input.extras.length) {
@@ -319,11 +333,11 @@ export async function updatePayable(id: string, input: UpdatePayableInput) {
     // Fee / RTR come from the day (Edit Hari) and reimbursements from the
     // approved trip costs, so only extras + keterangan are edited here.
     // base_amount is still accepted from older dashboards but ignored.
-    const base = Number(existing.base_amount);
+    const base = Number(current.base_amount);
     const total =
       base +
-      Number(existing.reimburse_amount) -
-      Number(existing.advance_amount) +
+      Number(current.reimburse_amount) -
+      Number(current.advance_amount) +
       extrasSum;
 
     const data: Prisma.PayableUncheckedUpdateInput = {

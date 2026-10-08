@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # End-to-end checks against the real API on a throwaway local Postgres, with
-# Supabase Storage and Expo Push replaced by mock-services.mjs. Nothing here
+# Supabase Storage, Expo Push and the GA4 collector replaced by mock-services.mjs. Nothing here
 # touches production. Usage (from the repo root):
 #   scripts/e2e/run-local.sh            # build, start everything, run, clean up
 #   E2E_SKIP_BUILD=1 scripts/e2e/run-local.sh   # reuse dist/
 #   E2E_KEEP=1 scripts/e2e/run-local.sh         # keep the database + logs
+#   E2E_EXTERNAL_DB=postgresql://… scripts/e2e/run-local.sh  # use an empty database that is already running (CI)
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
@@ -14,7 +15,7 @@ API_PORT=${E2E_API_PORT:-3999}
 MOCK_PORT=${E2E_MOCK_PORT:-4600}
 WORK=$(mktemp -d /var/tmp/arasya-e2e.XXXXXX)
 chmod 755 "$WORK"
-DB="postgresql://postgres@localhost:${PG_PORT}/arasya?host=${WORK}"
+DB=${E2E_EXTERNAL_DB:-"postgresql://postgres@localhost:${PG_PORT}/arasya?host=${WORK}"}
 
 # initdb refuses to run as root: use the postgres user when we are root.
 as_pg() {
@@ -27,22 +28,24 @@ API_PID=""
 cleanup() {
   [ -n "$API_PID" ] && kill "$API_PID" 2>/dev/null || true
   [ -n "$MOCK_PID" ] && kill "$MOCK_PID" 2>/dev/null || true
-  as_pg "$PG_BIN/pg_ctl -D $WORK/data -m fast stop" >/dev/null 2>&1 || true
+  [ -z "${E2E_EXTERNAL_DB:-}" ] && as_pg "$PG_BIN/pg_ctl -D $WORK/data -m fast stop" >/dev/null 2>&1 || true
   if [ -z "${E2E_KEEP:-}" ]; then rm -rf "$WORK"; else echo "kept $WORK"; fi
 }
 trap cleanup EXIT
 
-echo "== postgres ($WORK)"
-as_pg "$PG_BIN/initdb -D $WORK/data -A trust -U postgres" >"$WORK/initdb.log" 2>&1
-as_pg "$PG_BIN/pg_ctl -D $WORK/data -o '-p $PG_PORT -k $WORK' -l $WORK/pg.log -w start" >/dev/null
-as_pg "$PG_BIN/createdb -h $WORK -p $PG_PORT arasya"
+if [ -z "${E2E_EXTERNAL_DB:-}" ]; then
+  echo "== postgres ($WORK)"
+  as_pg "$PG_BIN/initdb -D $WORK/data -A trust -U postgres" >"$WORK/initdb.log" 2>&1
+  as_pg "$PG_BIN/pg_ctl -D $WORK/data -o '-p $PG_PORT -k $WORK' -l $WORK/pg.log -w start" >/dev/null
+  as_pg "$PG_BIN/createdb -h $WORK -p $PG_PORT arasya"
+fi
 
 echo "== migrations + client"
-DATABASE_URL="$DB" DIRECT_URL="$DB" npx prisma migrate deploy >"$WORK/migrate.log" 2>&1
+DATABASE_URL="$DB" DIRECT_URL="$DB" npx prisma migrate deploy >"$WORK/migrate.log" 2>&1 || { tail -40 "$WORK/migrate.log"; exit 1; }
 DATABASE_URL="$DB" DIRECT_URL="$DB" npx prisma generate >/dev/null 2>&1
 if [ -z "${E2E_SKIP_BUILD:-}" ] || [ ! -f dist/src/server.js ]; then
   echo "== build"
-  npm run build >"$WORK/build.log" 2>&1
+  npm run build >"$WORK/build.log" 2>&1 || { tail -40 "$WORK/build.log"; exit 1; }
 fi
 
 echo "== mock storage/push + API"
@@ -51,7 +54,7 @@ MOCK_PID=$!
 env PORT="$API_PORT" NODE_ENV=test JWT_SECRET=e2e-local-secret-0123456789 \
   SUPABASE_URL="http://localhost:$MOCK_PORT" SUPABASE_SERVICE_KEY=fake SUPABASE_STORAGE_BUCKET=invoices \
   EXPO_PUSH_URL="http://localhost:$MOCK_PORT/push" CONFIRMATION_SWEEP_ENABLED=false \
-  GA4_MEASUREMENT_ID= GA4_API_SECRET= WA_DELIVERY= WEB_DEPLOY_HOOK_URL="http://localhost:$MOCK_PORT/deploy-hook" \
+  GA4_MEASUREMENT_ID=G-E2E GA4_API_SECRET=e2e GA4_COLLECT_URL="http://localhost:$MOCK_PORT/ga4/collect" WA_DELIVERY= WEB_DEPLOY_HOOK_URL="http://localhost:$MOCK_PORT/deploy-hook" \
   DATABASE_URL="$DB" DIRECT_URL="$DB" node dist/src/server.js >"$WORK/api.log" 2>&1 &
 API_PID=$!
 for _ in $(seq 1 60); do

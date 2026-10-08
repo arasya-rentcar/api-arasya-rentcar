@@ -6,6 +6,7 @@ import {
   scheduleStockQuerySchema,
   tripHistoryQuerySchema,
   scheduleWeekQuerySchema,
+  cancelQuoteQuerySchema,
 } from './schedule.validation';
 import {
   listSchedule,
@@ -14,6 +15,7 @@ import {
   scheduleStock,
   tripHistory,
   scheduleWeek,
+  lineCancelQuote,
 } from './schedule.service';
 import { DRIVER_FEE_BASE, DRIVER_FEE_ADDONS } from '../../utils/driverFee';
 
@@ -107,4 +109,19 @@ export function driverFeePresetsController(_req: Request, res: Response): void {
     status: 'success',
     data: { base: DRIVER_FEE_BASE, addons: DRIVER_FEE_ADDONS },
   });
+}
+
+// A3: what cancelling this day in Edit Hari would charge (finance design §5.2).
+export async function lineCancelQuoteController(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const query = cancelQuoteQuerySchema.parse(req.query);
+    const data = await lineCancelQuote(req.params.id, query.requested_at);
+    res.json({ status: 'success', data });
+  } catch (err) {
+    next(err);
+  }
 }

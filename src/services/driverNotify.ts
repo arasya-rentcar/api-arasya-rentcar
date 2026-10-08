@@ -95,12 +95,14 @@ export async function notifyOrderPaidInFull(orderId: string): Promise<void> {
       select: {
         order_code: true,
         paid_to_date: true,
+        refunded_total: true,
         service_items: {
           orderBy: [{ service_date: "asc" }, { start_at: "asc" }],
           select: {
             id: true,
             total_price: true,
             line_status: true,
+            cancel_fee: true,
             is_external: true,
             driver_id: true,
             service_date: true,

@@ -8,6 +8,8 @@
  * All date/time logic is Asia/Jakarta (GMT+7). See SPRINT2_WORDING_SPEC.md.
  */
 
+import { CANCELLATION_POLICY_TEXT } from "../modules/orders/cancellation-policy";
+
 const TZ_OFFSET_MS = 7 * 60 * 60 * 1000; // GMT+7
 
 const MONTHS_ID = [
@@ -140,8 +142,8 @@ const BANK_BLOCK = [
 
 const CONTACT_LINE = "Info & konfirmasi: WhatsApp 0821-2402-4281 (Arasya Rent Car)";
 
-const CANCELLATION_LINE =
-  "Ketentuan pembatalan: sebelum hari H 20%, hari H s.d. pukul 10.00 WIB (perjalanan belum dimulai) 50%, setelahnya 100% dari total pesanan.";
+// The one policy text (orders/cancellation-policy.ts), same as the invoice PDF.
+const CANCELLATION_LINE = `Ketentuan pembatalan: ${CANCELLATION_POLICY_TEXT}`;
 
 export interface CaptionCtx {
   duration: string; // formatted trip duration
@@ -221,6 +223,22 @@ export function buildAdditionalInvoiceCaption(c: CaptionCtx): string {
     "Berikut kami kirimkan *Invoice Additional* untuk biaya tambahan yang tercatat selama perjalanan.",
     "",
     `Total tagihan: *${formatRp(c.additionalTotal ?? c.total)}*`,
+    "",
+    ...BANK_BLOCK,
+    "",
+    CONTACT_LINE,
+    "Terima kasih 🙏🏻😃",
+  ].join("\n");
+}
+
+/** "Invoice Penyesuaian": the shortfall of an earlier payment, billed again. */
+export function buildAdjustmentInvoiceCaption(c: CaptionCtx): string {
+  return [
+    `Selamat *${c.greeting}*, Kak. 🙏🏻😃`,
+    "",
+    "Berikut kami kirimkan *Invoice Penyesuaian* untuk kekurangan pembayaran sebelumnya.",
+    "",
+    `Total tagihan: *${formatRp(c.amount ?? c.total)}*`,
     "",
     ...BANK_BLOCK,
     "",

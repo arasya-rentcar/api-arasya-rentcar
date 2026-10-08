@@ -37,6 +37,9 @@ const envSchema = z.object({
   // gets its first payment. Both empty = reporting off.
   GA4_MEASUREMENT_ID: z.string().default(''),
   GA4_API_SECRET: z.string().default(''),
+  // Where the GA4 events are POSTed. Empty = Google's Measurement Protocol
+  // endpoint; the e2e checks point it at their mock to record the sends.
+  GA4_COLLECT_URL: z.string().default(''),
   // Website deploy hook, called after "Terbitkan" on the price list so the
   // site rebuilds with the new prices. Secret (the URL is the credential);
   // empty = off (the publication is still stored, deploy_status SKIPPED).

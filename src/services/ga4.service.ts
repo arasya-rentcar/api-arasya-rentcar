@@ -3,6 +3,15 @@ import { env } from "../config/env";
 import { logger } from "../config/logger";
 
 /**
+ * Invoice types whose payment is not a purchase (B12): a cancellation fee,
+ * or an adjustment billing a shortfall. They never trigger the report and
+ * never count as the order being paid.
+ */
+const NOT_A_PURCHASE = ["CANCELLATION_FEE", "ADJUSTMENT"] as const;
+export const sendsNoPurchase = (invoiceType: string) =>
+  (NOT_A_PURCHASE as readonly string[]).includes(invoiceType);
+
+/**
  * GA4 Measurement Protocol. When an order that came from a website lead gets
  * its first payment (usually the DP), report a "purchase" for the visitor who
  * sent the booking form, so GA4 shows which pages, cities and campaigns bring
@@ -18,12 +27,21 @@ export async function reportLeadPurchase(orderId: string): Promise<void> {
           order_code: true,
           final_price: true,
           payment_status: true,
-          invoices: { where: { status: "PAID" }, select: { id: true }, take: 1 },
+          order_status: true,
+          cancelled_at: true,
+          invoices: {
+            where: { status: "PAID", invoice_type: { notIn: [...NOT_A_PURCHASE] } },
+            select: { id: true },
+            take: 1,
+          },
         },
       },
     },
   });
   if (!lead || !lead.order || lead.purchase_reported_at || !lead.ga_client_id) return;
+  // A cancelled order is no purchase, also when its done days keep it open
+  // (cancelled_at set) (B12).
+  if (lead.order.cancelled_at || lead.order.order_status === "CANCELLED") return;
   // Called on every payment and on linking a lead: only a paid order counts.
   const paid =
     lead.order.invoices.length > 0 ||
@@ -49,7 +67,9 @@ export async function reportLeadPurchase(orderId: string): Promise<void> {
   };
   if (lead.ga_session_id) params.session_id = lead.ga_session_id;
 
-  const url = `https://www.google-analytics.com/mp/collect?measurement_id=${encodeURIComponent(env.GA4_MEASUREMENT_ID)}&api_secret=${encodeURIComponent(env.GA4_API_SECRET)}`;
+  // GA4_COLLECT_URL: a local collector for the e2e checks; Google otherwise.
+  const collect = env.GA4_COLLECT_URL || "https://www.google-analytics.com/mp/collect";
+  const url = `${collect}?measurement_id=${encodeURIComponent(env.GA4_MEASUREMENT_ID)}&api_secret=${encodeURIComponent(env.GA4_API_SECRET)}`;
   let res: Response;
   try {
     res = await fetch(url, {

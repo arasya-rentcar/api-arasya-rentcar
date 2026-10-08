@@ -1,0 +1,44 @@
+name: CI
+
+# Full end-to-end suite (scripts/e2e) on every PR, against a throwaway
+# Postgres 15 with storage, push and GA4 mocked. Keep the image on the
+# production major version (`SELECT version()` on Supabase). Nothing here
+# touches production.
+
+on:
+  pull_request:
+  workflow_dispatch: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: arasya
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install deps
+        run: npm ci
+      - name: E2E (migrations, build, all groups)
+        env:
+          E2E_EXTERNAL_DB: postgresql://postgres:postgres@localhost:5432/arasya
+        run: bash scripts/e2e/run-local.sh
