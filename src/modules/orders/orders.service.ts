@@ -2505,7 +2505,14 @@ export async function cancelOrder(
     // name, amounts) must not stay behind in the public bucket. Its reserved
     // number stays unused.
     if (prepared) void removeFile(env.SUPABASE_STORAGE_BUCKET, `invoices/${prepared.invoiceNumber}.pdf`);
-    if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002" && ref) {
+    // Only the client_ref key: another unique key (e.g. the fee invoice's
+    // number) is a real error, not a reused client_ref.
+    if (
+      err instanceof Prisma.PrismaClientKnownRequestError &&
+      err.code === "P2002" &&
+      ref &&
+      String(err.meta?.target ?? "").includes("cancel_client_ref")
+    ) {
       throw new AppError("client_ref ini sudah dipakai untuk pembatalan order lain.", 409);
     }
     throw err;

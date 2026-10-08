@@ -341,6 +341,7 @@ export async function assignScheduleLine(
   const now = new Date();
   let cancellation: DayCancellation | null = null;
   let cancelRequestedAt: Date | null = null;
+  let cancelDecidedAt: Date | null = null;
   if (becomesCancelled) {
     if (line.line_status === 'DONE') throw new AppError(DONE_DAY_MESSAGE, 409, { code: 'DONE_DAY' });
     if (!input.cancel_reason) {
@@ -349,6 +350,7 @@ export async function assignScheduleLine(
     const when = cancelDecisionTime(input.cancel_requested_at, now);
     if (when.error) throw new AppError(when.error, 400);
     cancelRequestedAt = when.requestedAt;
+    cancelDecidedAt = when.decidedAt;
     cancellation = dayCancellation({
       price: Number(line.total_price),
       dayDate: dayDateOf(line, line.order.service_start_at),
@@ -525,8 +527,16 @@ export async function assignScheduleLine(
     // finds it cancelled under the lock and keeps the first fee (a resend is
     // a no-op); a day finished meanwhile cannot be cancelled.
     if (cancellation) {
-      const [cur] = await tx.$queryRaw<{ line_status: string }[]>`
-        SELECT line_status::text AS line_status FROM "order_service_items" WHERE id = ${id} FOR NO KEY UPDATE`;
+      const [cur] = await tx.$queryRaw<
+        {
+          line_status: string;
+          total_price: Prisma.Decimal | null;
+          actual_start_at: Date | null;
+          trip_started_at: Date | null;
+        }[]
+      >`
+        SELECT line_status::text AS line_status, total_price, actual_start_at, trip_started_at
+        FROM "order_service_items" WHERE id = ${id} FOR NO KEY UPDATE`;
       if (cur?.line_status === 'DONE') throw new AppError(DONE_DAY_MESSAGE, 409, { code: 'DONE_DAY' });
       if (cur?.line_status === 'CANCELLED') {
         delete data.cancel_fee;
@@ -535,6 +545,24 @@ export async function assignScheduleLine(
         delete data.cancel_reason;
         delete data.cancel_requested_at;
         cancellation = null;
+      } else if (cur) {
+        // The fee above was worked out before the lock: the driver starting
+        // the day or Edit Order repricing it meanwhile changes the tier or
+        // the price. Charge only what the admin was shown.
+        const fresh = dayCancellation({
+          price: Number(cur.total_price ?? 0),
+          dayDate: dayDateOf(line, line.order.service_start_at),
+          started: dayStarted(cur),
+          decidedAt: cancelDecidedAt ?? now,
+        });
+        if (fresh.tier !== cancellation.tier || toSen(fresh.fee) !== toSen(cancellation.fee)) {
+          const quote = await lineCancelQuote(id, input.cancel_requested_at, now);
+          throw new AppError(
+            `Biaya pembatalan hari ini sekarang ${rupiah(fresh.fee)} (${fresh.pct}%), bukan ${rupiah(cancellation.fee)}. Periksa lalu simpan lagi.`,
+            409,
+            { code: 'CANCEL_FEE_CHANGED', quote },
+          );
+        }
       }
     }
     await tx.orderServiceItem.update({ where: { id }, data });

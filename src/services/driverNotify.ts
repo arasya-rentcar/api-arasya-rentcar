@@ -102,6 +102,7 @@ export async function notifyOrderPaidInFull(orderId: string): Promise<void> {
             id: true,
             total_price: true,
             line_status: true,
+            cancel_fee: true,
             is_external: true,
             driver_id: true,
             service_date: true,
