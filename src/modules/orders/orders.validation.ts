@@ -6,6 +6,17 @@ const orderCustomerSchema = z.object({
   is_primary: z.boolean().optional(),
 });
 
+// A day's map point: finite, in range; null clears it.
+const latitude = z.number().finite().min(-90).max(90).nullable().optional();
+const longitude = z.number().finite().min(-180).max(180).nullable().optional();
+const placeId = z
+  .string()
+  .trim()
+  .max(300)
+  .nullable()
+  .optional()
+  .transform((v) => (v === "" ? null : v));
+
 const orderServiceItemSchema = z
   .object({
     // Edit Order: the existing day this row is (absent = a new day). Ignored
@@ -25,6 +36,13 @@ const orderServiceItemSchema = z
     total_price: z.number().min(0).optional(),
     notes: z.string().optional(),
     sort_order: z.number().int().optional(),
+    // Map points of the day (null = clear; absent on an existing day = keep).
+    pickup_lat: latitude,
+    pickup_lng: longitude,
+    pickup_place_id: placeId,
+    dropoff_lat: latitude,
+    dropoff_lng: longitude,
+    dropoff_place_id: placeId,
   })
   .refine(
     (v) =>
@@ -33,7 +51,27 @@ const orderServiceItemSchema = z
       path: ["end_at"],
       message: "item end_at must be after start_at",
     },
-  );
+  )
+  .superRefine((v, ctx) => {
+    for (const side of ["pickup", "dropoff"] as const) {
+      const lat = v[`${side}_lat`];
+      const lng = v[`${side}_lng`];
+      // Both numbers, both null, or both left out: never half a point.
+      if (lat !== lng && (typeof lat !== "number" || typeof lng !== "number"))
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [`${side}_lng`],
+          message: `${side}_lat and ${side}_lng must be sent together`,
+        });
+      // A place id belongs to the point sent with it.
+      if (v[`${side}_place_id`] && typeof lat !== "number")
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [`${side}_place_id`],
+          message: `${side}_place_id needs ${side}_lat and ${side}_lng`,
+        });
+    }
+  });
 
 export const createOrderSchema = z
   .object({

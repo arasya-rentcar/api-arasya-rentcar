@@ -8,6 +8,29 @@ const text = (max: number) =>
     .optional()
     .transform((v) => (v ? v : undefined));
 
+/**
+ * A map coordinate from the website, or undefined when it is missing or
+ * unusable. Never an error: the form posts by sendBeacon and does not see the
+ * answer, so rejecting the body would lose the lead over a bad map point.
+ */
+const lenientCoordinate = (limit: number) =>
+  z.unknown().transform((v) => {
+    const n =
+      typeof v === "number"
+        ? v
+        : typeof v === "string" && v.trim() !== ""
+          ? Number(v)
+          : NaN;
+    return Number.isFinite(n) && Math.abs(n) <= limit ? n : undefined;
+  });
+
+/** Map place id / name: trimmed, dropped (not an error) when too long. */
+const lenientPlaceText = (max: number) =>
+  z.unknown().transform((v) => {
+    const t = typeof v === "string" ? v.trim() : "";
+    return t && t.length <= max ? t : undefined;
+  });
+
 /** What the website's booking form sends (see arasya-web BookingBar). */
 export const publicLeadSchema = z.object({
   lead_code: z.string().regex(/^ARS-[A-Z2-9]{5}$/, "invalid lead_code"),
@@ -33,8 +56,31 @@ export const publicLeadSchema = z.object({
   gclid: text(300),
   ga_client_id: text(100),
   ga_session_id: text(100),
+  // Map points picked on the website (all optional, see the transform below).
+  pickup_lat: lenientCoordinate(90),
+  pickup_lng: lenientCoordinate(180),
+  pickup_place_id: lenientPlaceText(300),
+  pickup_place_name: lenientPlaceText(300),
+  destination_lat: lenientCoordinate(90),
+  destination_lng: lenientCoordinate(180),
+  destination_place_id: lenientPlaceText(300),
+  destination_place_name: lenientPlaceText(300),
   // Honeypot: real visitors never see or fill this field.
   website: z.string().optional(),
+}).transform((lead) => {
+  // A side (pickup / destination) is kept only with both lat and lng valid;
+  // otherwise its four fields are dropped (stored as null) and the lead is
+  // still saved.
+  const out = { ...lead };
+  if (out.pickup_lat === undefined || out.pickup_lng === undefined) {
+    out.pickup_lat = out.pickup_lng = undefined;
+    out.pickup_place_id = out.pickup_place_name = undefined;
+  }
+  if (out.destination_lat === undefined || out.destination_lng === undefined) {
+    out.destination_lat = out.destination_lng = undefined;
+    out.destination_place_id = out.destination_place_name = undefined;
+  }
+  return out;
 });
 export type PublicLeadInput = z.infer<typeof publicLeadSchema>;
 

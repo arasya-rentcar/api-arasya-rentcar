@@ -102,6 +102,12 @@ function normalizeServiceItems(input: CreateOrderInput | UpdateOrderInput) {
       pickup_location: item.pickup_location,
       dropoff_location: item.dropoff_location,
       driver_origin_location: item.driver_origin_location || null,
+      pickup_lat: item.pickup_lat ?? null,
+      pickup_lng: item.pickup_lng ?? null,
+      pickup_place_id: item.pickup_place_id ?? null,
+      dropoff_lat: item.dropoff_lat ?? null,
+      dropoff_lng: item.dropoff_lng ?? null,
+      dropoff_place_id: item.dropoff_place_id ?? null,
       quantity,
       unit_price: unitPrice,
       total_price: item.total_price ?? quantity * unitPrice,
@@ -847,6 +853,12 @@ const DAY_CONTENT_FIELDS = [
   "pickup_location",
   "dropoff_location",
   "driver_origin_location",
+  "pickup_lat",
+  "pickup_lng",
+  "pickup_place_id",
+  "dropoff_lat",
+  "dropoff_lng",
+  "dropoff_place_id",
   "quantity",
   "unit_price",
   "total_price",
@@ -931,6 +943,12 @@ const dayForEditSelect = {
   pickup_location: true,
   dropoff_location: true,
   driver_origin_location: true,
+  pickup_lat: true,
+  pickup_lng: true,
+  pickup_place_id: true,
+  dropoff_lat: true,
+  dropoff_lng: true,
+  dropoff_place_id: true,
   quantity: true,
   unit_price: true,
   total_price: true,
@@ -945,6 +963,27 @@ const _everyContentFieldSelected: Record<
   never
 > = {};
 void _everyContentFieldSelected;
+
+/** A day field the order form may leave out to keep the stored value. */
+function keptUnlessSent(
+  field: (typeof DAY_CONTENT_FIELDS)[number],
+  sent: NonNullable<UpdateOrderInput["service_items"]>[number],
+): boolean {
+  switch (field) {
+    case "driver_origin_location":
+    case "pickup_lat":
+    case "pickup_lng":
+    case "dropoff_lat":
+    case "dropoff_lng":
+      return sent[field] === undefined;
+    case "pickup_place_id":
+      return sent.pickup_place_id === undefined && sent.pickup_lat === undefined;
+    case "dropoff_place_id":
+      return sent.dropoff_place_id === undefined && sent.dropoff_lat === undefined;
+    default:
+      return false;
+  }
+}
 
 const wibYmd = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Jakarta" });
 
@@ -1021,11 +1060,11 @@ export async function updateOrder(id: string, input: UpdateOrderInput) {
         throw new AppError(`Satu hari terkirim dua kali. ${reloadAndRetry}`, 400);
       kept.add(lineId);
       // Only what changed is written. The order form has no field for the
-      // driver's origin, so it is kept unless sent.
+      // driver's origin, so it is kept unless sent; so are the map points
+      // (a place id goes with its point: a point sent without one clears it).
       const changed: Partial<DayData> = {};
       for (const f of DAY_CONTENT_FIELDS) {
-        if (f === "driver_origin_location" && service_items[i].driver_origin_location === undefined)
-          continue;
+        if (keptUnlessSent(f, service_items[i])) continue;
         if (!sameValue(f, data[f], line[f])) (changed as Record<string, unknown>)[f] = data[f];
       }
       if (Object.keys(changed).length > 0) {
