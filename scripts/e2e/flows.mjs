@@ -747,7 +747,7 @@ await section('J. Phone clock, stale trips, packages, cancel on day H', async ()
   check('J6 deleting a driver receipt refused (409)', (await call('DELETE', `/lines/expenses/${e.id}`, { token: admin })).status === 409);
   const wibHour = new Date(Date.now() + 7 * 3600e3).getUTCHours();
   const c = await call('POST', `/orders/${o.id}/cancel`, { token: admin, body: { reason: 'tes hari H' } });
-  check('J7 cancel on day H after a departure → tier 3 (100%)', c.data?.tier === 3, `WIB hour ${wibHour}, ${JSON.stringify(c.data)}`);
+  check('J7 cancel on day H after the driver arrived at the pickup → tier 3 (100%)', c.data?.tier === 3, `WIB hour ${wibHour}, ${JSON.stringify(c.data)}`);
   const jFee = (await order(o.id)).invoices.find((i) => i.invoice_type === 'CANCELLATION_FEE');
   check('J7b [A6] fee 1.300.000 − 1.000.000 already paid: invoice for 300.000', c.data?.stillOwed === 300000 && Number(jFee?.amount) === 300000, `${c.data?.stillOwed} / ${jFee?.amount}`);
   // J12 (B12, owner Q1 7 Oct 2026): "before 10:00" is strictly before
@@ -1276,18 +1276,21 @@ await section('O. Finance formulas (extra charges, cancellations, cancelled days
     diff(before, after, 'outstanding.ar_outstanding') === -700000 && Number(o3b.paid_to_date) === 1000000 && o3b.payment_status === 'PAID',
     `${show(before, after, ['outstanding.ar_outstanding'])} ${o3b.paid_to_date} ${o3b.payment_status}`);
 
-  // Cancel after the driver left: the kept fee stays a cost.
+  // Cancel after the driver arrived at the pickup (tier 3 at any hour; leaving
+  // the garage alone is 50% before 10:00, owner 8 Oct 2026): the kept fee
+  // stays a cost.
   const o4 = await makeOrder('O11', { startDay: 0 });
   await payFull(o4);
   const l4 = o4.service_items[0].id;
   await putLine(l4, { is_external: false, driver_id: dO.id, car_id: carO.id, line_status: 'ASSIGNED', driver_fee: 200000 });
   await act(dO, l4, 'start');
+  await act(dO, l4, 'arrive', { latitude: -6.56, longitude: 106.8, location_accuracy_m: 12, location_mocked: false });
   before = await dash();
   rb = await rev();
   const c4 = await call('POST', `/orders/${o4.id}/cancel`, { token: admin, body: { reason: 'Batal di jalan' } });
   after = await dash();
   ra = await rev();
-  check('O11 cancel after departure: tier 3, paid in full, no invoice',
+  check('O11 cancel after the driver arrived at the pickup: tier 3, paid in full, no invoice',
     c4.data?.tier === 3 && c4.data.stillOwed === 0 && noFeeInvoice(await order(o4.id)), JSON.stringify(c4.data ?? c4.json));
   check('O12 [A3] Dashboard: the kept driver fee stays a cost; the fee replaces the day price (revenue and margin unchanged)',
     diff(before, after, 'accrual.revenue') === 0 && diff(before, after, 'accrual.margin') === 0 && diff(before, after, 'accrual.driver_cost') === 0,
@@ -2549,7 +2552,7 @@ await section('R. Order money, saldo lebih, money received, refunds, locks, clie
   // sweep (R33) below still runs when this block stops.
   try {
     const policy = createRequire(import.meta.url)('../../dist/src/modules/orders/cancellation-policy.js');
-    const { dayCancellation, pctRupiah, computeCancellationPenalty } = policy;
+    const { dayCancellation, dayArrivedBy, pctRupiah, computeCancellationPenalty } = policy;
     const num = (x) => (x == null ? null : Number(x));
     const byDate = (o) => [...o.service_items].sort((a, b) => a.service_date.localeCompare(b.service_date));
     const cancelDay = (id, extra = {}) => putLine(id, { is_external: false, line_status: 'CANCELLED', cancel_reason: 'Pelanggan minta kurangi hari', ...extra });
@@ -2611,8 +2614,8 @@ await section('R. Order money, saldo lebih, money received, refunds, locks, clie
     const q3 = await lineQuote(b2.id);
     const r3 = await cancelDay(b2.id, { expected_cancel_fee: q3.data?.fee });
     const o3a = await order(o2.id);
-    check('R3a [A3] line cancel-quote: tier 1, 20% of 1.000.000 = 200.000, not started, not blocked, new total 2.200.000, no credit released, 2.200.000 owed after',
-      q3.status === 200 && q3.data.tier === 1 && q3.data.pct === 20 && q3.data.price === 1000000 && q3.data.fee === 200000 && q3.data.started === false &&
+    check('R3a [A3] line cancel-quote: tier 1, 20% of 1.000.000 = 200.000, not arrived, not blocked, new total 2.200.000, no credit released, 2.200.000 owed after',
+      q3.status === 200 && q3.data.tier === 1 && q3.data.pct === 20 && q3.data.price === 1000000 && q3.data.fee === 200000 && q3.data.arrived === false &&
       q3.data.blocked === null && q3.data.new_total === 2200000 && q3.data.credit_release === 0 && q3.data.open_billed === 0 && q3.data.owed_after === 2200000 &&
       !Number.isNaN(Date.parse(q3.data.decided_at)), JSON.stringify(q3.data ?? q3.json).slice(0, 400));
     check('R3b saving with expected_cancel_fee = the quoted fee: 200, the same tier and fee, the order total = the quoted new total',
@@ -2627,12 +2630,12 @@ await section('R. Order money, saldo lebih, money received, refunds, locks, clie
 
     // R4: the boundaries on the built rule, then the request checks.
     const d10 = '2026-10-10T00:00:00+07:00';
-    const at = (iso, started = false, dayDate = d10) => dayCancellation({ price: 1_000_000, dayDate: dayDate ? new Date(dayDate) : null, started, decidedAt: new Date(iso) });
+    const at = (iso, arrived = false, dayDate = d10) => dayCancellation({ price: 1_000_000, dayDate: dayDate ? new Date(dayDate) : null, arrived, decidedAt: new Date(iso) });
     const t4 = [
       at('2026-10-10T09:59:59.999+07:00'), at('2026-10-10T10:00:00.000+07:00'), at('2026-10-10T10:00:59+07:00'), at('2026-10-09T23:59:00+07:00'),
       at('2026-10-10T08:00:00+07:00', true), at('2026-10-10T08:00:00+07:00', false, null), at('2026-10-11T08:00:00+07:00'),
     ];
-    check('R4a [A3, B12] dayCancellation (dist): 09:59:59.999 → 2 (500.000); 10:00:00.000 → 3; 10:00:59 → 3; 23:59 the day before → 1 (200.000); started (08:00) → 3; no date → 1; the day after → 3',
+    check('R4a [A3, B12] dayCancellation (dist): 09:59:59.999 → 2 (500.000); 10:00:00.000 → 3; 10:00:59 → 3; 23:59 the day before → 1 (200.000); arrived (08:00) → 3; no date → 1; the day after → 3',
       t4.map((x) => x.tier).join() === '2,3,3,1,3,1,3' && t4.map((x) => x.pct).join() === '50,100,100,20,100,20,100' &&
       t4[0].fee === 500000 && t4[1].fee === 1000000 && t4[3].fee === 200000 && t4[5].fee === 200000,
       t4.map((x) => `${x.tier}/${x.pct}/${x.fee}`).join(' '));
@@ -2650,7 +2653,7 @@ await section('R. Order money, saldo lebih, money received, refunds, locks, clie
       `${noReason4.status} ${longReason4.status} ${tooOld4.status} ${future4.status} quote ${qOld4.status} day ${a4a.line_status}`);
 
     // R5: rounding, per day then summed.
-    const half5 = dayCancellation({ price: 1_234_567, dayDate: new Date(d10), started: false, decidedAt: new Date('2026-10-10T09:00:00+07:00') });
+    const half5 = dayCancellation({ price: 1_234_567, dayDate: new Date(d10), arrived: false, decidedAt: new Date('2026-10-10T09:00:00+07:00') });
     check('R5a [A3] pctRupiah (dist): 1.234.567 → 20% 246.913, 50% 617.284 (617.283,5 half-up), 100% 1.234.567; two days at 50% = 2 × 617.284 = 1.234.568',
       pctRupiah(1234567, 20) === 246913 && pctRupiah(1234567, 50) === 617284 && pctRupiah(1234567, 100) === 1234567 &&
       half5.tier === 2 && half5.fee === 617284 && half5.fee * 2 === 1234568,
@@ -2906,6 +2909,119 @@ await section('R. Order money, saldo lebih, money received, refunds, locks, clie
       q31r.status === 200 && q31r.data.tier === 1 && q31r.data.fee === 200000 && r31r.status === 200 && r31r.data.cancellation?.tier === 1 && num(d31r.cancel_fee) === 200000 &&
       d31r.cancel_requested_at?.getTime() === new Date(req31).getTime() && Math.abs((d31r.cancelled_at?.getTime() ?? 0) - Date.now()) < 60e3,
       `quote ${q31r.status} ${q31r.data?.tier}/${q31r.data?.fee} | ${r31r.status} ${r31r.json?.message ?? ''} ${JSON.stringify(r31r.data?.cancellation)} req ${d31r.cancel_requested_at?.toISOString()}`);
+
+    // R44–R50 (owner, 8 Oct 2026): tier 2/3 by the driver ARRIVING at the
+    // pickup (as of the decision time), and a fee set by hand.
+    check('R44 [A3] CANCELLATION_POLICY_TEXT (dist) is the owner\'s wording of 8 Oct 2026 (arrival at the pickup, not departure)',
+      policy.CANCELLATION_POLICY_TEXT === 'Pembatalan dihitung per hari sewa dari harga hari tersebut: batal paling lambat sehari sebelumnya 20%; batal pada hari sewa sebelum pukul 10.00 WIB dan driver belum tiba di alamat jemput 50%; batal pada hari sewa mulai pukul 10.00 WIB atau setelah driver tiba di alamat jemput 100%. Biaya tambahan yang sudah terpakai dibayar penuh. Kelebihan bayar dipotongkan ke tagihan berikutnya atau dikembalikan bila diminta.',
+      String(policy.CANCELLATION_POLICY_TEXT).slice(0, 200));
+    const t08 = new Date('2026-10-10T08:00:00+07:00');
+    const departed = { actual_start_at: new Date('2026-10-10T07:00:00+07:00'), trip_started_at: new Date('2026-10-10T07:00:00+07:00'), line_status: 'IN_PROGRESS' };
+    const arrivedAt = (k, iso) => ({ ...departed, [k]: new Date(iso) });
+    const tierAt = (d, iso) => at(iso, dayArrivedBy(d, new Date(iso))).tier;
+    check('R45a [A3] dayArrivedBy (dist): departed only (IN_PROGRESS, actual_start_at, trip_started_at) → not arrived, 09:59:59.999 still tier 2 (50%), 10:00:00.000 tier 3; actual_pickup_at or customer_onboard_at before the decision → arrived, tier 3 at 08:00; DONE → arrived',
+      !dayArrivedBy(departed, t08) && tierAt(departed, '2026-10-10T09:59:59.999+07:00') === 2 && tierAt(departed, '2026-10-10T10:00:00.000+07:00') === 3 &&
+      dayArrivedBy(arrivedAt('actual_pickup_at', '2026-10-10T07:30:00+07:00'), t08) && tierAt(arrivedAt('actual_pickup_at', '2026-10-10T07:30:00+07:00'), '2026-10-10T08:00:00+07:00') === 3 &&
+      dayArrivedBy(arrivedAt('customer_onboard_at', '2026-10-10T07:45:00+07:00'), t08) && dayArrivedBy({ line_status: 'DONE' }, t08),
+      `${tierAt(departed, '2026-10-10T09:59:59.999+07:00')} ${tierAt(departed, '2026-10-10T10:00:00.000+07:00')}`);
+    const late = arrivedAt('actual_pickup_at', '2026-10-10T09:30:00+07:00');
+    check('R45b [A3] back-dated: the customer called 08:00, the driver arrived 09:30 → not arrived at 08:00, tier 2 (50%); the same arrival judged at 09:45 → tier 3',
+      !dayArrivedBy(late, t08) && tierAt(late, '2026-10-10T08:00:00+07:00') === 2 && at('2026-10-10T08:00:00+07:00', dayArrivedBy(late, t08)).fee === 500000 &&
+      tierAt(late, '2026-10-10T09:45:00+07:00') === 3, `${tierAt(late, '2026-10-10T08:00:00+07:00')} ${tierAt(late, '2026-10-10T09:45:00+07:00')}`);
+    // Through the API on today's day: arrived 1 minute ago → tier 3 now; the
+    // quote at a request time before the arrival → not arrived (its tier from the clock).
+    const o45 = await makeOrder('RA45', { days: 2, startDay: 0 });
+    const [today45] = byDate(o45);
+    await prisma.orderServiceItem.update({
+      where: { id: today45.id },
+      data: { line_status: 'IN_PROGRESS', actual_start_at: new Date(Date.now() - 10 * 60e3), trip_started_at: new Date(Date.now() - 10 * 60e3) },
+    });
+    const qDep45 = await lineQuote(today45.id);
+    await prisma.orderServiceItem.update({ where: { id: today45.id }, data: { actual_pickup_at: new Date(Date.now() - 60e3) } });
+    const qArr45 = await lineQuote(today45.id);
+    const req45 = new Date(Date.now() - 3 * 60e3).toISOString();
+    const qBack45 = await lineQuote(today45.id, req45);
+    const want45 = (q) => (q?.decided_at ? at(q.decided_at, false, today45.service_date).tier : null);
+    check('R45c [A3] API, today\'s day: departed only → not arrived (tier from the clock, never 3 for departing before 10:00); arrived 1 min ago → arrived, tier 3, 100%; requested 3 min ago (before the arrival) → not arrived',
+      qDep45.status === 200 && qDep45.data.arrived === false && qDep45.data.tier === want45(qDep45.data) &&
+      qArr45.status === 200 && qArr45.data.arrived === true && qArr45.data.tier === 3 && qArr45.data.fee === 1000000 &&
+      qBack45.status === 200 && qBack45.data.arrived === false && qBack45.data.tier === want45(qBack45.data),
+      `dep ${qDep45.data?.arrived}/${qDep45.data?.tier} arr ${qArr45.data?.arrived}/${qArr45.data?.tier} back ${qBack45.data?.arrived}/${qBack45.data?.tier} (${qBack45.status} ${qBack45.json?.message ?? ''})`);
+    // Back to a plain day (no running trip left behind for other checks).
+    await prisma.orderServiceItem.update({
+      where: { id: today45.id },
+      data: { line_status: 'SCHEDULED', actual_start_at: null, trip_started_at: null, actual_pickup_at: null },
+    });
+
+    // R46: Edit Hari with a fee set by hand.
+    const o46 = await makeOrder('RA46', { days: 2, startDay: 50 });
+    const [, b46] = byDate(o46);
+    const over46 = await cancelDay(b46.id, { cancel_fee: 1_000_001 });
+    const frac46 = await cancelDay(b46.id, { cancel_fee: 1000.5 });
+    const neg46 = await cancelDay(b46.id, { cancel_fee: -1 });
+    const b46a = await day(b46.id);
+    check('R46a [A3] Edit Hari cancel_fee above the day price → 400 INVALID_CANCEL_FEE; not whole rupiah or negative → 400; the day unchanged',
+      over46.status === 400 && over46.json?.code === 'INVALID_CANCEL_FEE' && frac46.status === 400 && neg46.status === 400 &&
+      b46a.line_status === 'SCHEDULED' && b46a.cancel_fee == null, `${over46.status} ${over46.json?.code} ${frac46.status} ${neg46.status} ${b46a.line_status}`);
+    const t46 = Date.now();
+    const r46 = await cancelDay(b46.id, { cancel_fee: 350_000, expected_cancel_fee: 200_000 });
+    const b46b = await day(b46.id);
+    const o46a = await order(o46.id);
+    const log46 = (await logsSince(o46, t46)).find((l) => l.field === 'line_status');
+    check('R46b [A3] Edit Hari cancel_fee 350.000 (automatic 200.000, expected_cancel_fee = the automatic): stored cancel_fee 350.000, cancel_fee_auto 200.000, tier 1; total 1.350.000; the response says manual; the log says "diisi manual"',
+      r46.status === 200 && num(b46b.cancel_fee) === 350000 && num(b46b.cancel_fee_auto) === 200000 && b46b.cancel_tier === 1 &&
+      Number(o46a.final_price) === 1350000 && r46.data.order_money?.total === 1350000 &&
+      r46.data.cancellation?.fee === 350000 && r46.data.cancellation?.fee_auto === 200000 && r46.data.cancellation?.manual === true &&
+      num(o46a.service_items.find((l) => l.id === b46.id)?.cancel_fee_auto) === 200000 &&
+      /diisi manual Rp 350\.000 \(otomatis Rp 200\.000, 20%\)/.test(log46?.new_value ?? ''),
+      `${r46.status} ${r46.json?.message ?? ''} ${b46b.cancel_fee}/${b46b.cancel_fee_auto} total ${o46a.final_price} log ${log46?.new_value}`);
+    const dp46 = await invoice(o46.id, 'DP', 300_000);
+    const dp46t = await pdfStrings(dp46.data?.file_url);
+    check('R46c [A3] the invoice PDF prints the manual day as "(Dibatalkan — biaya pembatalan)" with no %',
+      dp46.status === 201 && /\(Dibatalkan [-—] biaya pembatalan\)/.test(dp46t) && !/biaya pembatalan \d+%/.test(dp46t),
+      `${dp46.status} ${dp46.json?.message ?? ''} ${(dp46t.match(/\(Dibatalkan[^)]*\)/g) ?? []).join(' | ')}`);
+    const reopen46 = await putLine(b46.id, { is_external: false, line_status: 'SCHEDULED' });
+    const b46c = await day(b46.id);
+    check('R46d reopening the manual day clears cancel_fee and cancel_fee_auto',
+      reopen46.status === 200 && b46c.cancel_fee == null && b46c.cancel_fee_auto == null && b46c.cancel_tier == null, `${reopen46.status} ${b46c.cancel_fee}/${b46c.cancel_fee_auto}`);
+
+    // R47: Batalkan Pesanan with day_fees.
+    const o47 = await makeOrder('RA47', { days: 3, startDay: 52 });
+    const [a47, b47, c47] = byDate(o47);
+    await payDp(o47, 600_000);
+    const q47 = await orderQuote(o47);
+    const unk47 = await cancelOrder(o47, { day_fees: [{ line_id: uuid(), fee: 0 }] });
+    const dup47 = await cancelOrder(o47, { day_fees: [{ line_id: a47.id, fee: 0 }, { line_id: a47.id, fee: 1 }] });
+    const over47 = await cancelOrder(o47, { day_fees: [{ line_id: a47.id, fee: 1_000_001 }] });
+    const frac47 = await cancelOrder(o47, { day_fees: [{ line_id: a47.id, fee: 0.5 }] });
+    const still47 = await order(o47.id);
+    check('R47a [A3] Batalkan Pesanan day_fees: an unknown line, a day twice, a fee above the day price → 400 INVALID_CANCEL_FEE; not whole rupiah → 400; nothing cancelled; the quote stays automatic (each day fee = fee_auto, price, manual false)',
+      unk47.status === 400 && unk47.json?.code === 'INVALID_CANCEL_FEE' && dup47.status === 400 && dup47.json?.code === 'INVALID_CANCEL_FEE' &&
+      over47.status === 400 && over47.json?.code === 'INVALID_CANCEL_FEE' && frac47.status === 400 && still47.cancellation_fee == null &&
+      still47.service_items.every((l) => l.line_status !== 'CANCELLED') && q47.status === 200 && q47.data.fee_total === 600000 &&
+      q47.data.days.every((d) => d.fee === d.fee_auto && d.fee === 200000 && d.price === 1000000 && d.manual === false && d.arrived === false),
+      `${unk47.status}/${unk47.json?.code} ${dup47.status} ${over47.status} ${frac47.status} quote ${JSON.stringify(q47.data?.days?.[0])}`);
+    const ref47 = uuid();
+    const body47 = { expected_fee_total: 600_000, client_ref: ref47, day_fees: [{ line_id: a47.id, fee: 0 }, { line_id: b47.id, fee: 1_000_000 }] };
+    const c47r = await cancelOrder(o47, body47);
+    const o47a = await order(o47.id);
+    const fee47 = o47a.invoices.find((i) => i.invoice_type === 'CANCELLATION_FEE');
+    const d47 = (id) => o47a.service_items.find((l) => l.id === id);
+    check('R47b [A3] day_fees 0 and 1.000.000 (+ the third day automatic 200.000), expected_fee_total = the automatic 600.000: penalty = feeTotal = cancellation_fee = total = 1.200.000, autoFeeTotal 600.000; each day cancel_fee / cancel_fee_auto; fee invoice and stillOwed 600.000 (− 600.000 DP); saldo lebih 0',
+      c47r.status === 200 && c47r.data.penalty === 1200000 && c47r.data.feeTotal === 1200000 && c47r.data.autoFeeTotal === 600000 &&
+      Number(o47a.cancellation_fee) === 1200000 && Number(o47a.final_price) === 1200000 &&
+      num(d47(a47.id)?.cancel_fee) === 0 && num(d47(a47.id)?.cancel_fee_auto) === 200000 && num(d47(b47.id)?.cancel_fee) === 1000000 &&
+      num(d47(c47.id)?.cancel_fee) === 200000 && num(d47(c47.id)?.cancel_fee_auto) === 200000 &&
+      c47r.data.days.filter((d) => d.manual).length === 2 && Number(fee47?.amount) === 600000 && c47r.data.stillOwed === 600000 &&
+      c47r.data.creditBalance === 0 && Number(o47a.money?.credit_balance ?? 0) === 0,
+      `${c47r.status} ${JSON.stringify(c47r.data ?? c47r.json).slice(0, 400)} fee inv ${fee47?.amount}`);
+    const c47again = await cancelOrder(o47, { ...body47, day_fees: [{ line_id: a47.id, fee: 5 }] });
+    const fee47t = fee47 ? await pdfStrings((await prisma.invoice.findUnique({ where: { id: fee47.id } }))?.file_url) : '';
+    const tags47 = fee47t.match(/\(Dibatalkan [-—] biaya pembatalan[^)]*\)/g) ?? [];
+    check('R47c [A3] a resend with the same client_ref (other day_fees) → 200 with the stored result; the fee invoice PDF prints the two manual days without % and the automatic day with 20%',
+      c47again.status === 200 && c47again.data?.penalty === 1200000 && (await order(o47.id)).invoices.length === o47a.invoices.length &&
+      tags47.length === 3 && tags47.filter((x) => !/%/.test(x)).length === 2 && tags47.filter((x) => /20%/.test(x)).length === 1,
+      `${c47again.status} ${c47again.data?.penalty} tags ${tags47.join(' | ')}`);
   } catch (err) {
     check('R A3 (per-day cancellation) block: stopped by an error', false, String(err?.stack ?? err).split('\n').slice(0, 3).join(' | '));
   }
@@ -2947,7 +3063,7 @@ await section('R. Order money, saldo lebih, money received, refunds, locks, clie
   const mine = await prisma.order.findMany({
     where: { customer_name: { contains: tag } },
     include: {
-      service_items: { select: { total_price: true, line_status: true, cancel_fee: true, cancel_tier: true } },
+      service_items: { select: { total_price: true, line_status: true, cancel_fee: true, cancel_fee_auto: true, cancel_tier: true } },
       invoices: { include: { receipts: { orderBy: { created_at: 'asc' }, take: 1 } } },
       refunds: true,
       credit_entries: true,
@@ -2993,8 +3109,11 @@ await section('R. Order money, saldo lebih, money received, refunds, locks, clie
     if (!legacyCancel) {
       for (const l of o.service_items) {
         if (l.line_status !== 'CANCELLED' || l.cancel_tier == null) continue;
-        if (!tierPct[l.cancel_tier] || sen(l.cancel_fee) !== pctSen(l.total_price, tierPct[l.cancel_tier]))
-          v.dayFee.push(`${name} day ${l.total_price} tier ${l.cancel_tier} fee ${l.cancel_fee} ≠ ${pctSen(l.total_price, tierPct[l.cancel_tier] ?? 0) / 100}`);
+        // The automatic fee follows the tier; the fee charged (maybe set by hand) is within 0..price.
+        if (!tierPct[l.cancel_tier] || l.cancel_fee_auto == null || sen(l.cancel_fee_auto) !== pctSen(l.total_price, tierPct[l.cancel_tier]))
+          v.dayFee.push(`${name} day ${l.total_price} tier ${l.cancel_tier} fee_auto ${l.cancel_fee_auto} ≠ ${pctSen(l.total_price, tierPct[l.cancel_tier] ?? 0) / 100}`);
+        if (l.cancel_fee == null || sen(l.cancel_fee) < 0 || sen(l.cancel_fee) > sen(l.total_price))
+          v.dayFee.push(`${name} day ${l.total_price} fee ${l.cancel_fee} outside 0..price`);
       }
       const chargesSen = o.adjustments.filter((a) => a.is_billable).reduce((s, a) => s + sen(a.amount) * (a.quantity ?? 1), 0);
       if (T !== dayBillable + chargesSen) v.dayFee.push(`${name} total ${o.final_price} ≠ Σ dayBillable + charges ${(dayBillable + chargesSen) / 100}`);
@@ -3041,7 +3160,7 @@ await section('R. Order money, saldo lebih, money received, refunds, locks, clie
   check('R33e [INV-6] covered + open_billed ≤ total on every order (cancelled ones too)', v.cap.length === 0, head(v.cap));
   check('R33h [INV-5, INV-8] covered ≤ total on every order; one OVERPAYMENT entry per overpaid invoice (= the difference); one REFUND entry per refund (= its amount)', v.ledger.length === 0, head(v.ledger));
   check('R33i [INV-9] payment_status follows Net, the total and the DP base on every order', v.status.length === 0, head(v.status));
-  check('R33j [A3] per-day fees: every cancelled day with a tier has fee = pctRupiah(price, 20/50/100); DAY_V2 cancellation_fee = Σ day fees; total = Σ dayBillable + charges (legacy ORDER_V1 excluded)', v.dayFee.length === 0, head(v.dayFee));
+  check('R33j [A3] per-day fees: every cancelled day with a tier has cancel_fee_auto = pctRupiah(price, 20/50/100) and cancel_fee within 0..price; DAY_V2 cancellation_fee = Σ day fees; total = Σ dayBillable + charges (legacy ORDER_V1 excluded)', v.dayFee.length === 0, head(v.dayFee));
 });
 
 const failed = summary();

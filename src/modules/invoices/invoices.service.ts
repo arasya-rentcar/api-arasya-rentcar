@@ -167,11 +167,17 @@ function paymentLines(
   }));
 }
 
-/** "(Dibatalkan — biaya pembatalan 20%)": the tag of a day cancelled with a fee. */
-function cancelFeeTag(tier: unknown): string {
-  const pct = TIER_PCT[Number(tier) as DayCancelTier];
-  return pct ? `(Dibatalkan — biaya pembatalan ${pct}%)` : "(Dibatalkan — biaya pembatalan)";
+/**
+ * "(Dibatalkan — biaya pembatalan 20%)": the tag of a day cancelled with a
+ * fee. A fee set by hand (cancel_fee ≠ cancel_fee_auto, owner 8 Oct 2026)
+ * prints no %: the tier's % is not what it charges.
+ */
+function cancelFeeTag(item: { cancel_tier?: number | null; cancel_fee?: unknown; cancel_fee_auto?: unknown }): string {
+  const manual = item.cancel_fee_auto != null && sen(item.cancel_fee_auto) !== sen(item.cancel_fee);
+  return feeTag(manual ? null : TIER_PCT[Number(item.cancel_tier) as DayCancelTier]);
 }
+const feeTag = (pct: number | null | undefined) =>
+  pct ? `(Dibatalkan — biaya pembatalan ${pct}%)` : "(Dibatalkan — biaya pembatalan)";
 
 /**
  * One service day as a PDF line item (invoice, kwitansi, statement). A
@@ -194,13 +200,14 @@ function serviceItemToLineItem(
     total_price: unknown;
     line_status: string;
     cancel_fee?: unknown;
+    cancel_fee_auto?: unknown;
     cancel_tier?: number | null;
   },
   withFee = true,
 ) {
   const cancelled = item.line_status === "CANCELLED";
   const fee = cancelled && withFee && item.cancel_fee != null ? Number(item.cancel_fee) : null;
-  const tag = fee != null ? cancelFeeTag(item.cancel_tier) : "(Dibatalkan)";
+  const tag = fee != null ? cancelFeeTag(item) : "(Dibatalkan)";
   return {
     serviceDate: item.service_date,
     description: cancelled
@@ -294,7 +301,7 @@ async function rentalDocumentItems(
     if (invoiceType !== "CANCELLATION_FEE") return order.service_items.map((i) => serviceItemToLineItem(i));
     const fees = order.service_items
       .filter((i) => i.line_status === "CANCELLED" && i.cancel_fee != null)
-      .map((i) => cancelFeeLineItem(i.service_date, cancelFeeTag(i.cancel_tier), Number(i.cancel_fee)));
+      .map((i) => cancelFeeLineItem(i.service_date, cancelFeeTag(i), Number(i.cancel_fee)));
     const rest = rp(sen(order.final_price) - fees.reduce((s, f) => s + sen(f.totalPrice), 0)) - otherLines;
     return rest > 0
       ? [...fees, { description: RUN_DAYS_AND_CHARGES, quantity: 1, unitPrice: rest, totalPrice: rest }]
@@ -369,7 +376,8 @@ export async function buildCancellationFeePdf(args: {
     dropoff_location: string;
   };
   /** Every cancelled day of the order (earlier ones too), one line each. */
-  days: { date: Date | null; price: number; pct: number; fee: number }[];
+  /** pct null: a fee set by hand (printed without a %). */
+  days: { date: Date | null; price: number; pct: number | null; fee: number }[];
   /** The order total after the cancellation (T_new = Σ done day prices + Σ fees + charges). */
   total: number;
   /** Money already settling the total (Covered = Net − saldo lebih). */
@@ -392,7 +400,7 @@ export async function buildCancellationFeePdf(args: {
   // One fee line per cancelled day (finance design §8), then the rest of T
   // (days that ran, charges billed in full), so the lines add up to T.
   const items = args.days.map((d) =>
-    cancelFeeLineItem(d.date, `(Dibatalkan — biaya pembatalan ${d.pct}%)`, d.fee),
+    cancelFeeLineItem(d.date, feeTag(d.pct), d.fee),
   );
   const rest = rp(sen(args.total) - args.days.reduce((s, d) => s + sen(d.fee), 0));
   if (rest > 0) items.push({ description: RUN_DAYS_AND_CHARGES, quantity: 1, unitPrice: rest, totalPrice: rest });

@@ -16,9 +16,9 @@ import {
 import { assertOpenWithinTotal, computeOrderMoney, moneyState, settleCredit } from '../orders/order-money';
 import {
   cancelDecisionTime,
+  dayArrivedBy,
   dayCancellation,
   dayDateOf,
-  dayStarted,
   TIER_PCT,
   type DayCancellation,
 } from '../orders/cancellation-policy';
@@ -337,9 +337,12 @@ export async function assignScheduleLine(
   // Per-day cancellation fee (A3, owner 7 Oct 2026). The fee is worked out
   // from the day's own WIB date and price at the decision time (the save, or
   // when the customer asked) and stored on the day; it stays part of the
-  // order total. A day already done keeps its price (Q7).
+  // order total. A day already done keeps its price (Q7). The admin may
+  // charge another fee by hand (`cancel_fee`, owner 8 Oct 2026); the
+  // automatic one stays what `expected_cancel_fee` and the re-check compare.
   const now = new Date();
   let cancellation: DayCancellation | null = null;
+  let chargedFee = 0;
   let cancelRequestedAt: Date | null = null;
   let cancelDecidedAt: Date | null = null;
   if (becomesCancelled) {
@@ -354,7 +357,7 @@ export async function assignScheduleLine(
     cancellation = dayCancellation({
       price: Number(line.total_price),
       dayDate: dayDateOf(line, line.order.service_start_at),
-      started: dayStarted(line),
+      arrived: dayArrivedBy(line, when.decidedAt),
       decidedAt: when.decidedAt,
     });
     if (
@@ -368,6 +371,14 @@ export async function assignScheduleLine(
         { code: 'CANCEL_FEE_CHANGED', quote },
       );
     }
+    if (input.cancel_fee !== undefined && toSen(input.cancel_fee) > toSen(line.total_price)) {
+      throw new AppError(
+        `Biaya pembatalan paling banyak harga hari ini, ${rupiah(Number(line.total_price))}.`,
+        400,
+        { code: 'INVALID_CANCEL_FEE' },
+      );
+    }
+    chargedFee = input.cancel_fee ?? cancellation.fee;
   }
   const started = !!(line.actual_start_at || line.trip_started_at);
   const paidPayable =
@@ -478,7 +489,8 @@ export async function assignScheduleLine(
     data.end_at = input.end_at ? new Date(input.end_at) : null;
   if (input.notes !== undefined) data.notes = input.notes;
   if (cancellation) {
-    data.cancel_fee = cancellation.fee;
+    data.cancel_fee = chargedFee;
+    data.cancel_fee_auto = cancellation.fee;
     data.cancel_tier = cancellation.tier;
     data.cancelled_at = now;
     data.cancel_reason = input.cancel_reason ?? null;
@@ -490,6 +502,7 @@ export async function assignScheduleLine(
     line.line_status === 'CANCELLED' && data.line_status !== undefined && data.line_status !== 'CANCELLED';
   if (reopens) {
     data.cancel_fee = null;
+    data.cancel_fee_auto = null;
     data.cancel_tier = null;
     data.cancelled_at = null;
     data.cancel_reason = null;
@@ -531,31 +544,37 @@ export async function assignScheduleLine(
         {
           line_status: string;
           total_price: Prisma.Decimal | null;
-          actual_start_at: Date | null;
-          trip_started_at: Date | null;
+          actual_pickup_at: Date | null;
+          customer_onboard_at: Date | null;
         }[]
       >`
-        SELECT line_status::text AS line_status, total_price, actual_start_at, trip_started_at
+        SELECT line_status::text AS line_status, total_price, actual_pickup_at, customer_onboard_at
         FROM "order_service_items" WHERE id = ${id} FOR NO KEY UPDATE`;
       if (cur?.line_status === 'DONE') throw new AppError(DONE_DAY_MESSAGE, 409, { code: 'DONE_DAY' });
       if (cur?.line_status === 'CANCELLED') {
         delete data.cancel_fee;
+        delete data.cancel_fee_auto;
         delete data.cancel_tier;
         delete data.cancelled_at;
         delete data.cancel_reason;
         delete data.cancel_requested_at;
         cancellation = null;
       } else if (cur) {
-        // The fee above was worked out before the lock: the driver starting
-        // the day or Edit Order repricing it meanwhile changes the tier or
-        // the price. Charge only what the admin was shown.
+        // The fee above was worked out before the lock: the driver arriving
+        // at the pickup or Edit Order repricing the day meanwhile changes the
+        // tier or the price. Charge only what the admin was shown (a fee set
+        // by hand must still fit the price).
         const fresh = dayCancellation({
           price: Number(cur.total_price ?? 0),
           dayDate: dayDateOf(line, line.order.service_start_at),
-          started: dayStarted(cur),
+          arrived: dayArrivedBy(cur, cancelDecidedAt ?? now),
           decidedAt: cancelDecidedAt ?? now,
         });
-        if (fresh.tier !== cancellation.tier || toSen(fresh.fee) !== toSen(cancellation.fee)) {
+        if (
+          fresh.tier !== cancellation.tier ||
+          toSen(fresh.fee) !== toSen(cancellation.fee) ||
+          toSen(chargedFee) > toSen(cur.total_price)
+        ) {
           const quote = await lineCancelQuote(id, input.cancel_requested_at, now);
           throw new AppError(
             `Biaya pembatalan hari ini sekarang ${rupiah(fresh.fee)} (${fresh.pct}%), bukan ${rupiah(cancellation.fee)}. Periksa lalu simpan lagi.`,
@@ -614,7 +633,9 @@ export async function assignScheduleLine(
           field: 'line_status',
           old_value: `${line.line_status} (${dayLabelForLog(line)}, Rp ${Number(line.total_price)})`,
           new_value: cancellation
-            ? `CANCELLED — ${cancellation.label}: Rp ${cancellation.fee}`
+            ? chargedFee !== cancellation.fee
+              ? `CANCELLED — ${manualFeeLog(chargedFee, cancellation)}`
+              : `CANCELLED — ${cancellation.label}: Rp ${cancellation.fee}`
             : `${String(data.line_status)} (dibuka lagi, biaya pembatalan Rp ${Number(line.cancel_fee ?? 0)} dihapus)`,
           note: cancellation
             ? [
@@ -665,13 +686,20 @@ export async function assignScheduleLine(
   return {
     ...withStartReady(updated),
     confirmation_state: deriveState(updated),
-    ...(cancellation ? { cancellation } : {}),
+    // `fee` = the fee charged; tier / pct / label / fee_auto = the automatic one.
+    ...(cancellation
+      ? { cancellation: { ...cancellation, fee: chargedFee, fee_auto: cancellation.fee, manual: chargedFee !== cancellation.fee } }
+      : {}),
     ...(orderMoney ? { order_money: orderMoney } : {}),
   };
 }
 
 const DONE_DAY_MESSAGE =
   'Hari ini sudah selesai, jadi tidak bisa dibatalkan. Harga hari yang sudah berjalan tetap ditagih.';
+
+/** The log text of a fee set by hand (owner, 8 Oct 2026). */
+export const manualFeeLog = (fee: number, auto: { fee: number; pct: number }) =>
+  `Biaya pembatalan diisi manual ${rupiah(fee)} (otomatis ${rupiah(auto.fee)}, ${auto.pct}%)`;
 
 const dayLabelForLog = (l: { service_date: Date | null; start_at: Date | null }) => {
   const d = l.service_date ?? l.start_at;
@@ -685,7 +713,9 @@ export type LineCancelBlock = null | 'LAST_OPEN_DAY' | 'OPEN_INVOICE_EXCEEDS' | 
  * this day in Edit Hari would charge now (or at `requestedAt`, the customer's
  * request time) and do to the order's money. Read-only; the save computes
  * the same rule again (R3) and answers 409 CANCEL_FEE_CHANGED when its fee
- * differs from the `expected_cancel_fee` the admin saw.
+ * differs from the `expected_cancel_fee` the admin saw. `fee` / `tier` /
+ * `pct` are the automatic ones; `price` bounds a fee set by hand; `arrived`
+ * = the driver was at the pickup by the decision time.
  */
 export async function lineCancelQuote(id: string, requestedAt?: string, now = new Date()) {
   const when = cancelDecisionTime(requestedAt, now);
@@ -707,7 +737,7 @@ export async function lineCancelQuote(id: string, requestedAt?: string, now = ne
   const m = await moneyState(prisma, line.order_id);
   if (!m) throw new AppError('Order not found', 404);
   const price = Number(line.total_price);
-  const started = dayStarted(line);
+  const arrived = dayArrivedBy(line, when.decidedAt);
   let quote: { tier: number; pct: number; fee: number; label: string };
   let blocked: LineCancelBlock = null;
   if (line.line_status === 'CANCELLED') {
@@ -723,7 +753,7 @@ export async function lineCancelQuote(id: string, requestedAt?: string, now = ne
     quote = dayCancellation({
       price,
       dayDate: dayDateOf(line, line.order.service_start_at),
-      started,
+      arrived,
       decidedAt: when.decidedAt,
     });
     if (line.line_status === 'DONE') blocked = 'DONE_DAY';
@@ -741,7 +771,7 @@ export async function lineCancelQuote(id: string, requestedAt?: string, now = ne
     price,
     fee: quote.fee,
     label: quote.label,
-    started,
+    arrived,
     blocked,
     new_total: newTotal / 100,
     net_paid: m.net / 100,

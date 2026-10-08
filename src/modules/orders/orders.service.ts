@@ -24,9 +24,9 @@ import { attachLeadToOrder } from "../leads/leads.service";
 import { notifyNewTrips, notifyTripsChanged, notifyTripsRemoved } from "../../services/tripNotify";
 import { defaultDriverFee } from "../../utils/driverFee";
 import { computeMargin, MARGIN_FORMULA_VERSION } from "../../utils/margin";
-import { cancelDecisionTime, dayCancellation, dayDateOf, dayStarted, TIER_PCT } from "./cancellation-policy";
+import { cancelDecisionTime, dayArrivedBy, dayCancellation, dayDateOf, TIER_PCT } from "./cancellation-policy";
 import { recomputeLineMoney } from "../schedule/line-money.service";
-import { rollupOrderFinance } from "../schedule/schedule.service";
+import { manualFeeLog, rollupOrderFinance } from "../schedule/schedule.service";
 import { assertUnitsFree, lockUnits } from "../schedule/availability";
 import { nextOrderCode } from "../../utils/codes";
 import { wibShortDay } from "../../utils/wib";
@@ -1941,9 +1941,10 @@ type PlanDay = {
   total_price: unknown;
   service_date: Date | null;
   start_at: Date | null;
-  actual_start_at: Date | null;
-  trip_started_at: Date | null;
+  actual_pickup_at: Date | null;
+  customer_onboard_at: Date | null;
   cancel_fee: unknown;
+  cancel_fee_auto: unknown;
   cancel_tier: number | null;
 };
 
@@ -1951,10 +1952,16 @@ export interface CancelPlanDay {
   id: string;
   date: string | null;
   price: number;
-  started: boolean;
+  /** The driver was at the pickup by the decision time (dayArrivedBy). */
+  arrived: boolean;
+  /** The automatic tier / pct (dayCancellation). */
   tier: 1 | 2 | 3;
   pct: 20 | 50 | 100;
+  /** The fee charged: `fee_auto`, or the one set by hand (`day_fees`). */
   fee: number;
+  /** The automatic fee. */
+  fee_auto: number;
+  manual: boolean;
   label: string;
 }
 
@@ -1972,6 +1979,10 @@ export interface CancelPlanDay {
  *    first, a CANCELLATION_FEE invoice asks for the rest. gross ≤ 0: the
  *    excess becomes saldo lebih (RELEASE).
  *
+ * `dayFees` (owner, 8 Oct 2026): fees set by hand for some of the days
+ * cancelled now (line id → whole rupiah, checked by dayFeeMap); every sum
+ * above uses them. Without it the plan is the automatic one.
+ *
  * Pure over its inputs: GET /orders/:id/cancel-quote shows it and cancelOrder
  * recomputes it under the locks, so the two agree (R8).
  */
@@ -1981,8 +1992,9 @@ function cancelPlan(args: {
   money: { net: number; credit: number; charges: number };
   unpaid: { id: string; invoice_number: string; amount: unknown; credit_applied: unknown }[];
   decidedAt: Date;
+  dayFees?: Map<string, number>;
 }) {
-  const { days, money, unpaid, decidedAt } = args;
+  const { days, money, unpaid, decidedAt, dayFees } = args;
   const toCancel: CancelPlanDay[] = [];
   let doneSen = 0;
   let earlierSen = 0;
@@ -1991,14 +2003,18 @@ function cancelPlan(args: {
     else if (d.line_status === "CANCELLED") earlierSen += sen(d.cancel_fee);
     else {
       const date = dayDateOf(d, args.orderStart);
-      const started = dayStarted(d);
-      const q = dayCancellation({ price: Number(d.total_price), dayDate: date, started, decidedAt });
+      const arrived = dayArrivedBy(d, decidedAt);
+      const q = dayCancellation({ price: Number(d.total_price), dayDate: date, arrived, decidedAt });
+      const fee = dayFees?.get(d.id) ?? q.fee;
       toCancel.push({
         id: d.id,
         date: date ? date.toISOString() : null,
         price: Number(d.total_price),
-        started,
+        arrived,
         ...q,
+        fee,
+        fee_auto: q.fee,
+        manual: fee !== q.fee,
       });
     }
   }
@@ -2042,18 +2058,23 @@ const planDaySelect = {
   total_price: true,
   service_date: true,
   start_at: true,
-  actual_start_at: true,
-  trip_started_at: true,
+  actual_pickup_at: true,
+  customer_onboard_at: true,
   cancel_fee: true,
+  cancel_fee_auto: true,
   cancel_tier: true,
 } as const;
 
-/** The plan from the database (prisma or a transaction), for one order. */
+/**
+ * The plan from the database (prisma or a transaction), for one order:
+ * `auto` without and `plan` with the fees set by hand (the same when none).
+ */
 async function loadCancelPlan(
   db: Prisma.TransactionClient | typeof prisma,
   orderId: string,
   orderStart: Date | null,
   decidedAt: Date,
+  dayFees?: Map<string, number>,
 ) {
   const [days, m, unpaid] = await Promise.all([
     db.orderServiceItem.findMany({
@@ -2069,11 +2090,33 @@ async function loadCancelPlan(
     }),
   ]);
   if (!m) throw new AppError("Order not found", 404);
+  const auto = cancelPlan({ orderStart, days, money: m, unpaid, decidedAt });
   return {
     days,
     money: m,
-    plan: cancelPlan({ orderStart, days, money: m, unpaid, decidedAt }),
+    auto,
+    plan: dayFees?.size ? cancelPlan({ orderStart, days, money: m, unpaid, decidedAt, dayFees }) : auto,
   };
+}
+
+/**
+ * The fees set by hand in Batalkan Pesanan (`day_fees`, owner 8 Oct 2026):
+ * only days this cancel cancels, once each, whole rupiah within the day's
+ * price; else 400 INVALID_CANCEL_FEE.
+ */
+function dayFeeMap(dayFees: { line_id: string; fee: number }[] | undefined, auto: CancelPlan) {
+  const out = new Map<string, number>();
+  const days = new Map(auto.days.map((d) => [d.id, d]));
+  for (const f of dayFees ?? []) {
+    const bad = (msg: string) => new AppError(msg, 400, { code: "INVALID_CANCEL_FEE", line_id: f.line_id });
+    const d = days.get(f.line_id);
+    if (!d) throw bad("Biaya manual hanya untuk hari yang ikut dibatalkan sekarang.");
+    if (out.has(f.line_id)) throw bad("Biaya manual satu hari diisi dua kali.");
+    if (!Number.isInteger(f.fee) || f.fee < 0) throw bad("Biaya pembatalan harus rupiah bulat, tidak minus.");
+    if (sen(f.fee) > sen(d.price)) throw bad(`Biaya pembatalan paling banyak harga harinya, ${rupiah(d.price)}.`);
+    out.set(f.line_id, f.fee);
+  }
+  return out;
 }
 
 /** The refusals Batalkan Pesanan and its quote share. */
@@ -2141,7 +2184,7 @@ export async function orderCancelQuote(orderId: string, requestedAt?: string) {
 export interface CancelOrderResult {
   /** Highest tier among the days cancelled now. */
   tier: 1 | 2 | 3;
-  /** Σ cancellation fees of every cancelled day (= orders.cancellation_fee). */
+  /** Σ fees charged of every cancelled day (= orders.cancellation_fee). */
   penalty: number;
   originalFinalPrice: number;
   /** Money received (paid_to_date). */
@@ -2155,7 +2198,10 @@ export interface CancelOrderResult {
   rule: "DAY_V2";
   days: CancelPlanDay[];
   earlierFeeTotal: number;
+  /** Σ fees charged (the ones set by hand included) = penalty. */
   feeTotal: number;
+  /** The automatic total of the days cancelled now + earlierFeeTotal. */
+  autoFeeTotal: number;
   newTotal: number;
   netPaid: number;
   creditBalance: number;
@@ -2201,6 +2247,7 @@ export async function cancelOrder(
     expected_fee_total?: number;
     requested_at?: string;
     client_ref?: string;
+    day_fees?: { line_id: string; fee: number }[];
   },
 ): Promise<CancelOrderResult> {
   const { reason, actor } = input;
@@ -2220,16 +2267,28 @@ export async function cancelOrder(
   const replayed = cancelReplay(order, ref);
   if (replayed) return replayed;
   if (ref) await assertCancelRefFree(orderId, ref);
-  const before = await loadCancelPlan(prisma, orderId, order.service_start_at, decidedAt);
-  assertCancellable(order, before.days);
+  const auto = await loadCancelPlan(prisma, orderId, order.service_start_at, decidedAt);
+  assertCancellable(order, auto.days);
+  // `expected_fee_total` is the AUTOMATIC total the admin was shown; the fees
+  // set by hand (`day_fees`) replace the automatic fee of their days only.
   if (
     input.expected_fee_total !== undefined &&
-    sen(input.expected_fee_total) !== before.plan.feeTotalSen
+    sen(input.expected_fee_total) !== auto.auto.feeTotalSen
   ) {
     throw new AppError(
-      `Biaya pembatalan sekarang ${rupiah(rp(before.plan.feeTotalSen))}, bukan ${rupiah(input.expected_fee_total)}. Periksa rinciannya lalu batalkan lagi.`,
+      `Biaya pembatalan sekarang ${rupiah(rp(auto.auto.feeTotalSen))}, bukan ${rupiah(input.expected_fee_total)}. Periksa rinciannya lalu batalkan lagi.`,
       409,
-      { code: "CANCEL_FEE_CHANGED", quote: planView(before.plan, before.money, decidedAt, when.requestedAt) },
+      { code: "CANCEL_FEE_CHANGED", quote: planView(auto.auto, auto.money, decidedAt, when.requestedAt) },
+    );
+  }
+  const dayFees = dayFeeMap(input.day_fees, auto.auto);
+  const before = dayFees.size
+    ? await loadCancelPlan(prisma, orderId, order.service_start_at, decidedAt, dayFees)
+    : auto;
+  if (dayFees.size && !samePlan(before.auto, auto.auto)) {
+    throw new AppError(
+      "Ada perubahan pada hari, invoice atau pembayaran order ini saat pesanan dibatalkan. Coba batalkan lagi.",
+      409,
     );
   }
   const originalFinalPrice = Number(order.final_price);
@@ -2242,10 +2301,14 @@ export async function cancelOrder(
       .map((d) => {
         const q = now.get(d.id);
         const tier = (q?.tier ?? d.cancel_tier ?? 1) as 1 | 2 | 3;
+        // A fee set by hand prints no % (it is not the tier's).
+        const manual = q
+          ? q.manual
+          : d.cancel_fee_auto != null && sen(d.cancel_fee_auto) !== sen(d.cancel_fee);
         return {
           date: dayDateOf(d, order.service_start_at),
           price: Number(d.total_price),
-          pct: TIER_PCT[tier],
+          pct: manual ? null : TIER_PCT[tier],
           fee: q ? q.fee : Number(d.cancel_fee ?? 0),
         };
       });
@@ -2302,10 +2365,12 @@ export async function cancelOrder(
       // cancelled or repriced, a payment or an invoice since the plan was
       // worked out (and its PDF built) changes what is owed: stop and let the
       // admin retry.
-      const locked = await loadCancelPlan(tx, orderId, order.service_start_at, decidedAt);
+      const locked = await loadCancelPlan(tx, orderId, order.service_start_at, decidedAt, dayFees);
       if (allDaysEnded(locked.days)) throw new AppError(ALL_DAYS_DONE_MESSAGE, 409);
       const plan = locked.plan;
-      if (!samePlan(plan, before.plan)) {
+      // The automatic plan decides (expected_fee_total was checked on it);
+      // the one with the fees set by hand is what the PDF was built from.
+      if (!samePlan(locked.auto, before.auto) || !samePlan(plan, before.plan)) {
         throw new AppError(
           "Ada perubahan pada hari, invoice atau pembayaran order ini saat pesanan dibatalkan. Coba batalkan lagi.",
           409,
@@ -2370,6 +2435,7 @@ export async function cancelOrder(
             ...release,
             line_status: "CANCELLED",
             cancel_fee: q.fee,
+            cancel_fee_auto: q.fee_auto,
             cancel_tier: q.tier,
             cancelled_at: now,
             cancel_reason: reason,
@@ -2478,6 +2544,7 @@ export async function cancelOrder(
         days: plan.days,
         earlierFeeTotal: rp(plan.earlierFeeSen),
         feeTotal: rp(plan.feeTotalSen),
+        autoFeeTotal: rp(locked.auto.feeTotalSen),
         newTotal: rp(after.total),
         netPaid: rp(after.net),
         creditBalance: rp(after.credit),
@@ -2546,7 +2613,10 @@ async function assertCancelRefFree(orderId: string, ref: string) {
 /** One line for the invoice note and the change log: the fee of each day. */
 function feeSummary(plan: CancelPlan): string {
   const parts = plan.days.map(
-    (d) => `${d.date ? wibShortDay(new Date(d.date)) : "tanpa tanggal"} ${d.pct}% ${rupiah(d.fee)}`,
+    (d) =>
+      `${d.date ? wibShortDay(new Date(d.date)) : "tanpa tanggal"} ${
+        d.manual ? manualFeeLog(d.fee, { fee: d.fee_auto, pct: d.pct }) : `${d.pct}% ${rupiah(d.fee)}`
+      }`,
   );
   const earlier = plan.earlierFeeSen > 0 ? `; dibatalkan sebelumnya ${rupiah(rp(plan.earlierFeeSen))}` : "";
   return `Biaya pembatalan per hari: ${parts.join(", ")}${earlier}`;

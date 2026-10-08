@@ -9,7 +9,7 @@
  * it here only. Must say the same as dayCancellation below and the website.
  */
 export const CANCELLATION_POLICY_TEXT =
-  "Pembatalan dihitung per hari sewa dari harga hari tersebut: batal paling lambat sehari sebelumnya 20%; batal pada hari sewa sebelum pukul 10.00 WIB dan driver belum berangkat 50%; batal pada hari sewa mulai pukul 10.00 WIB atau setelah driver berangkat 100%. Biaya tambahan yang sudah terpakai dibayar penuh. Kelebihan bayar dipotongkan ke tagihan berikutnya atau dikembalikan bila diminta.";
+  "Pembatalan dihitung per hari sewa dari harga hari tersebut: batal paling lambat sehari sebelumnya 20%; batal pada hari sewa sebelum pukul 10.00 WIB dan driver belum tiba di alamat jemput 50%; batal pada hari sewa mulai pukul 10.00 WIB atau setelah driver tiba di alamat jemput 100%. Biaya tambahan yang sudah terpakai dibayar penuh. Kelebihan bayar dipotongkan ke tagihan berikutnya atau dikembalikan bila diminta.";
 
 // ── Jakarta timezone helpers ──────────────────────────────────────────────
 const JAKARTA_OFFSET_MS = 7 * 60 * 60 * 1000;
@@ -118,22 +118,24 @@ export interface DayCancellation {
  *
  *  - decided on a WIB day before the day's date           → tier 1, 20%
  *  - on the day's date, before 10:00:00.000 WIB, and the
- *    trip has not started (driver still at the garage)     → tier 2, 50%
- *  - otherwise (from 10:00:00.000, started, or after it)   → tier 3, 100%
+ *    driver has not arrived at the pickup yet              → tier 2, 50%
+ *  - otherwise (from 10:00:00.000, arrived, or after it)   → tier 3, 100%
  *
  * `dayDate`: the day's service_date (fallbacks start_at, then the order's
- * service_start_at, chosen by the caller); none → tier 1. `started`:
- * actual_start_at / trip_started_at set or line_status IN_PROGRESS / DONE
- * (dayStarted). `decidedAt`: the save time, or the customer's request time
- * when the admin gives one. Partner days use the same tiers.
+ * service_start_at, chosen by the caller); none → tier 1. `arrived`: the
+ * driver was at the pickup by `decidedAt` (dayArrivedBy; leaving the garage
+ * alone does not count, owner 8 Oct 2026). `decidedAt`: the save time, or
+ * the customer's request time when the admin gives one. Partner days use the
+ * same tiers. This is the automatic fee; the admin may charge another one by
+ * hand (stored as cancel_fee, this one as cancel_fee_auto).
  */
 export function dayCancellation(args: {
   price: number | string;
   dayDate: Date | string | null | undefined;
-  started: boolean;
+  arrived: boolean;
   decidedAt: Date;
 }): DayCancellation {
-  const { price, dayDate, started, decidedAt } = args;
+  const { price, dayDate, arrived, decidedAt } = args;
   const make = (tier: DayCancelTier, why: string): DayCancellation => ({
     tier,
     pct: TIER_PCT[tier],
@@ -145,7 +147,7 @@ export function dayCancellation(args: {
   const day = jakartaDate(dayDate);
   if (decidedDay < day) return make(1, "dibatalkan sebelum hari sewa");
   if (decidedDay === day) {
-    if (started) return make(3, "driver sudah berangkat");
+    if (arrived) return make(3, "driver sudah tiba di alamat jemput");
     const msOfWibDay = (decidedAt.getTime() + JAKARTA_OFFSET_MS) % 86_400_000;
     if (msOfWibDay < 10 * 3_600_000) return make(2, "hari sewa, sebelum pukul 10.00 WIB");
     return make(3, "hari sewa, mulai pukul 10.00 WIB");
@@ -153,18 +155,23 @@ export function dayCancellation(args: {
   return make(3, "setelah hari sewa");
 }
 
-/** "Started" for the tiers: the driver left the garage (owner, 7 Oct 2026). */
-export function dayStarted(day: {
-  actual_start_at?: Date | null;
-  trip_started_at?: Date | null;
-  line_status: string;
-}): boolean {
-  return (
-    !!day.actual_start_at ||
-    !!day.trip_started_at ||
-    day.line_status === "IN_PROGRESS" ||
-    day.line_status === "DONE"
-  );
+/**
+ * "Arrived" for the tiers (owner, 8 Oct 2026): the driver was at the pickup
+ * address by `at`, the decision time (a back-dated request time counts only
+ * an arrival before it). Arrival = actual_pickup_at, or customer_onboard_at
+ * (onboarding without the arrive tap), or the day DONE. Leaving the garage
+ * (actual_start_at, trip_started_at, IN_PROGRESS) does not count.
+ */
+export function dayArrivedBy(
+  day: {
+    actual_pickup_at?: Date | null;
+    customer_onboard_at?: Date | null;
+    line_status: string;
+  },
+  at: Date,
+): boolean {
+  const by = (t: Date | null | undefined) => !!t && new Date(t).getTime() <= at.getTime();
+  return by(day.actual_pickup_at) || by(day.customer_onboard_at) || day.line_status === "DONE";
 }
 
 /** The date a day's tier is decided from: service_date, start_at, then the order's start. */
