@@ -50,6 +50,17 @@ export const assignScheduleLineSchema = z
     // is derived from the approved trip costs (recomputeLineMoney).
     ops_cost: z.number().nonnegative().optional(),
     notes: z.string().nullable().optional(),
+    // Per-day cancellation (A3), read only when line_status turns CANCELLED:
+    // the reason (required then), the fee the admin saw in the quote (a
+    // different server fee → 409 CANCEL_FEE_CHANGED) and when the customer
+    // asked to cancel (≤ now, ≥ now − 3 days; the tier follows it).
+    // `expected_cancel_fee` is always the AUTOMATIC fee; `cancel_fee` is the
+    // fee set by hand (owner, 8 Oct 2026; whole rupiah, ≤ the day's price,
+    // else 400 INVALID_CANCEL_FEE), absent = the automatic fee.
+    cancel_reason: z.string().trim().min(1).max(500).optional(),
+    expected_cancel_fee: z.number().nonnegative().optional(),
+    cancel_fee: z.number().int('Biaya pembatalan harus rupiah bulat').nonnegative().optional(),
+    cancel_requested_at: z.string().datetime({ offset: true }).optional(),
   })
   .strict();
 export type AssignScheduleLineInput = z.infer<typeof assignScheduleLineSchema>;
@@ -93,3 +104,8 @@ export const scheduleWeekQuerySchema = z.object({
   resource: z.enum(['drivers', 'cars']).default('drivers'),
 });
 export type ScheduleWeekQuery = z.infer<typeof scheduleWeekQuerySchema>;
+
+// GET /schedule/lines/:id/cancel-quote and GET /orders/:id/cancel-quote.
+export const cancelQuoteQuerySchema = z.object({
+  requested_at: z.string().datetime({ offset: true }).optional(),
+});

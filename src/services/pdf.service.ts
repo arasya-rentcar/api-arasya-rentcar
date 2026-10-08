@@ -10,6 +10,7 @@ import fs from "fs";
 import path from "path";
 import prisma from "../prisma/client";
 import { logger } from "../config/logger";
+import { CANCELLATION_POLICY_TEXT } from "../modules/orders/cancellation-policy";
 
 export interface InvoiceLineItem {
   serviceDate?: Date | string | null;
@@ -68,6 +69,9 @@ export interface InvoiceData {
   showPaidStamp?: boolean;
   // Free-form footer notes shown under the table (pickup/dropoff/inclusions).
   noteLines?: string[];
+  // Document title printed top-right instead of "INVOICE" (e.g. "Invoice
+  // Biaya Pembatalan"); a long title is printed smaller.
+  title?: string;
   // Optional extra "additional charges" section (combined invoice).
   additionalItems?: InvoiceLineItem[];
 }
@@ -90,12 +94,9 @@ const COMPANY = {
     "(2) Pelunasan dibayarkan di hari pertama pelayanan.\n" +
     "(3) Tambahan overtime, reimburse parkir, atau biaya lain yang terjadi (jika ada), " +
     "dibayarkan maksimal H+2 dari selesai kegiatan",
-  // Same tiers as computeCancellationPenalty (orders/cancellation-policy.ts) and the DP caption.
-  cancellation:
-    "Cancellation policy:\n" +
-    "Cancel sebelum hari H = 20% dari total pesanan (DP hangus).\n" +
-    "Cancel hari H sebelum pukul 10.00 WIB (perjalanan belum dimulai) = 50% dari total pesanan.\n" +
-    "Cancel setelahnya = 100% dari total pesanan.",
+  // The one policy text (orders/cancellation-policy.ts), same as the WhatsApp
+  // captions and dayCancellation.
+  cancellation: "Cancellation policy:\n" + CANCELLATION_POLICY_TEXT,
   thankYou: "THANK YOU FOR YOUR BUSINESS!",
 };
 
@@ -258,8 +259,8 @@ export async function generateInvoicePDF(data: InvoiceData): Promise<Buffer> {
     ? "STATEMENT"
     : isReceipt
       ? "KUITANSI"
-      : "INVOICE";
-  drawRight(title, y - 24, 26, bold, rgb(0.1, 0.1, 0.1));
+      : sanitizeText(data.title || "INVOICE");
+  drawRight(title, y - 24, title.length > 12 ? 16 : 26, bold, rgb(0.1, 0.1, 0.1));
 
   // Tagline / address / phone (left, under logo)
   let infoY = y - 56;
@@ -629,6 +630,16 @@ export async function generateInvoicePDF(data: InvoiceData): Promise<Buffer> {
       // A settlement (or a revision of it) that bills less than the rest:
       // the TOTAL is what THIS invoice asks, so say what it covers.
       if (Math.round(dueNow) !== Math.round(sisa)) drawTotalRow("Ditagih di invoice ini", formatRp(dueNow));
+      creditRow();
+      divider();
+      drawTotalRow("TOTAL", formatRp(cash(dueNow)), { bold: true, size: 11 });
+    } else if (kind === "CANCELLATION_FEE") {
+      // Invoice Biaya Pembatalan (finance A3): the order total after the
+      // per-day fees, the money already received toward it, the saldo lebih
+      // used, and the cash asked.
+      const alreadyPaid = data.previouslyPaid;
+      drawTotalRow("Total setelah pembatalan", formatRp(total));
+      if (alreadyPaid > 0) drawTotalRow("Sudah dibayar", formatRp(-alreadyPaid));
       creditRow();
       divider();
       drawTotalRow("TOTAL", formatRp(cash(dueNow)), { bold: true, size: 11 });

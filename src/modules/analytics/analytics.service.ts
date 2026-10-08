@@ -1,5 +1,6 @@
 import prisma from '../../prisma/client';
 import { Prisma } from '@prisma/client';
+import { isLegacyCancelled } from '../orders/assignment-guard';
 
 const n = (v: Prisma.Decimal | number | null | undefined) =>
   v == null ? 0 : Number(v);
@@ -501,7 +502,7 @@ export async function revenueReport(opts: RevenueOpts = {}) {
       external_vendor: { select: { id: true, name: true } },
       external_car_id: true,
       external_car: { select: { id: true, model: true, plate_number: true } },
-      order: { select: { order_status: true } },
+      order: { select: { order_status: true, cancellation_rule: true } },
       payable: {
         select: {
           kind: true,
@@ -877,17 +878,30 @@ export async function revenueReport(opts: RevenueOpts = {}) {
 // /orders/:id (order-money.ts); saldo lebih held for customers is shown on
 // its own (customer_credit). ACCRUAL and the order card are unchanged, so
 // MARGIN_FORMULA_VERSION is not bumped.
+// Rule set v3, finance A3 (2026-10-07, MARGIN_FORMULA_VERSION v6): the
+// cancellation fee is per day (finance design §7). A cancelled day books its
+// own cancel_fee on its cancelled_at; the legacy whole-order rule stays for
+// ORDER_V1 orders only. On per-day cancellations the charges stay billed in
+// full and the days that ran keep their price, like the order card.
 //
 //   ACCRUAL
 //     day_revenue   = Σ total_price of days in range (by service_date, WIB)
-//                     whose day and order are not CANCELLED
+//                     that are not CANCELLED, on orders that are not
+//                     CANCELLED by the legacy rule (a DAY_V2 order's days
+//                     that ran still earn)
 //     extra_charges = Σ billable OrderAdjustment (amount × quantity) added in
 //                     range (by created_at), except trip costs billed back at
 //                     cost (linked to an Expense) → pass_through, which is
 //                     neither revenue nor cost
-//     cancellation_income = Σ over orders cancelled in range (cancelled_at) of
+//     cancellation_income =
+//                     Σ cancel_fee of CANCELLED days cancelled in range (the
+//                     day's cancelled_at, WIB), on orders that are not legacy
+//                     (isLegacyCancelled false: DAY_V2, or not cancelled at
+//                     all), charges not subtracted
+//                   + Σ over legacy orders (ORDER_V1, or a fee without a
+//                     rule) cancelled in range (order cancelled_at) of
 //                     cancellation_fee − day prices kept − all billable charges
-//                     (the fee replaces what the cancelled days and charges
+//                     (the fee replaced what the cancelled days and charges
 //                     would have earned)
 //     revenue       = day_revenue + extra_charges + cancellation_income
 //     ops_cost      = Σ OrderServiceItem.ops_cost        ┐ every day in range,
@@ -969,23 +983,31 @@ interface OrderLevelSlice {
   pass_through: number;
 }
 
-// A day earns its price unless it, or its whole order, was cancelled.
-const dayEarns = (l: { line_status: string; order: { order_status: string } | null }) =>
-  l.line_status !== 'CANCELLED' && l.order?.order_status !== 'CANCELLED';
+// A day earns its price unless it, or its whole order, was cancelled. On a
+// per-day cancellation (DAY_V2) the days that ran keep their price (they are
+// in the order total); only a legacy whole-order fee replaced them.
+const dayEarns = (l: {
+  line_status: string;
+  order: { order_status: string; cancellation_rule?: string | null } | null;
+}) =>
+  l.line_status !== 'CANCELLED' &&
+  (l.order?.order_status !== 'CANCELLED' || l.order?.cancellation_rule === 'DAY_V2');
 
 // Order-level income has no unit; it goes to the vendor side only when every
 // day of the order went to a partner.
 const orderChannel = (days: { is_external: boolean }[]): 'internal' | 'vendor' =>
   days.length > 0 && days.every((d) => d.is_external) ? 'vendor' : 'internal';
 
-// Income that belongs to an order, not to one day (rules in the header):
-// extra charges by the date they were added (a later day edit never moves
-// them to another month), cancellation fees by the cancellation date.
+// Income that belongs to an order, not to one day's price (rules in the
+// header): extra charges by the date they were added (a later day edit never
+// moves them to another month), cancellation fees by the cancellation date:
+// a per-day fee by its day's cancelled_at, a legacy whole-order fee by the
+// order's.
 async function orderLevelSlice(
   start: Date,
   end: Date,
 ): Promise<OrderLevelSlice & { by_channel: Record<'internal' | 'vendor', number> }> {
-  const [charges, cancelled] = await Promise.all([
+  const [charges, cancelled, cancelledDays] = await Promise.all([
     prisma.orderAdjustment.findMany({
       where: { is_billable: true, created_at: { gte: start, lte: end } },
       select: {
@@ -1000,6 +1022,7 @@ async function orderLevelSlice(
       select: {
         order_status: true,
         cancellation_fee: true,
+        cancellation_rule: true,
         service_items: {
           select: { line_status: true, total_price: true, is_external: true },
         },
@@ -1007,6 +1030,20 @@ async function orderLevelSlice(
           where: { is_billable: true },
           select: { amount: true, quantity: true },
         },
+      },
+    }),
+    // Days cancelled with their own fee (A3), also on orders that are not
+    // cancelled at all (a day cancelled in Edit Hari).
+    prisma.orderServiceItem.findMany({
+      where: {
+        line_status: 'CANCELLED',
+        cancel_fee: { not: null },
+        cancelled_at: { gte: start, lte: end },
+      },
+      select: {
+        cancel_fee: true,
+        is_external: true,
+        order: { select: { cancellation_fee: true, cancellation_rule: true } },
       },
     }),
   ]);
@@ -1027,7 +1064,20 @@ async function orderLevelSlice(
     out.extra_charges += amt;
     out.by_channel[orderChannel(a.order.service_items)] += amt;
   }
+  // Per-day fees: what the cancelled day bills now (it is in the order total,
+  // dayBillable). Its costs stay in the day costs, like any day in range.
+  for (const d of cancelledDays) {
+    if (isLegacyCancelled(d.order)) continue;
+    const fee = n(d.cancel_fee);
+    out.cancellation_income += fee;
+    out.by_channel[d.is_external ? 'vendor' : 'internal'] += fee;
+  }
+  // Legacy whole-order cancellations (ORDER_V1): the fee replaced what the
+  // days and the charges would have earned. A DAY_V2 order's
+  // cancellation_fee is only the sum of its day fees, counted above; its
+  // charges stay billed in full (extra_charges).
   for (const o of cancelled) {
+    if (!isLegacyCancelled(o)) continue;
     const kept = o.service_items
       .filter((l) => dayEarns({ line_status: l.line_status, order: o }))
       .reduce((s, l) => s + n(l.total_price), 0);
@@ -1058,16 +1108,17 @@ async function accrualSlice(
         rtr_amount: true,
         is_external: true,
         line_status: true,
-        order: { select: { order_status: true } },
+        order: { select: { order_status: true, cancellation_rule: true } },
         payable: { select: { extras_amount: true } },
       },
     }),
     orderLevelP,
   ]);
-  // Same rule as the order card (margin v5): revenue − driver fees − RTR −
+  // Same rule as the order card (margin v6): revenue − driver fees − RTR −
   // Arasya's share of the approved trip costs. Payables are not used here:
   // a driver payable also carries reimbursed trip costs (already in ops_cost).
-  // A cancelled day earns nothing but keeps what it cost.
+  // A cancelled day earns no price but keeps what it cost; its fee is in
+  // cancellation_income.
   let day_revenue = 0;
   let trips = 0;
   let ops_cost = 0;
@@ -1138,7 +1189,7 @@ async function channelSplit(
         driver_fee: true,
         rtr_amount: true,
         line_status: true,
-        order: { select: { order_status: true } },
+        order: { select: { order_status: true, cancellation_rule: true } },
         payable: { select: { extras_amount: true } },
       },
     }),

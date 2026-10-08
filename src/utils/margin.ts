@@ -20,10 +20,17 @@
  * (fee − active day prices − charges), so the order card and the dashboard
  * agree after a cancellation.
  *
+ * v6 (2026-10-07, per-day cancellation fee, finance design §7): a cancelled
+ * day adds its own `cancel_fee − its costs` (driver fee / RTR, trip costs,
+ * extras); billable charges stay in full. final_price is Σ dayBillable +
+ * charges and freezes only for legacy whole-order cancellations (ORDER_V1),
+ * which keep the v5 rule (fee − active day prices − charges). No day had a
+ * cancel_fee before v6, so v5 and v6 agree on older data.
+ *
  * Bump MARGIN_FORMULA_VERSION whenever this logic changes so historical rows
  * remain auditable.
  */
-export const MARGIN_FORMULA_VERSION = 'v5-2026-10-06';
+export const MARGIN_FORMULA_VERSION = 'v6-2026-10-07';
 
 export interface MarginInputs {
   isExternal: boolean;

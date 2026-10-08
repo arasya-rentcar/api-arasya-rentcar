@@ -1,10 +1,12 @@
 import { waLink, waManual } from "../../utils/waManual";
 import {
   dpBaseOf,
+  isLegacyCancelled,
   minDpFor,
   netPaid,
   paymentStatusFor,
   rentalBaseOf,
+  rentalLineSelect,
   startPayment,
 } from "../orders/assignment-guard";
 import {
@@ -17,6 +19,7 @@ import {
   settleCredit,
   type MoneyState,
 } from "../orders/order-money";
+import { TIER_PCT, type DayCancelTier } from "../orders/cancellation-policy";
 import { rupiah } from "../../services/adminNotify";
 import { notifyOrderPaidInFull } from "../../services/driverNotify";
 import { reportLeadPurchase, sendsNoPurchase } from "../../services/ga4.service";
@@ -165,37 +168,78 @@ function paymentLines(
 }
 
 /**
- * One service day as a PDF line item (invoice, kwitansi, statement). A
- * cancelled day is not in the order total, so it is printed as
- * "(Dibatalkan)" at Rp 0 and the lines add up to the printed total (B7).
+ * "(Dibatalkan — biaya pembatalan 20%)": the tag of a day cancelled with a
+ * fee. A fee set by hand (cancel_fee ≠ cancel_fee_auto, owner 8 Oct 2026)
+ * prints no %: the tier's % is not what it charges.
  */
-function serviceItemToLineItem(item: {
-  service_date: Date | null;
-  description: string | null;
-  service_kind: string | null;
-  service_package: string | null;
-  pickup_location: string;
-  dropoff_location: string;
-  quantity: number;
-  unit_price: unknown;
-  total_price: unknown;
-  line_status: string;
-}) {
+function cancelFeeTag(item: { cancel_tier?: number | null; cancel_fee?: unknown; cancel_fee_auto?: unknown }): string {
+  const manual = item.cancel_fee_auto != null && sen(item.cancel_fee_auto) !== sen(item.cancel_fee);
+  return feeTag(manual ? null : TIER_PCT[Number(item.cancel_tier) as DayCancelTier]);
+}
+const feeTag = (pct: number | null | undefined) =>
+  pct ? `(Dibatalkan — biaya pembatalan ${pct}%)` : "(Dibatalkan — biaya pembatalan)";
+
+/**
+ * One service day as a PDF line item (invoice, kwitansi, statement). A
+ * cancelled day bills its cancellation fee (A3, finance design §8): it is
+ * printed with the fee tag and the fee as 1 × fee, so the lines add up to the
+ * order total T (B7). A cancelled day without a fee (cancelled before A3, or
+ * on a legacy whole-order cancellation, `withFee` false) is not in the total:
+ * "(Dibatalkan)" at Rp 0.
+ */
+function serviceItemToLineItem(
+  item: {
+    service_date: Date | null;
+    description: string | null;
+    service_kind: string | null;
+    service_package: string | null;
+    pickup_location: string;
+    dropoff_location: string;
+    quantity: number;
+    unit_price: unknown;
+    total_price: unknown;
+    line_status: string;
+    cancel_fee?: unknown;
+    cancel_fee_auto?: unknown;
+    cancel_tier?: number | null;
+  },
+  withFee = true,
+) {
   const cancelled = item.line_status === "CANCELLED";
+  const fee = cancelled && withFee && item.cancel_fee != null ? Number(item.cancel_fee) : null;
+  const tag = fee != null ? cancelFeeTag(item) : "(Dibatalkan)";
   return {
     serviceDate: item.service_date,
     description: cancelled
-      ? [item.description?.trim(), "(Dibatalkan)"].filter(Boolean).join(" ")
+      ? [item.description?.trim(), tag].filter(Boolean).join(" ")
       : item.description,
     serviceKind: item.service_kind,
     servicePackage: item.service_package,
     pickupLocation: item.pickup_location,
     dropoffLocation: item.dropoff_location,
-    quantity: item.quantity,
-    unitPrice: cancelled ? 0 : Number(item.unit_price),
-    totalPrice: cancelled ? 0 : Number(item.total_price),
+    quantity: fee != null ? 1 : item.quantity,
+    unitPrice: fee != null ? fee : cancelled ? 0 : Number(item.unit_price),
+    totalPrice: fee != null ? fee : cancelled ? 0 : Number(item.total_price),
   };
 }
+
+/**
+ * The fee line of one cancelled day on a cancellation-fee invoice:
+ * "Biaya pembatalan sewa Sabtu, 10 Oktober 2026 (Dibatalkan — biaya
+ * pembatalan 20%)", amount = the fee.
+ */
+function cancelFeeLineItem(date: Date | null, tag: string, fee: number): InvoiceLineItem {
+  const day = fmtAdjustmentDate(date);
+  return {
+    description: `Biaya pembatalan sewa${day ? ` ${day}` : ""} ${tag}`,
+    quantity: 1,
+    unitPrice: fee,
+    totalPrice: fee,
+  };
+}
+
+/** The line that brings a cancellation-fee invoice's lines up to the order total. */
+const RUN_DAYS_AND_CHARGES = "Hari yang sudah berjalan dan biaya tambahan";
 
 /**
  * The audit-log value cancelOrder writes; tierLabelOf reads the tier back
@@ -217,12 +261,16 @@ async function tierLabelOf(orderId: string): Promise<string | null> {
 type DocumentOrder = {
   id: string;
   cancellation_fee: unknown;
+  cancellation_rule?: string | null;
+  /** The order total T; the per-day CANCELLATION_FEE document adds up to it. */
+  final_price?: unknown;
   service_items: Parameters<typeof serviceItemToLineItem>[0][];
 };
 
 /**
  * A document only about the cancellation fee: the CANCELLATION_FEE invoice
- * and its kwitansi, or anything for an order whose days are all cancelled.
+ * and its kwitansi, or anything for an order whose days are all cancelled
+ * (Batalkan Pesanan, either rule: cancellation_fee is set on both).
  * It prints no package notes (what the price includes is not what it bills).
  */
 const isFeeOnly = (order: DocumentOrder, invoiceType?: string) =>
@@ -230,19 +278,38 @@ const isFeeOnly = (order: DocumentOrder, invoiceType?: string) =>
   (order.cancellation_fee != null && order.service_items.every((i) => i.line_status === "CANCELLED"));
 
 /**
- * The day lines of a document (invoice, kwitansi, statement). On a cancelled
- * order (cancellation_fee set, the order total) a "Biaya Pembatalan" line
- * holds what the days and the other lines printed (`otherLines`) do not, so
- * the lines add up to the printed total (B7). A CANCELLATION_FEE document
- * lists only the fee, like the invoice cancelOrder issued.
+ * The day lines of a document (invoice, kwitansi, statement).
+ *
+ * Per-day cancellations (DAY_V2, or a day cancelled in Edit Hari on an order
+ * that is not cancelled): each cancelled day prints its own fee
+ * (serviceItemToLineItem), so the lines add up to T. A CANCELLATION_FEE
+ * document lists one fee line per cancelled day and, when T holds more (days
+ * that ran, charges), one line for the rest, like buildCancellationFeePdf.
+ *
+ * Legacy whole-order cancellation (ORDER_V1, isLegacyCancelled): a
+ * "Biaya Pembatalan" line holds what the days and the other lines printed
+ * (`otherLines`) do not, so the lines add up to the frozen total (B7). A
+ * CANCELLATION_FEE document lists only the fee, like the invoice cancelOrder
+ * issued.
  */
 async function rentalDocumentItems(
   order: DocumentOrder,
   invoiceType?: string,
   otherLines = 0,
 ): Promise<InvoiceLineItem[]> {
+  if (!isLegacyCancelled(order)) {
+    if (invoiceType !== "CANCELLATION_FEE") return order.service_items.map((i) => serviceItemToLineItem(i));
+    const fees = order.service_items
+      .filter((i) => i.line_status === "CANCELLED" && i.cancel_fee != null)
+      .map((i) => cancelFeeLineItem(i.service_date, cancelFeeTag(i), Number(i.cancel_fee)));
+    const rest = rp(sen(order.final_price) - fees.reduce((s, f) => s + sen(f.totalPrice), 0)) - otherLines;
+    return rest > 0
+      ? [...fees, { description: RUN_DAYS_AND_CHARGES, quantity: 1, unitPrice: rest, totalPrice: rest }]
+      : fees;
+  }
   const fee = order.cancellation_fee == null ? null : Number(order.cancellation_fee);
-  const days = invoiceType === "CANCELLATION_FEE" ? [] : order.service_items.map(serviceItemToLineItem);
+  const days =
+    invoiceType === "CANCELLATION_FEE" ? [] : order.service_items.map((i) => serviceItemToLineItem(i, false));
   if (fee == null) return days;
   const listed = days.reduce((s, d) => s + d.totalPrice, 0) + otherLines;
   const amount = fee - listed;
@@ -308,10 +375,15 @@ export async function buildCancellationFeePdf(args: {
     pickup_location: string;
     dropoff_location: string;
   };
-  penalty: number;
-  /** Money already received on the order; the invoice asks for the rest. */
+  /** Every cancelled day of the order (earlier ones too), one line each. */
+  /** pct null: a fee set by hand (printed without a %). */
+  days: { date: Date | null; price: number; pct: number | null; fee: number }[];
+  /** The order total after the cancellation (T_new = Σ done day prices + Σ fees + charges). */
+  total: number;
+  /** Money already settling the total (Covered = Net − saldo lebih). */
   alreadyPaid: number;
-  tierLabel: string;
+  /** Saldo lebih used for this invoice. */
+  creditApplied: number;
   reason: string;
   issueDate?: Date;
 }): Promise<{
@@ -325,14 +397,18 @@ export async function buildCancellationFeePdf(args: {
     (tx) => nextInvoiceNumber(tx, args.customer, issueDate),
   );
 
-  const lineItem = {
-    description: `Biaya Pembatalan — ${args.tierLabel}`,
-    quantity: 1,
-    unitPrice: args.penalty,
-    totalPrice: args.penalty,
-  };
+  // One fee line per cancelled day (finance design §8), then the rest of T
+  // (days that ran, charges billed in full), so the lines add up to T.
+  const items = args.days.map((d) =>
+    cancelFeeLineItem(d.date, feeTag(d.pct), d.fee),
+  );
+  const rest = rp(sen(args.total) - args.days.reduce((s, d) => s + sen(d.fee), 0));
+  if (rest > 0) items.push({ description: RUN_DAYS_AND_CHARGES, quantity: 1, unitPrice: rest, totalPrice: rest });
 
-  const alreadyPaid = Math.min(Math.max(args.alreadyPaid, 0), args.penalty);
+  // TOTAL = total − already paid − saldo lebih used: the cash this invoice asks.
+  const alreadyPaid = Math.min(Math.max(args.alreadyPaid, 0), args.total);
+  const gross = args.total - alreadyPaid;
+  const credit = Math.min(Math.max(args.creditApplied, 0), gross);
   const pdfBuffer = await generateInvoicePDF({
     invoiceNumber,
     displayNumber: args.order.order_code ?? null,
@@ -341,20 +417,20 @@ export async function buildCancellationFeePdf(args: {
     customerPhone: args.order.customer_phone ?? null,
     pickupLocation: args.order.pickup_location,
     dropoffLocation: args.order.dropoff_location,
-    finalPrice: args.penalty,
-    // Nothing paid yet: the single-amount layout ("Total Tambahan / TOTAL").
-    // Some money in: the settlement layout (total − already paid = remaining).
+    finalPrice: args.total,
+    // Its own layout (not the settlement one, whose "DP sudah dibayar" does
+    // not fit here): total after the cancellation, "Sudah dibayar", "Dipotong
+    // dari saldo lebih", TOTAL = the cash asked.
     invoiceType: "Cancellation Fee",
-    invoiceKind: alreadyPaid > 0 ? "SETTLEMENT" : "ADDITIONAL",
+    invoiceKind: "CANCELLATION_FEE",
+    title: "Invoice Biaya Pembatalan",
     paymentMethod: "Bank Transfer",
-    amountPaid: args.penalty - alreadyPaid,
+    amountPaid: gross,
     previouslyPaid: alreadyPaid,
+    creditApplied: credit,
     documentMode: "INVOICE",
-    noteLines: [
-      `Pembatalan pesanan: ${args.reason}`,
-      args.tierLabel,
-    ],
-    items: [lineItem],
+    noteLines: [`Pembatalan pesanan: ${args.reason}`],
+    items,
   });
 
   const fileName = `${invoiceNumber}.pdf`;
@@ -392,7 +468,7 @@ async function invoiceCapState(
 ) {
   const [m, days, activeCombined, adjusted] = await Promise.all([
     moneyState(db, orderId, { excludeInvoiceId: opts.excludeInvoiceId }),
-    db.orderServiceItem.findMany({ where: { order_id: orderId }, select: { total_price: true, line_status: true } }),
+    db.orderServiceItem.findMany({ where: { order_id: orderId }, select: rentalLineSelect }),
     db.invoice.count({
       where: {
         order_id: orderId,
@@ -891,11 +967,11 @@ async function assertAmountAcknowledged(
   if (got === asked || ack) return;
   const [m, days] = await Promise.all([
     moneyState(prisma, invoice.order_id),
-    prisma.orderServiceItem.findMany({ where: { order_id: invoice.order_id }, select: { total_price: true, line_status: true } }),
+    prisma.orderServiceItem.findMany({ where: { order_id: invoice.order_id }, select: rentalLineSelect }),
   ]);
   const order = await prisma.order.findUniqueOrThrow({
     where: { id: invoice.order_id },
-    select: { cancellation_fee: true },
+    select: { cancellation_fee: true, cancellation_rule: true },
   });
   const netAfter = rp((m?.net ?? 0) + got);
   const statusAfter = paymentStatusFor(netAfter, rp(m?.total ?? 0), dpBaseOf(order, days));
@@ -993,8 +1069,9 @@ export async function markInvoicePaid(
             paid_to_date: unknown;
             refunded_total: unknown;
             cancellation_fee: unknown;
+            cancellation_rule: string | null;
           }[]
-        >`SELECT final_price, paid_to_date, refunded_total, cancellation_fee
+        >`SELECT final_price, paid_to_date, refunded_total, cancellation_fee, cancellation_rule
           FROM "orders" WHERE id = ${invoice.order_id} FOR NO KEY UPDATE`;
         const { count } = await tx.invoice.updateMany({
           where: { id: invoiceId, status: { notIn: ["PAID", "REVISED", "CANCELLED"] } },
@@ -1056,7 +1133,7 @@ export async function markInvoicePaid(
         const paidTotal = others.total + amountReceived;
         const days = await tx.orderServiceItem.findMany({
           where: { order_id: invoice.order_id },
-          select: { total_price: true, line_status: true },
+          select: rentalLineSelect,
         });
         await tx.order.update({
           where: { id: invoice.order_id },
@@ -1524,7 +1601,10 @@ export async function reviseInvoice(
     // without this invoice and its credit).
     previouslyPaid: rp(before.money.covered - oldCredit + before.money.open),
     creditApplied: rp(plannedCredit),
-    invoiceKind: isAdjustment ? "ADDITIONAL" : invoice.invoice_type,
+    // A revised fee invoice keeps the "what this invoice covers" layout
+    // (SUBTOTAL), under its own title.
+    invoiceKind: isAdjustment ? "ADDITIONAL" : invoice.invoice_type === "CANCELLATION_FEE" ? "FULL" : invoice.invoice_type,
+    ...(invoice.invoice_type === "CANCELLATION_FEE" ? { title: "Invoice Biaya Pembatalan" } : {}),
     // Same notes as the original; a cancellation fee keeps none (its own
     // notes, the reason and tier, are not stored).
     noteLines:

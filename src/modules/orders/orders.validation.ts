@@ -180,9 +180,34 @@ export const createRefundSchema = z.object({
 // Full-order cancellation. A reason is required (kept in the audit log + on the
 // cancellation-fee invoice). The penalty tier is computed server-side from the
 // service date + current time; the client never sends an amount.
+// A3 (per day): `expected_fee_total` is the fee total the admin saw in
+// GET /orders/:id/cancel-quote (a different server total → 409
+// CANCEL_FEE_CHANGED); `requested_at` is when the customer asked to cancel
+// (≤ now, ≥ now − 3 days; the tiers follow it, it is logged).
 export const cancelOrderSchema = z.object({
-  reason: z.string().trim().min(1, "Cancellation reason is required"),
+  reason: z.string().trim().min(1, "Cancellation reason is required").max(500),
   actor: z.string().optional(),
+  expected_fee_total: z.number().nonnegative().optional(),
+  requested_at: z.string().datetime({ offset: true }).optional(),
+  // Idempotency: a resend with the same ref gets the stored result (200).
+  client_ref: z.string().uuid().optional(),
+  // Fees set by hand (owner, 8 Oct 2026), whole rupiah: only days this cancel
+  // cancels, once each, ≤ that day's price (checked in cancelOrder, 400
+  // INVALID_CANCEL_FEE); days not listed get the automatic fee.
+  // `expected_fee_total` stays the AUTOMATIC total.
+  day_fees: z
+    .array(
+      z.object({
+        line_id: z.string().min(1),
+        fee: z.number().int("Biaya pembatalan harus rupiah bulat").nonnegative(),
+      }).strict(),
+    )
+    .max(400)
+    .optional(),
+});
+
+export const orderCancelQuoteSchema = z.object({
+  requested_at: z.string().datetime({ offset: true }).optional(),
 });
 
 export type UpsertOrderFinanceInput = z.infer<typeof upsertOrderFinanceSchema>;

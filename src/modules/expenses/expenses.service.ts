@@ -5,7 +5,7 @@ import { billedToCustomerByPackage } from '../../utils/driverFee';
 import { recomputeLineMoney } from '../schedule/line-money.service';
 import { notifyExpenseRejected } from '../../services/driverNotify';
 import { rollupOrderFinance } from '../schedule/schedule.service';
-import { lockOrder, lockOrderDays } from '../orders/order-money';
+import { assertOpenWithinTotal, lockOrder, lockOrderDays } from '../orders/order-money';
 import { CreateExpenseInput, UpdateExpenseInput } from './expenses.validation';
 
 // Merge: expenses belong to a service-day LINE (the line IS the trip).
@@ -125,6 +125,27 @@ async function reviewerName(userId: string): Promise<string> {
   return u?.email ?? 'admin';
 }
 
+// INV-6 for trip costs (finance A3, closes an A2 gap): a cost billed to the
+// customer is a charge in the order total. Rejecting, unbilling, lowering or
+// deleting it lowers the total, and an unpaid invoice must not keep asking
+// more than is still owed: after the rollup (which holds the order lock),
+// assertOpenWithinTotal refuses with 409 OPEN_INVOICE_EXCEEDS and the whole
+// change rolls back. Only checked when the cost was billed before the change.
+
+/** Under the order lock: the cost is mirrored as a billable charge. */
+async function wasBilled(tx: Prisma.TransactionClient, expenseId: string): Promise<boolean> {
+  const row = await tx.expense.findUnique({ where: { id: expenseId }, select: { adjustment_id: true } });
+  return !!row?.adjustment_id;
+}
+
+/** The action named in the INV-6 refusal ("… membuat total order Rp …"). */
+function tripCostAction(input: UpdateExpenseInput): string {
+  if (input.status === 'REJECTED') return 'Menolak biaya perjalanan ini';
+  if (input.bill_to_customer === false) return 'Tidak menagihkan biaya perjalanan ini ke pelanggan';
+  if (input.amount !== undefined) return 'Mengubah nominal biaya perjalanan ini';
+  return 'Perubahan biaya perjalanan ini';
+}
+
 /** Changes that move money owed to the driver. */
 function touchesDriverMoney(
   e: { status: string; paid_by: string; amount: unknown },
@@ -172,6 +193,7 @@ export async function updateExpense(
       // before this touches the payable and the day (recomputeLineMoney).
       await lockOrderDays(tx, line.order_id);
       await lockOrder(tx, line.order_id);
+      const billed = await wasBilled(tx, expenseId);
       await tx.expense.update({
         where: { id: expenseId },
         data: {
@@ -190,6 +212,7 @@ export async function updateExpense(
       });
       await recomputeLineMoney(tx, line.id);
       await rollupOrderFinance(tx, line.order_id);
+      if (billed) await assertOpenWithinTotal(tx, line.order_id, tripCostAction(input));
       return tx.expense.findUniqueOrThrow({
         where: { id: expenseId },
         include: { trip_report: { select: { id: true, file_url: true, file_mime: true } } },
@@ -240,6 +263,7 @@ export async function deleteExpense(expenseId: string) {
       // before this touches the payable and the day (recomputeLineMoney).
       await lockOrderDays(tx, line.order_id);
       await lockOrder(tx, line.order_id);
+      const billed = await wasBilled(tx, e.id);
       if (e.adjustment_id) {
         await tx.expense.update({ where: { id: e.id }, data: { adjustment_id: null } });
         await tx.orderAdjustment.deleteMany({ where: { id: e.adjustment_id } });
@@ -247,6 +271,7 @@ export async function deleteExpense(expenseId: string) {
       await tx.expense.delete({ where: { id: e.id } });
       await recomputeLineMoney(tx, line.id);
       await rollupOrderFinance(tx, line.order_id);
+      if (billed) await assertOpenWithinTotal(tx, line.order_id, 'Menghapus biaya perjalanan ini');
     },
     { maxWait: 15000, timeout: 30000 },
   );

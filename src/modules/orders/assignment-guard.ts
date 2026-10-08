@@ -1,6 +1,7 @@
 import type { Prisma, ScheduleStatus } from "@prisma/client";
 import { AppError } from "../../utils/AppError";
 import { rupiah } from "../../services/adminNotify";
+import { pctRupiah } from "./cancellation-policy";
 
 // Owner rule (Oct 2026): a trip goes to an internal driver only after the
 // customer has paid at least the DP. Decided from the money actually received
@@ -110,27 +111,39 @@ export function assertOrderPaidForTripStart(state: StartPayment): void {
 }
 
 /** Prisma select for what startPayment needs from an order. */
+/** Prisma select for a day as rentalBaseOf needs it. */
+export const rentalLineSelect = { total_price: true, line_status: true, cancel_fee: true } as const;
+
 export const startPaymentSelect = {
   paid_to_date: true,
   refunded_total: true,
-  service_items: { select: { total_price: true, line_status: true } },
+  service_items: { select: rentalLineSelect },
 } as const;
 
 /** A day as far as the rental price is concerned. */
 export interface RentalLine {
   total_price: unknown;
   line_status: string;
+  /** Per-day cancellation fee (A3); null on legacy cancelled days. */
+  cancel_fee?: unknown;
 }
 
 /**
- * Rental price of the days that are not cancelled: the DP base (20%), what
- * "lunas" for "Mulai perjalanan" covers, and the base of the DP rule in
- * payment_status. Extra charges are billed separately and are not in it.
+ * What one day bills (finance design §2, dayBillable): its price, or once
+ * cancelled its cancellation fee (none on legacy days).
+ */
+export function dayBillable(l: RentalLine): number {
+  return l.line_status === "CANCELLED" ? Number(l.cancel_fee ?? 0) : Number(l.total_price ?? 0);
+}
+
+/**
+ * Σ dayBillable = T − charges: the DP base (20%), what "lunas" for "Mulai
+ * perjalanan" covers, and the base of the DP rule in payment_status. A day
+ * cancelled with a fee counts with its fee (owner, 7 Oct 2026). Extra
+ * charges are billed separately and are not in it.
  */
 export function rentalBaseOf(lines: RentalLine[]): number {
-  return lines
-    .filter((l) => l.line_status !== "CANCELLED")
-    .reduce((s, l) => s + Number(l.total_price ?? 0), 0);
+  return lines.reduce((s, l) => s + dayBillable(l), 0);
 }
 
 /**
@@ -142,17 +155,25 @@ export function rentalBaseOf(lines: RentalLine[]): number {
  * would make any money count as DP.
  */
 export function dpBaseOf(
-  order: { cancellation_fee?: unknown },
+  order: { cancellation_fee?: unknown; cancellation_rule?: string | null },
   lines: RentalLine[],
 ): number {
-  return order.cancellation_fee != null
-    ? Number(order.cancellation_fee)
-    : rentalBaseOf(lines);
+  return isLegacyCancelled(order) ? Number(order.cancellation_fee) : rentalBaseOf(lines);
 }
 
-/** Minimum DP: 20% of the rental base, in whole rupiah. */
+/**
+ * Cancelled by the old whole-order rule (ORDER_V1): the order keeps its
+ * frozen final_price and fee (owner, 7 Oct 2026). Per-day cancellations
+ * (DAY_V2) are computed from the days like any other order. A fee without a
+ * rule is legacy too (the A3 migration stamps those).
+ */
+export function isLegacyCancelled(order: { cancellation_fee?: unknown; cancellation_rule?: string | null }): boolean {
+  return order.cancellation_fee != null && order.cancellation_rule !== "DAY_V2";
+}
+
+/** Minimum DP: 20% of the rental base, in whole rupiah (pctRupiah, integer sen). */
 export function minDpFor(rentalBase: number): number {
-  return Math.round(rentalBase * 0.2);
+  return pctRupiah(rentalBase, 20);
 }
 
 /**
@@ -205,6 +226,7 @@ export interface PaymentOrder {
   is_refunded?: boolean | null;
   refund_amount?: unknown;
   cancellation_fee?: unknown;
+  cancellation_rule?: string | null;
 }
 
 /** Prisma select for orderPaymentStatus / assertOrderPaidForDriverAssignment. */
@@ -216,7 +238,8 @@ export const paymentOrderSelect = {
   is_refunded: true,
   refund_amount: true,
   cancellation_fee: true,
-  service_items: { select: { total_price: true, line_status: true } },
+  cancellation_rule: true,
+  service_items: { select: rentalLineSelect },
 } as const;
 
 /**
