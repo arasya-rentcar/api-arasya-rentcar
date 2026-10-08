@@ -2385,7 +2385,12 @@ export async function cancelOrder(
       //    Re-check under the locks: a second click (or a finalize) that
       //    committed meanwhile wins and this cancel stops.
       await lockOrderDays(tx, orderId);
-      await lockOrder(tx, orderId);
+      // FOR UPDATE, not lockOrder's FOR NO KEY UPDATE: the end of this
+      // transaction writes cancel_client_ref (a unique key), which needs FOR
+      // UPDATE. Upgrading a held row lock while another statement queues on
+      // the row (a driver "Berangkat" setting needs_review) deadlocks; taking
+      // the strong lock up front makes the others simply wait.
+      await tx.$queryRaw`SELECT id FROM "orders" WHERE id = ${orderId} FOR UPDATE`;
       const fresh = await tx.order.findUniqueOrThrow({
         where: { id: orderId },
         select: { order_status: true, cancellation_fee: true, cancel_client_ref: true, cancel_result: true },
