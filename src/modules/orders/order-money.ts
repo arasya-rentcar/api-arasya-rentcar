@@ -16,7 +16,10 @@ type Db = Prisma.TransactionClient | typeof prisma;
  *      lockOrderDays (all days, ORDER BY id), or the single day `update` that
  *      Edit Hari and the driver app start with.
  *   2. The order row: lockOrder (FOR NO KEY UPDATE). rollupOrderFinance takes
- *      it too, after the days.
+ *      it too, after the days. A transaction that will update a unique key
+ *      of the order (cancelOrder: cancel_client_ref) takes FOR UPDATE here
+ *      instead, never upgrading later (an upgrade behind a queued waiter
+ *      deadlocks).
  *   3. Invoices of the order: conditional updateMany (or the insert).
  *   4. Payables.
  *   5. Drivers and cars: lockUnits (id order).

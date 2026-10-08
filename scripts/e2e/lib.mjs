@@ -82,7 +82,7 @@ export async function call(method, path, { token, body, form, headers = {} } = {
   try {
     json = await res.json();
   } catch {}
-  return { status: res.status, json, data: json?.data };
+  return { status: res.status, json, data: json?.data, headers: res.headers };
 }
 
 export async function ensureAdmin() {
