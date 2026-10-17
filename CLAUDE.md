@@ -36,7 +36,7 @@ Postgres 16 binaries are in `/usr/lib/postgresql/16/bin`. Typical recipe: `initd
 `.github/workflows/api-smoke.yml` (manual) checks the live API read-only.
 
 ## Deploy
-Push to `main` that touches API paths (`src/**`, `prisma/**`, package files) runs `deploy.yml`: CI build, then SSH to the VPS and `cd /root/.openclaw/workspace/arasya-projects && GIT_SYNC=1 ./deploy-local.sh api` (release dir, migrations, health-gated flip; `./deploy-local.sh rollback api` to undo). The same command can be run by hand on the VPS. Note: `DRY_RUN=1` still runs migrations. The owner renewed the VPS (Oct 2026); no hosting move planned.
+Push to `main` that touches API paths (`src/**`, `prisma/**`, package files) runs `deploy.yml`: CI build, then SSH to the VPS, sync `/opt/arasya/src/api-arasya-rentcar` and run `GIT_SYNC=1 ops/deploy.sh api` (release dir, migrations, health-gated flip; `ops/deploy.sh rollback api` to undo). The same command can be run by hand on the VPS. The VPS was rebuilt from scratch in Oct 2026 (old server lost); `ops/README.md` has the full setup (`setup-vps.sh`, nginx, env templates with where each value comes from).
 `keep-supabase-awake.yml` pings the DB every 3 days (secret `SUPABASE_KEEPALIVE_DB_URL`, login role `keepalive`).
 
 ## Env (see `.env.example`)
