@@ -58,5 +58,8 @@ jobs:
           command_timeout: 20m
           script: |
             set -e
-            cd /root/.openclaw/workspace/arasya-projects
-            GIT_SYNC=1 ./deploy-local.sh api
+            # The deploy script lives in the API repo (ops/); sync it first.
+            OPS=/opt/arasya/src/api-arasya-rentcar
+            git -C "$OPS" fetch -q origin main
+            git -C "$OPS" reset -q --hard origin/main
+            GIT_SYNC=1 "$OPS/ops/deploy.sh" api
